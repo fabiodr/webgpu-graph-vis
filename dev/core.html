@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>dev: core</title>
+<style>html,body{margin:0;height:100%;background:#000;color:#ccc;font:12px system-ui}#app{position:fixed;inset:0}#hud{position:fixed;left:8px;top:8px;white-space:pre}</style>
+</head>
+<body>
+<div id="app"></div><div id="hud"></div>
+<script type="module">
+import { createApp } from '../src/app/App.js';
+import { loadPrepared } from '../src/data/load.js';
+import { DebugNodes } from '../src/debug/DebugNodes.js';
+
+const params = new URLSearchParams( location.search );
+const ds = params.get( 'ds' ) || 'imsv/lesmis';
+const app = await createApp( document.getElementById( 'app' ) );
+window.__app = app;
+app.use( new DebugNodes() );
+const graph = await loadPrepared( `/data/${ds}.json` );
+app.setGraph( graph );
+const s = app.boundingSphere();
+app.camera.position.set( 0, 0, s.radius * 3 );
+app.camera.lookAt( 0, 0, 0 );
+const hud = document.getElementById( 'hud' );
+app.events.addEventListener( 'frame', () => {
+
+	if ( app.frame % 30 === 0 ) hud.textContent = `${graph.name}  N=${graph.N} E=${graph.E} D=${graph.D}  fps=${app.fps.toFixed( 1 )}  readbacks=${app.positionsVersion}`;
+
+} );
+window.__ready = true;
+</script>
+</body>
+</html>

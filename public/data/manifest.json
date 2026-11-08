@@ -1,0 +1,112 @@
+{
+	"groups": {
+		"imsv": "ImsvGraphVis datasets",
+		"generated": "Generated"
+	},
+	"datasets": [
+		{
+			"id": "imsv/karate",
+			"file": "data/imsv/karate.json",
+			"group": "imsv",
+			"name": "Zachary's karate club",
+			"description": "Social network of a university karate club that split in two.",
+			"source": "W. W. Zachary, J. Anthropol. Res. 33, 452 (1977). Clustering hierarchy from ImsvGraphVis (O.-H. Kwon et al., IEEE TVCG 22(7), 2016).",
+			"nodes": 34,
+			"edges": 78,
+			"levels": 2,
+			"bytes": 1236,
+			"order": 0
+		},
+		{
+			"id": "imsv/dolphins",
+			"file": "data/imsv/dolphins.json",
+			"group": "imsv",
+			"name": "Dolphins",
+			"description": "Frequent associations among 62 bottlenose dolphins in Doubtful Sound, New Zealand.",
+			"source": "D. Lusseau et al., Behav. Ecol. Sociobiol. 54, 396 (2003). Clustering hierarchy from ImsvGraphVis (O.-H. Kwon et al., IEEE TVCG 22(7), 2016).",
+			"nodes": 62,
+			"edges": 159,
+			"levels": 2,
+			"bytes": 2204,
+			"order": 1
+		},
+		{
+			"id": "imsv/lesmis",
+			"file": "data/imsv/lesmis.json",
+			"group": "imsv",
+			"name": "Les Misérables",
+			"description": "Co-appearance of characters in Victor Hugo’s novel.",
+			"source": "D. E. Knuth, The Stanford GraphBase (1993). Clustering hierarchy from ImsvGraphVis (O.-H. Kwon et al., IEEE TVCG 22(7), 2016).",
+			"nodes": 77,
+			"edges": 254,
+			"levels": 2,
+			"bytes": 3254,
+			"order": 2
+		},
+		{
+			"id": "imsv/polbooks",
+			"file": "data/imsv/polbooks.json",
+			"group": "imsv",
+			"name": "Political books",
+			"description": "Books about US politics co-purchased on Amazon around the 2004 election.",
+			"source": "V. Krebs, unpublished; via M. Newman. Clustering hierarchy from ImsvGraphVis (O.-H. Kwon et al., IEEE TVCG 22(7), 2016).",
+			"nodes": 105,
+			"edges": 441,
+			"levels": 2,
+			"bytes": 5735,
+			"order": 3
+		},
+		{
+			"id": "imsv/adjnoun",
+			"file": "data/imsv/adjnoun.json",
+			"group": "imsv",
+			"name": "Adjectives & nouns",
+			"description": "Adjacency of common adjectives and nouns in Dickens’ David Copperfield.",
+			"source": "M. E. J. Newman, Phys. Rev. E 74, 036104 (2006). Clustering hierarchy from ImsvGraphVis (O.-H. Kwon et al., IEEE TVCG 22(7), 2016).",
+			"nodes": 112,
+			"edges": 425,
+			"levels": 2,
+			"bytes": 4403,
+			"order": 4
+		},
+		{
+			"id": "imsv/football",
+			"file": "data/imsv/football.json",
+			"group": "imsv",
+			"name": "College football",
+			"description": "Games between Division IA colleges, fall 2000 season.",
+			"source": "M. Girvan and M. E. J. Newman, PNAS 99, 7821 (2002). Clustering hierarchy from ImsvGraphVis (O.-H. Kwon et al., IEEE TVCG 22(7), 2016).",
+			"nodes": 115,
+			"edges": 613,
+			"levels": 2,
+			"bytes": 6199,
+			"order": 5
+		},
+		{
+			"id": "imsv/serengeti-foodweb",
+			"file": "data/imsv/serengeti-foodweb.json",
+			"group": "imsv",
+			"name": "Serengeti food web",
+			"description": "Feeding links among plants and herbivores of the Serengeti ecosystem.",
+			"source": "E. B. Baskerville et al., PLoS Comput. Biol. 7, e1002321 (2011). Clustering hierarchy from ImsvGraphVis (O.-H. Kwon et al., IEEE TVCG 22(7), 2016).",
+			"nodes": 161,
+			"edges": 591,
+			"levels": 2,
+			"bytes": 6068,
+			"order": 6
+		},
+		{
+			"id": "imsv/celegansneural",
+			"file": "data/imsv/celegansneural.json",
+			"group": "imsv",
+			"name": "C. elegans neurons",
+			"description": "Neural network of the nematode C. elegans (treated as undirected).",
+			"source": "D. J. Watts and S. H. Strogatz, Nature 393, 440 (1998). Clustering hierarchy from ImsvGraphVis (O.-H. Kwon et al., IEEE TVCG 22(7), 2016).",
+			"nodes": 297,
+			"edges": 2148,
+			"levels": 2,
+			"bytes": 18472,
+			"order": 7
+		}
+	]
+}
