@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>dev: edges</title>
+<style>html,body{margin:0;height:100%;background:#000;color:#ccc;font:12px system-ui}#app{position:fixed;inset:0}#hud{position:fixed;left:8px;top:8px;white-space:pre;pointer-events:none}</style>
+</head>
+<body>
+<div id="app"></div><div id="hud"></div>
+<script type="module">
+// Dev page for src/render/EdgeRenderer.js. Static positions (no force layout).
+//   ?ds=imsv/lesmis           dataset (served at /data/<ds>.json)
+//   ?synth=20000&deg=20&br=10,10   synthetic clustered graph instead of a dataset
+//   ?mode=sphere              paper sphere layout (nodePos = sphereDir * sphereRadius, layoutBlend = 1)
+//   ?blend=0.5                sphere mode with a partial layoutBlend (positions mixed too)
+//   ?cam=inside               camera at the sphere center (immersive view)
+//   ?beta=0.85 ?seg=N ?width=1 ?opacity=1 ?minpx=0.75 ?additive ?source ?noedges ?nonodes
+//   ?hl=<node>                highlight node + neighbors (nodeState written directly), focus = 1
+//   ?hover=<node>             hover state for a node
+//   ?zoom=1 ?az=0             camera distance multiplier, azimuth (degrees)
+//   ?flat                     drop the hierarchy (D = 0)
+//   ?tiny=empty|pair|tri      tiny graphs: E = 0, single edge, coincident nodes (zero-length edge)
+//   ?swap                     setGraph(karate) then setGraph(graph) again (dispose/rebuild path)
+// window.__verify() runs the GPU curve (edgeCurveNode in a compute kernel) and compares it to
+// the CPU mirror (evalEdgeCurveCPU): endpoints, max deviation, beta = 1 centroid proximity.
+import * as THREE from 'three/webgpu';
+import { Fn, instanceIndex, instancedArray, float, uint, vec4, uniform } from 'three/tsl';
+import { createApp } from '../src/app/App.js';
+import { loadPrepared, fetchGraph } from '../src/data/load.js';
+import { normalizeGraph } from '../src/data/format.js';
+import { prepareGraph } from '../src/graph/prepare.js';
+import { DebugNodes } from '../src/debug/DebugNodes.js';
+import { synthGraph } from '../src/debug/synth.js';
+import { EdgeRenderer, edgeCurveNode, evalEdgeCurveCPU } from '../src/render/EdgeRenderer.js';
+
+try {
+
+	const params = new URLSearchParams( location.search );
+	const num = ( k, d ) => ( params.has( k ) ? Number( params.get( k ) ) : d );
+	const app = await createApp( document.getElementById( 'app' ) );
+	window.__app = app;
+	if ( ! params.has( 'nonodes' ) ) app.use( new DebugNodes( { size: num( 'nodesize', 4 ) } ) );
+	let edges = null;
+	if ( ! params.has( 'noedges' ) ) {
+
+		edges = app.use( new EdgeRenderer( {
+			beta: num( 'beta', 0.85 ),
+			segments: params.has( 'seg' ) ? num( 'seg' ) : null,
+			width: num( 'width', 1 ),
+			opacity: num( 'opacity', 1 ),
+			minPixelWidth: num( 'minpx', 0.75 ),
+			blendMode: params.has( 'additive' ) ? 'additive' : 'normal',
+			colorMode: params.has( 'source' ) ? 'source' : 'gradient',
+		} ) );
+		window.__edges = edges;
+
+	}
+
+	let graph;
+	const t0 = performance.now();
+	const tinyGraphs = {
+		// no edges at all
+		empty: { nodeCount: 3, edges: [] },
+		// a single edge, no hierarchy
+		pair: { nodeCount: 2, edges: [ 0, 1 ] },
+		// 4 nodes, one hierarchy level; nodes 1 and 2 are placed at the same point (zero-length edge)
+		tri: { nodeCount: 4, edges: [ 0, 1, 1, 2, 2, 3, 0, 3, 0, 2 ], hierarchy: { method: 'test', levels: [ [ 0, 0, 1, 1 ] ] } },
+	};
+	if ( params.has( 'synth' ) ) {
+
+		const br = ( params.get( 'br' ) || '10,10' ).split( ',' ).map( Number );
+		graph = prepareGraph( synthGraph( { n: num( 'synth', 20000 ), avgDegree: num( 'deg', 20 ), branching: br } ) );
+
+	} else if ( params.has( 'tiny' ) ) {
+
+		graph = prepareGraph( normalizeGraph( { name: 'tiny ' + params.get( 'tiny' ), ...tinyGraphs[ params.get( 'tiny' ) ] } ) );
+
+	} else {
+
+		const g = await fetchGraph( `/data/${params.get( 'ds' ) || 'imsv/lesmis'}.json` );
+		if ( params.has( 'flat' ) ) g.hierarchy = null; // D = 0: no bundling possible, straight B-splines
+		graph = prepareGraph( g );
+
+	}
+
+	const prepMs = performance.now() - t0;
+	let buffers = app.setGraph( graph );
+	if ( params.has( 'swap' ) ) {
+
+		// graph replacement: load another dataset, then come back (exercises dispose/rebuild)
+		app.setGraph( await loadPrepared( '/data/imsv/karate.json' ) );
+		await new Promise( ( r ) => setTimeout( r, 300 ) );
+		buffers = app.setGraph( graph );
+
+	}
+
+	if ( params.get( 'tiny' ) === 'tri' ) {
+
+		const p = new Float32Array( [ - 60, 0, 0, 0, 60, 0, 0, 0, 60, 0, 0, 0, 0, 70, 0, 0 ] );
+		buffers.setPositions( p );
+		app.positions = p;
+
+	}
+	const R = graph.layoutRadius;
+	const mode = params.get( 'mode' ) || 'force';
+	if ( mode === 'sphere' ) {
+
+		const b = num( 'blend', 1 );
+		const p = new Float32Array( 4 * graph.N );
+		for ( let i = 0; i < graph.N; i ++ ) {
+
+			for ( let q = 0; q < 3; q ++ ) p[ 4 * i + q ] = graph.initPos[ 4 * i + q ] * ( 1 - b ) + graph.sphereDir[ 4 * i + q ] * R * b;
+
+		}
+
+		buffers.setPositions( p );
+		app.positions = p;
+		buffers.uniforms.layoutBlend.value = b;
+
+	}
+
+	// highlight / hover: write eased state and its target directly
+	window.__highlight = ( node, hover = - 1 ) => {
+
+		const st = new Float32Array( 4 * graph.N );
+		if ( node >= 0 ) {
+
+			for ( let i = 0; i < graph.N; i ++ ) st[ 4 * i + 2 ] = 1; // dimmed
+			st[ 4 * node ] = 1; st[ 4 * node + 2 ] = 0;
+			for ( let k = graph.adjStart[ node ]; k < graph.adjStart[ node ] + graph.degree[ node ]; k ++ ) {
+
+				const j = graph.adjList[ k ];
+				st[ 4 * j + 1 ] = 1; st[ 4 * j + 2 ] = 0;
+
+			}
+
+		}
+
+		if ( hover >= 0 ) st[ 4 * hover + 3 ] = 1;
+		buffers.nodeState.value.array.set( st );
+		buffers.nodeState.value.needsUpdate = true;
+		buffers.setStateTargets( st );
+		buffers.uniforms.focus.value = node >= 0 ? 1 : 0;
+		buffers.uniforms.selectedIndex.value = node;
+		buffers.uniforms.hoverIndex.value = hover;
+		return { node, degree: node >= 0 ? graph.degree[ node ] : 0 };
+
+	};
+
+	// ?hl=max picks the highest-degree node, ?hl=<k> node k
+	const maxDegNode = graph.degree.indexOf( graph.maxDegree );
+	const pick = ( k ) => ( params.get( k ) === 'max' ? maxDegNode : num( k, - 1 ) );
+	if ( params.has( 'hl' ) || params.has( 'hover' ) ) window.__highlight( pick( 'hl' ), pick( 'hover' ) );
+
+	// camera
+	const zoom = num( 'zoom', 1 );
+	if ( mode === 'sphere' && params.get( 'cam' ) === 'inside' ) {
+
+		app.camera.fov = 100;
+		app.camera.updateProjectionMatrix();
+		app.camera.position.set( 0, 0, 0.001 );
+		app.controls.target.set( 0, 0, R * 0.01 );
+		app.camera.lookAt( 0, 0, R );
+
+	} else {
+
+		const s = mode === 'sphere' ? { radius: R } : app.boundingSphere();
+		const dist = s.radius * ( mode === 'sphere' ? 3.2 : 2.6 ) * zoom;
+		const az = num( 'az', 0 ) * Math.PI / 180;
+		app.camera.position.set( Math.sin( az ) * dist, 0, Math.cos( az ) * dist );
+		app.controls.target.set( 0, 0, 0 );
+		app.camera.lookAt( 0, 0, 0 );
+
+	}
+
+	app.controls.update();
+
+	// GPU vs CPU curve check
+	window.__verify = async ( { edgesToCheck = 512, samples = 33, beta = edges ? edges.bundling : 0.85 } = {} ) => {
+
+		const E = graph.E;
+		const M = Math.min( E, edgesToCheck ), K = samples;
+		if ( M === 0 ) return { edgesChecked: 0 };
+		const sel = instancedArray( Math.max( 1, M ), 'uint' );
+		for ( let i = 0; i < M; i ++ ) sel.value.array[ i ] = Math.floor( ( i * E ) / M );
+		const out = instancedArray( Math.max( 1, M * K ), 'vec4' );
+		const p = { beta: uniform( beta ), highlightLevel: uniform( 0.75 ), sphereAxis: uniform( new THREE.Vector3( 0, 0, 1 ) ) };
+		const kernel = Fn( () => {
+
+			const i = instanceIndex;
+			const e = sel.element( i.div( uint( K ) ) );
+			const t = float( i.mod( uint( K ) ) ).div( K - 1 );
+			const { position } = edgeCurveNode( buffers, graph, p, buffers.edgeInfo.element( e ), t );
+			out.element( i ).assign( vec4( position, 1 ) );
+
+		} )().compute( M * K, [ 64 ] );
+		await app.renderer.computeAsync( kernel );
+		const gpu = new Float32Array( await app.renderer.getArrayBufferAsync( out.value ) );
+		const nodePos = buffers.nodePos.value.array, clusterPos = buffers.clusterPos.value.array;
+		const opts = { beta, layoutBlend: buffers.uniforms.layoutBlend.value, sphereRadius: buffers.uniforms.sphereRadius.value };
+		let maxErr = 0, maxEndErr = 0, nan = 0, scale = 0;
+		for ( let m = 0; m < M; m ++ ) {
+
+			const e = sel.value.array[ m ];
+			for ( let k = 0; k < K; k ++ ) {
+
+				const t = k / ( K - 1 );
+				const cpu = evalEdgeCurveCPU( graph, e, t, nodePos, clusterPos, opts ).position;
+				const g = gpu.subarray( 4 * ( m * K + k ), 4 * ( m * K + k ) + 3 );
+				if ( ! g.every( Number.isFinite ) ) nan ++;
+				const err = Math.hypot( g[ 0 ] - cpu[ 0 ], g[ 1 ] - cpu[ 1 ], g[ 2 ] - cpu[ 2 ] );
+				maxErr = Math.max( maxErr, err );
+				scale = Math.max( scale, Math.hypot( ...cpu ) );
+				if ( k === 0 || k === K - 1 ) {
+
+					const n = k === 0 ? graph.edges[ 2 * e ] : graph.edges[ 2 * e + 1 ];
+					maxEndErr = Math.max( maxEndErr, Math.hypot( g[ 0 ] - nodePos[ 4 * n ], g[ 1 ] - nodePos[ 4 * n + 1 ], g[ 2 ] - nodePos[ 4 * n + 2 ] ) );
+
+				}
+
+			}
+
+		}
+
+		// beta = 1 centroid proximity (CPU, dense sampling): distance from each interior control point
+		// to the curve, relative to that cluster's bounding radius
+		let worstRel = 0, meanRel = 0, cnt = 0;
+		for ( let m = 0; m < M; m ++ ) {
+
+			const e = sel.value.array[ m ];
+			const ref = evalEdgeCurveCPU( graph, e, 0, nodePos, clusterPos, { ...opts, beta: 1 } );
+			const pts = [];
+			for ( let k = 0; k <= 400; k ++ ) pts.push( evalEdgeCurveCPU( graph, e, k / 400, nodePos, clusterPos, { ...opts, beta: 1 } ).position );
+			for ( let c = 1; c < ref.L - 1; c ++ ) {
+
+				const cp = ref.controlPoints[ c ];
+				let best = Infinity;
+				for ( const q of pts ) best = Math.min( best, Math.hypot( q[ 0 ] - cp[ 0 ], q[ 1 ] - cp[ 1 ], q[ 2 ] - cp[ 2 ] ) );
+				// cluster radius: find the cluster id again (same rule as the shader)
+				const L = ref.L, s = graph.edges[ 2 * e ], tg = graph.edges[ 2 * e + 1 ];
+				const srcSide = 2 * c <= L - 1, lv = srcSide ? c - 1 : L - 2 - c;
+				const cl = graph.anc[ ( srcSide ? s : tg ) * graph.D + lv ];
+				const rel = best / Math.max( 1e-6, clusterPos[ 4 * cl + 3 ] );
+				worstRel = Math.max( worstRel, rel ); meanRel += rel; cnt ++;
+
+			}
+
+		}
+
+		out.value.dispose?.(); sel.value.dispose?.();
+		return { edgesChecked: M, samples: K, maxGpuCpuErr: maxErr, coordScale: scale, maxEndpointErr: maxEndErr, nonFinite: nan, beta1CentroidDistOverClusterRadius: { mean: cnt ? meanRel / cnt : 0, worst: worstRel, controlPoints: cnt } };
+
+	};
+
+	const hud = document.getElementById( 'hud' );
+	app.events.addEventListener( 'frame', () => {
+
+		if ( app.frame % 20 === 0 ) {
+
+			const st = edges ? edges.stats : null;
+			hud.textContent = `${graph.name}  N=${graph.N} E=${graph.E} D=${graph.D}  mode=${mode}  fps=${app.fps.toFixed( 1 )} (${app.frameMs.toFixed( 1 )} ms)` +
+				( st ? `\nedges: S=${st.segments} vertices=${st.vertices} tris=${st.triangles} opacity=${st.autoOpacity.toFixed( 3 )} beta=${edges.bundling}` : '\nedges: off' ) +
+				`\nprepare ${prepMs.toFixed( 0 )} ms`;
+
+		}
+
+	} );
+	window.__info = () => ( { N: graph.N, E: graph.E, D: graph.D, stats: edges && edges.stats, fps: app.fps, frameMs: app.frameMs, drawCalls: app.renderer.info.render.drawCalls, triangles: app.renderer.info.render.triangles } );
+	window.__ready = true;
+
+} catch ( e ) {
+
+	console.error( e );
+	window.__error = e && e.stack || String( e );
+
+}
+</script>
+</body>
+</html>

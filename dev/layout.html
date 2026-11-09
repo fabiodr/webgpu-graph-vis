@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>dev: layout</title>
+<style>html,body{margin:0;height:100%;background:#000;color:#ccc;font:12px system-ui}#app{position:fixed;inset:0}#hud{position:fixed;left:8px;top:8px;white-space:pre;pointer-events:none;text-shadow:0 0 3px #000}</style>
+</head>
+<body>
+<div id="app"></div><div id="hud"></div>
+<script type="module">
+// Dev page for the GPU force layout (src/gpu/ForceLayout.js).
+//
+// URL params
+//   ds=imsv/lesmis          dataset under /data/ (default)
+//   synth=3000&deg=20&br=10,10   synthetic clustered graph instead (src/debug/synth.js)
+//   theta, charge, gravity, ticks (fixed ticks/frame), leaf (virtual leaf size), maxIter
+//   mode=sphere             start in the paper's sphere layout
+//   nofit                   do not auto-fit the camera to the layout
+// Helpers on window (used by scripts/shot.mjs --eval):
+//   __layout, __app, __graph
+//   __validate()            nodeForce at theta = 0 / 0.5 / 0.8 vs a CPU brute-force reference
+//   __dragTest()            drag a node, check neighbours follow, pin keeps it fixed
+//   __bench(ticks)          wall-clock ms per tick (full tick and repulsion only)
+//   __positions()           Float32Array of current node positions (GPU readback)
+//   __fit()                 fit the camera to the current positions
+import * as THREE from 'three/webgpu';
+import { uniform, instancedArray, Fn, instanceIndex, vertexIndex, select, float } from 'three/tsl';
+import { createApp } from '../src/app/App.js';
+import { loadPrepared } from '../src/data/load.js';
+import { prepareGraph } from '../src/graph/prepare.js';
+import { synthGraph } from '../src/debug/synth.js';
+import { normalizeGraph } from '../src/data/format.js';
+import { DebugNodes } from '../src/debug/DebugNodes.js';
+import { ForceLayout } from '../src/gpu/ForceLayout.js';
+import { aggregateCPU, repulsionCPU } from '../src/gpu/forceKernels.js';
+
+const params = new URLSearchParams( location.search );
+const num = ( k, d ) => ( params.has( k ) ? Number( params.get( k ) ) : d );
+const sleep = ( ms ) => new Promise( ( r ) => setTimeout( r, ms ) );
+
+try {
+
+	const app = await createApp( document.getElementById( 'app' ) );
+	window.__app = app;
+	let graph;
+	if ( params.has( 'synth' ) ) {
+
+		const br = ( params.get( 'br' ) || '10,10' ).split( ',' ).map( Number ).filter( ( x ) => x > 0 );
+		const t0 = performance.now();
+		graph = prepareGraph( synthGraph( { n: num( 'synth', 3000 ), avgDegree: num( 'deg', 20 ), branching: br.length ? br : [ 1 ] } ) );
+		console.info( `synth prepared in ${( performance.now() - t0 ).toFixed( 0 )} ms` );
+
+	} else {
+
+		graph = await loadPrepared( `/data/${params.get( 'ds' ) || 'imsv/lesmis'}.json` );
+
+	}
+
+	window.__graph = graph;
+	// for edge-case tests: __setGraph( __prepare( { nodeCount, edges, hierarchy } ) ), __synth( {...} )
+	window.__prepare = ( raw ) => prepareGraph( normalizeGraph( raw ) );
+	window.__synth = ( o ) => prepareGraph( synthGraph( o ) );
+	window.__setGraph = ( g ) => {
+
+		window.__graph = graph = g;
+		app.setGraph( g );
+
+	};
+
+	// straight debug edges (dev only): endpoints read from nodePos in the vertex stage
+	class DebugEdges {
+
+		constructor() {
+
+			this.order = 11;
+
+		}
+
+		setGraph( buffers, g, app ) {
+
+			if ( this.mesh ) app.scene.remove( this.mesh );
+			if ( params.has( 'noedges' ) || g.E === 0 ) return;
+			const geo = new THREE.BufferGeometry();
+			geo.setAttribute( 'position', new THREE.BufferAttribute( new Float32Array( 6 * g.E ), 3 ) );
+			const mat = new THREE.LineBasicNodeMaterial( { transparent: true, depthWrite: false, blending: THREE.AdditiveBlending } );
+			const e = buffers.edgeInfo.element( vertexIndex.div( 2 ) );
+			const end = select( vertexIndex.mod( 2 ).equal( 0 ), e.x, e.y );
+			mat.positionNode = buffers.nodePos.element( end ).xyz;
+			mat.colorNode = buffers.nodeColor.element( end ).xyz;
+			mat.opacityNode = float( Math.min( 0.5, 40 / Math.sqrt( g.E ) ) );
+			this.mesh = new THREE.LineSegments( geo, mat );
+			this.mesh.frustumCulled = false;
+			app.scene.add( this.mesh );
+
+		}
+
+	}
+
+	const opts = {};
+	for ( const [ k, key ] of [ [ 'theta', 'theta' ], [ 'charge', 'charge' ], [ 'gravity', 'gravity' ], [ 'ticks', 'ticksPerFrame' ], [ 'leaf', 'leafSize' ], [ 'maxIter', 'maxIterations' ] ] ) if ( params.has( k ) ) opts[ key ] = num( k );
+	const layout = new ForceLayout( opts );
+	window.__layout = layout;
+	app.use( layout );
+	app.use( new DebugEdges() );
+	app.use( new DebugNodes( { size: graph.N > 5000 ? 3 : 5 } ) );
+	app.setGraph( graph );
+	if ( params.get( 'mode' ) === 'sphere' ) layout.setLayoutMode( 'sphere' );
+
+	const fit = ( smooth = 0 ) => {
+
+		const s = app.boundingSphere();
+		const vHalf = THREE.MathUtils.degToRad( app.camera.fov / 2 );
+		const hHalf = Math.atan( Math.tan( vHalf ) * app.camera.aspect );
+		const dist = ( s.radius * 1.15 ) / Math.sin( Math.min( vHalf, hHalf ) );
+		const dir = app.camera.position.clone().sub( app.controls ? app.controls.target : new THREE.Vector3() ).normalize();
+		if ( dir.lengthSq() === 0 ) dir.set( 0, 0, 1 );
+		const target = s.center.clone();
+		const pos = target.clone().addScaledVector( dir, dist );
+		if ( smooth > 0 ) {
+
+			app.camera.position.lerp( pos, smooth );
+			if ( app.controls ) app.controls.target.lerp( target, smooth );
+
+		} else {
+
+			app.camera.position.copy( pos );
+			if ( app.controls ) app.controls.target.copy( target );
+
+		}
+
+		app.camera.lookAt( app.controls ? app.controls.target : target );
+
+	};
+
+	window.__fit = () => fit( 0 );
+	fit( 0 );
+
+	window.__positions = async () => new Float32Array( await app.renderer.getArrayBufferAsync( app.buffers.nodePos.value ) );
+
+	// ── force accuracy check ───────────────────────────────────────────────────────────────
+	window.__validate = async ( thetas = [ 0, 0.5, 0.8 ] ) => {
+
+		const wasPaused = layout.paused;
+		layout.pause();
+		await sleep( 100 );
+		const pos = await window.__positions();
+		const N = graph.N;
+		const charge = layout.charge, dmin2 = layout.distanceMin * layout.distanceMin;
+		const ref = new Float64Array( 3 * N );
+		const t0 = performance.now();
+		for ( let i = 0; i < N; i ++ ) {
+
+			let fx = 0, fy = 0, fz = 0;
+			const px = pos[ 4 * i ], py = pos[ 4 * i + 1 ], pz = pos[ 4 * i + 2 ];
+			for ( let j = 0; j < N; j ++ ) {
+
+				if ( j === i ) continue;
+				const dx = pos[ 4 * j ] - px, dy = pos[ 4 * j + 1 ] - py, dz = pos[ 4 * j + 2 ] - pz;
+				let l2 = dx * dx + dy * dy + dz * dz;
+				if ( l2 < 1e-12 ) continue;
+				if ( l2 < dmin2 ) l2 = Math.sqrt( dmin2 * l2 );
+				fx += ( dx * charge ) / l2; fy += ( dy * charge ) / l2; fz += ( dz * charge ) / l2;
+
+			}
+
+			ref[ 3 * i ] = fx; ref[ 3 * i + 1 ] = fy; ref[ 3 * i + 2 ] = fz;
+
+		}
+
+		const cpuMs = performance.now() - t0;
+		const out = { N, cpuBruteForceMs: Math.round( cpuMs ), bh: layout.stats.bh, maxIterations: layout.maxIterations };
+		for ( const th of thetas ) {
+
+			const f = await layout.readForces( { theta: th } );
+			const rel = new Float64Array( N );
+			let nan = 0;
+			for ( let i = 0; i < N; i ++ ) {
+
+				const ex = ref[ 3 * i ], ey = ref[ 3 * i + 1 ], ez = ref[ 3 * i + 2 ];
+				const dx = f[ 4 * i ] - ex, dy = f[ 4 * i + 1 ] - ey, dz = f[ 4 * i + 2 ] - ez;
+				if ( ! Number.isFinite( f[ 4 * i ] + f[ 4 * i + 1 ] + f[ 4 * i + 2 ] ) ) nan ++;
+				rel[ i ] = Math.hypot( dx, dy, dz ) / Math.max( 1e-9, Math.hypot( ex, ey, ez ) );
+
+			}
+
+			rel.sort();
+			const q = ( p ) => rel[ Math.min( N - 1, Math.floor( p * N ) ) ];
+			out[ 'theta' + th ] = { median: + q( 0.5 ).toExponential( 3 ), p95: + q( 0.95 ).toExponential( 3 ), max: + rel[ N - 1 ].toExponential( 3 ), nan };
+
+		}
+
+		// GPU vs the CPU mirror of the same walk (same tree, same acceptance) at the default theta
+		{
+
+			const f = await layout.readForces( { theta: layout.theta } );
+			const bh = aggregateCPU( graph, layout.struct, pos );
+			const m = repulsionCPU( layout.struct, pos, bh, { theta: layout.theta, charge, distanceMin: layout.distanceMin, maxIterations: layout.maxIterations } ).force;
+			let worst = 0;
+			const rel = new Float64Array( N );
+			for ( let i = 0; i < N; i ++ ) {
+
+				const e = Math.hypot( f[ 4 * i ] - m[ 4 * i ], f[ 4 * i + 1 ] - m[ 4 * i + 1 ], f[ 4 * i + 2 ] - m[ 4 * i + 2 ] );
+				rel[ i ] = e / Math.max( 1e-9, Math.hypot( m[ 4 * i ], m[ 4 * i + 1 ], m[ 4 * i + 2 ] ) );
+				worst = Math.max( worst, rel[ i ] );
+
+			}
+
+			rel.sort();
+			out.gpuVsCpuMirror = { theta: layout.theta, median: + rel[ N >> 1 ].toExponential( 2 ), max: + worst.toExponential( 2 ) };
+
+		}
+
+		if ( ! wasPaused ) layout.resume();
+		return out;
+
+	};
+
+	// ── drag / pin check ───────────────────────────────────────────────────────────────────
+	window.__dragTest = async () => {
+
+		const N = graph.N;
+		let best = 0;
+		for ( let i = 0; i < N; i ++ ) if ( graph.degree[ i ] > graph.degree[ best ] ) best = i;
+		const i = best;
+		const nbrs = Array.from( graph.adjList.subarray( graph.adjStart[ i ], graph.adjStart[ i ] + graph.degree[ i ] ) );
+		const p0 = await window.__positions();
+		const at = ( p, k ) => new THREE.Vector3( p[ 4 * k ], p[ 4 * k + 1 ], p[ 4 * k + 2 ] );
+		const mean = ( p, ks ) => ks.reduce( ( a, k ) => a.add( at( p, k ) ), new THREE.Vector3() ).multiplyScalar( 1 / ks.length );
+		const start = at( p0, i );
+		const offset = new THREE.Vector3( graph.layoutRadius * 0.8, graph.layoutRadius * 0.3, 0 );
+		const target = start.clone().add( offset );
+		const nbr0 = mean( p0, nbrs );
+		layout.startDrag( i );
+		const steps = 20;
+		for ( let s = 1; s <= steps; s ++ ) {
+
+			layout.drag( i, start.clone().lerp( target, s / steps ) );
+			await sleep( 50 );
+
+		}
+
+		await sleep( 1500 );
+		const p1 = await window.__positions();
+		const nodeErr = at( p1, i ).distanceTo( target );
+		const nbr1 = mean( p1, nbrs );
+		const followed = nbr1.clone().sub( nbr0 ).dot( offset ) / offset.length();
+		layout.endDrag( i, { pin: true } );
+		await sleep( 1500 );
+		const p2 = await window.__positions();
+		const pinnedDrift = at( p2, i ).distanceTo( target );
+		const pinnedFlag = p2[ 4 * i + 3 ];
+		// release: unpin, the node should move again (pulled back by its neighbours)
+		layout.setPinned( i, false );
+		layout.reheat( 0.3 );
+		await sleep( 1500 );
+		const p3 = await window.__positions();
+		const releasedMove = at( p3, i ).distanceTo( target );
+		return {
+			node: i, degree: graph.degree[ i ], dragDistance: + offset.length().toFixed( 1 ),
+			nodeErrWhileDragging: + nodeErr.toFixed( 4 ),
+			neighbourMeanMovedAlongDrag: + followed.toFixed( 1 ),
+			pinnedDriftAfterRelease: + pinnedDrift.toFixed( 4 ), pinnedFlag,
+			movedAfterUnpin: + releasedMove.toFixed( 1 ), unpinnedFlag: p3[ 4 * i + 3 ],
+		};
+
+	};
+
+	// per-call uniform upload check: 3 compute calls in one JS turn with u = 1, 2, 3 -> expect 6
+	window.__uniformTest = async () => {
+
+		const u = uniform( 0 );
+		const buf = instancedArray( 1, 'float' );
+		const k = Fn( () => {
+
+			buf.element( instanceIndex ).addAssign( u );
+
+		} )().compute( 1 );
+		for ( let i = 1; i <= 3; i ++ ) {
+
+			u.value = i;
+			app.renderer.compute( k );
+
+		}
+
+		return new Float32Array( await app.renderer.getArrayBufferAsync( buf.value ) )[ 0 ];
+
+	};
+
+	// generated WGSL of a layout kernel, e.g. __wgsl( 'repulsion' )
+	window.__wgsl = ( name = 'repulsion' ) => {
+
+		const k = layout.kernels[ name ];
+		const node = Array.isArray( k ) ? k[ 0 ] : k;
+		return app.renderer._nodes.getForCompute( node ).computeShader;
+
+	};
+
+	window.__bench = async ( ticks = 10 ) => {
+
+		const wasPaused = layout.paused;
+		layout.pause();
+		await sleep( 50 );
+		const full = await layout.benchmark( ticks );
+		const rep = await layout.benchmark( ticks, { repulsionOnly: true } );
+		if ( ! wasPaused ) layout.resume();
+		return { msPerTick: + full.toFixed( 2 ), repulsionMs: + rep.toFixed( 2 ), N: graph.N, E: graph.E, bh: layout.stats.bh };
+
+	};
+
+	const hud = document.getElementById( 'hud' );
+	let lastFit = 0;
+	app.events.addEventListener( 'frame', () => {
+
+		if ( ! params.has( 'nofit' ) && app.time - lastFit > 0.5 ) {
+
+			lastFit = app.time;
+			fit( 0.5 );
+
+		}
+
+		if ( app.frame % 15 === 0 ) {
+
+			const s = layout.stats;
+			const bs = app.boundingSphere();
+			hud.textContent = `${graph.name}  N=${graph.N} E=${graph.E} D=${graph.D}  fps=${app.fps.toFixed( 1 )}\n` +
+				`${s.mode} blend=${s.blend.toFixed( 2 )} alpha=${s.alpha.toFixed( 4 )} running=${s.running} ticks=${s.ticks} k=${s.ticksPerFrame} (static ${s.kStatic}, dyn ${s.kDynamic})\n` +
+				`radius=${bs.radius.toFixed( 0 )} (layoutRadius ${graph.layoutRadius.toFixed( 0 )})  gravity=${s.gravity.toFixed( 4 )}\n` +
+				`BH: tree ${s.bh.treeSize}, virtual ${s.bh.virtualClusters} (${s.bh.virtualHeights} heights), visits/node ≈ ${s.bh.visitsPerNode.toFixed( 0 )}`;
+
+		}
+
+	} );
+
+	window.__ready = true;
+
+} catch ( e ) {
+
+	console.error( e );
+	window.__error = e && e.stack || String( e );
+
+}
+</script>
+</body>
+</html>

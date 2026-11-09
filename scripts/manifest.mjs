@@ -1,5 +1,12 @@
-// Scans public/data/**/*.json (wgv-graph files) and writes public/data/manifest.json, which the
-// app uses to populate the dataset picker. Run automatically by the data scripts.
+// Scans public/data/**/*.json and writes public/data/manifest.json, which the app uses to populate
+// the dataset picker. Run automatically by the data scripts.
+//
+// Entry fields: id, group, name, description, source, nodes, edges, levels, order, and either
+//   file      "data/<group>/<id>.json" (wgv-graph files; also `bytes`), or
+//   generate  { model, params, seed } for presets listed in a "wgv-presets" file (written by
+//             scripts/generate.mjs for graphs too large to commit); the app generates them in the
+//             data worker (DataClient.load(entry)), deterministically.
+// Optional: tier ('readable' | 'overview' | 'stress' | 'sanity') for generated presets.
 import { readdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
@@ -27,9 +34,33 @@ export function buildManifest() {
 	for ( const file of walk( ROOT ) ) {
 
 		const g = JSON.parse( readFileSync( file, 'utf8' ) );
-		if ( g.format !== 'wgv-graph' ) continue;
 		const rel = relative( ROOT, file ).split( '\\' ).join( '/' );
 		const group = rel.split( '/' )[ 0 ];
+		if ( g.format === 'wgv-presets' ) {
+
+			for ( const p of g.presets || [] ) {
+
+				datasets.push( {
+					id: p.id,
+					generate: p.generate,
+					group: p.group || group,
+					name: p.name,
+					description: p.description || '',
+					source: p.source || '',
+					nodes: p.nodes,
+					edges: p.edges,
+					levels: p.levels,
+					order: Number.isFinite( p.order ) ? p.order : 1e9,
+					tier: p.tier,
+				} );
+
+			}
+
+			continue;
+
+		}
+
+		if ( g.format !== 'wgv-graph' ) continue;
 		datasets.push( {
 			id: rel.replace( /\.json$/, '' ),
 			file: 'data/' + rel,
@@ -42,6 +73,7 @@ export function buildManifest() {
 			levels: g.hierarchy ? g.hierarchy.levels.length : 0,
 			bytes: statSync( file ).size,
 			order: g.meta && Number.isFinite( g.meta.order ) ? g.meta.order : 1e9,
+			tier: g.meta && g.meta.tier ? g.meta.tier : undefined,
 		} );
 
 	}

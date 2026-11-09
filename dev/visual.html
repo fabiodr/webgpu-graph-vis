@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>dev: visual</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui;overflow:hidden}
+#app{position:fixed;inset:0}
+#hud{position:fixed;left:10px;bottom:8px;white-space:pre;opacity:.7;z-index:2;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="app"></div><div id="hud"></div>
+<script type="module">
+// Dev page for the visual modules (NodeRenderer, Labels, PostFX, Background).
+// The real ForceLayout / EdgeRenderer are built in parallel, so this page uses stand-ins:
+//  - StubLayout: static positions (a quick CPU spring layout for small graphs, the paper sphere
+//    layout with ?layout=sphere), GPU easing of nodeState toward nodeStateTarget, ForceLayout API
+//    as no-ops.
+//  - stand-in edges: CPU hierarchical edge bundling (B-splines through cluster centroids,
+//    straightened by beta) drawn as additive LineSegments; straight lines for big graphs.
+// Query: ds=imsv/lesmis | synth&n=20000, nodes=renderer|debug, tone=agx|neutral|aces|none,
+//        bloom=0.8, labels=auto|all|off, layout=force|sphere, sel=<index|label>, hover=<index|label>,
+//        edges=bundled|straight|none, post=0, quality=high|low|auto, zoom=1, yaw=0, pitch=0,
+//        size=1, palette=paper|rainbow|aurora|ember
+import * as THREE from 'three/webgpu';
+import { Fn, instanceIndex, mix, uniform, If, uint } from 'three/tsl';
+import { createApp } from '../src/app/App.js';
+import { loadPrepared } from '../src/data/load.js';
+import { prepareGraph, colorize } from '../src/graph/prepare.js';
+import { DebugNodes } from '../src/debug/DebugNodes.js';
+import { synthGraph } from '../src/debug/synth.js';
+import { NodeRenderer } from '../src/render/NodeRenderer.js';
+import { Labels } from '../src/render/Labels.js';
+import { PostFX } from '../src/render/PostFX.js';
+import { Background } from '../src/render/Background.js';
+
+const params = new URLSearchParams( location.search );
+const P = ( k, d ) => ( params.has( k ) ? params.get( k ) : d );
+
+/** Stand-in for src/gpu/ForceLayout.js: static layout + GPU nodeState easing. */
+class StubLayout {
+
+	constructor() {
+
+		this.order = 0;
+		this.running = false; this.alpha = 0;
+		this.charge = 1; this.linkDistance = 30; this.gravity = 1; this.theta = 0.8; this.velocityDecay = 0.4;
+		this.ease = uniform( 0.2 );
+		this.focusTarget = 0;
+		this.mode = 'force';
+
+	}
+
+	init( app ) { this.app = app; }
+
+	setGraph( buffers, graph ) {
+
+		this.buffers = buffers; this.graph = graph;
+		const N = graph.N;
+		this.forcePos = graph.N <= 700 ? cpuLayout( graph ) : new Float32Array( graph.initPos );
+		this.easeNode = Fn( () => {
+
+			If( instanceIndex.lessThan( uint( N ) ), () => {
+
+				const s = buffers.nodeState.element( instanceIndex );
+				s.assign( mix( s, buffers.nodeStateTarget.element( instanceIndex ), this.ease ) );
+
+			} );
+
+		} )().compute( N );
+		this.setLayoutMode( this.mode, true );
+
+	}
+
+	setLayoutMode( mode, immediate ) {
+
+		this.mode = mode;
+		const g = this.graph, b = this.buffers;
+		if ( mode === 'sphere' ) {
+
+			const R = g.layoutRadius, p = new Float32Array( 4 * g.N );
+			for ( let i = 0; i < g.N; i ++ ) for ( let k = 0; k < 3; k ++ ) p[ 4 * i + k ] = g.sphereDir[ 4 * i + k ] * R;
+			b.setPositions( p );
+			b.uniforms.layoutBlend.value = 1;
+
+		} else {
+
+			b.setPositions( this.forcePos );
+			b.uniforms.layoutBlend.value = 0;
+
+		}
+
+		this.app.positions = new Float32Array( b.nodePos.value.array );
+		this.app.positionsVersion ++;
+		void immediate;
+
+	}
+
+	update( dt, app ) {
+
+		if ( ! this.easeNode ) return;
+		const k = 1 - Math.exp( - dt * 9 );
+		this.ease.value = k;
+		app.renderer.compute( this.easeNode );
+		const f = this.buffers.uniforms.focus;
+		f.value += ( this.focusTarget - f.value ) * k;
+
+	}
+
+	reheat() {} pause() {} resume() {} startDrag() {} drag() {} endDrag() {} setPinned() {} unpinAll() {} resetPositions() {}
+
+}
+
+/** Quick O(N²) spring-electrical layout (Fruchterman–Reingold style) for small graphs. */
+function cpuLayout( g ) {
+
+	const N = g.N, E = g.E, L = g.linkDistance;
+	const p = new Float64Array( 3 * N );
+	for ( let i = 0; i < N; i ++ ) for ( let k = 0; k < 3; k ++ ) p[ 3 * i + k ] = g.initPos[ 4 * i + k ] * 0.6;
+	const f = new Float64Array( 3 * N );
+	const iters = 260;
+	for ( let it = 0; it < iters; it ++ ) {
+
+		f.fill( 0 );
+		for ( let i = 0; i < N; i ++ ) {
+
+			for ( let j = i + 1; j < N; j ++ ) {
+
+				const dx = p[ 3 * i ] - p[ 3 * j ], dy = p[ 3 * i + 1 ] - p[ 3 * j + 1 ], dz = p[ 3 * i + 2 ] - p[ 3 * j + 2 ];
+				const d2 = dx * dx + dy * dy + dz * dz + 1;
+				const s = ( L * L * 1.2 ) / d2;
+				f[ 3 * i ] += dx * s; f[ 3 * i + 1 ] += dy * s; f[ 3 * i + 2 ] += dz * s;
+				f[ 3 * j ] -= dx * s; f[ 3 * j + 1 ] -= dy * s; f[ 3 * j + 2 ] -= dz * s;
+
+			}
+
+		}
+
+		for ( let e = 0; e < E; e ++ ) {
+
+			const a = g.edges[ 2 * e ], b = g.edges[ 2 * e + 1 ];
+			const dx = p[ 3 * a ] - p[ 3 * b ], dy = p[ 3 * a + 1 ] - p[ 3 * b + 1 ], dz = p[ 3 * a + 2 ] - p[ 3 * b + 2 ];
+			const d = Math.sqrt( dx * dx + dy * dy + dz * dz ) + 1e-6;
+			const w = 1 / Math.min( g.degree[ a ], g.degree[ b ] );
+			const s = ( ( d - L ) / d ) * 0.5 * w;
+			f[ 3 * a ] -= dx * s; f[ 3 * a + 1 ] -= dy * s; f[ 3 * a + 2 ] -= dz * s;
+			f[ 3 * b ] += dx * s; f[ 3 * b + 1 ] += dy * s; f[ 3 * b + 2 ] += dz * s;
+
+		}
+
+		const temp = L * 0.6 * ( 1 - it / iters ) + 0.5;
+		for ( let i = 0; i < N; i ++ ) {
+
+			for ( let k = 0; k < 3; k ++ ) f[ 3 * i + k ] -= p[ 3 * i + k ] * 0.012; // gravity
+			const fl = Math.hypot( f[ 3 * i ], f[ 3 * i + 1 ], f[ 3 * i + 2 ] ) + 1e-9;
+			const s = Math.min( fl, temp ) / fl;
+			for ( let k = 0; k < 3; k ++ ) p[ 3 * i + k ] += f[ 3 * i + k ] * s;
+
+		}
+
+	}
+
+	// rescale so that 90 % of the nodes lie within ~0.8 layoutRadius (what the GPU layout produces)
+	const c = [ 0, 0, 0 ];
+	for ( let i = 0; i < N; i ++ ) for ( let k = 0; k < 3; k ++ ) c[ k ] += p[ 3 * i + k ] / N;
+	const d = Array.from( { length: N }, ( _, i ) => Math.hypot( p[ 3 * i ] - c[ 0 ], p[ 3 * i + 1 ] - c[ 1 ], p[ 3 * i + 2 ] - c[ 2 ] ) ).sort( ( a, b ) => a - b );
+	const scale = ( 0.8 * g.layoutRadius ) / Math.max( 1e-6, d[ Math.floor( 0.9 * ( N - 1 ) ) ] );
+	const out = new Float32Array( 4 * N );
+	for ( let i = 0; i < N; i ++ ) for ( let k = 0; k < 3; k ++ ) out[ 4 * i + k ] = ( p[ 3 * i + k ] - c[ k ] ) * scale;
+	return out;
+
+}
+
+/** Stand-in edges: CPU hierarchical bundling (beta-straightened clamped B-splines). */
+function buildEdges( graph, buffers, mode ) {
+
+	const g = graph, D = g.D;
+	const pos = buffers.nodePos.value.array, cp = buffers.clusterPos.value.array, col = g.colors;
+	const beta = + P( 'beta', 0.85 );
+	const bundled = mode === 'bundled' && g.E * 16 <= 600000;
+	const SEG = bundled ? 16 : 1;
+	const maxE = Math.min( g.E, + P( 'maxe', bundled ? g.E : 400000 ) );
+	const verts = new Float32Array( maxE * SEG * 2 * 3 ), cols = new Float32Array( maxE * SEG * 2 * 3 );
+	let v = 0;
+	const ctrl = [];
+	const pt = ( out, a ) => { out[ 0 ] = a[ 0 ]; out[ 1 ] = a[ 1 ]; out[ 2 ] = a[ 2 ]; };
+	const evalB = ( C, t, out ) => {
+
+		const n = C.length, k = Math.min( 3, n - 1 );
+		const knots = [];
+		for ( let i = 0; i <= k; i ++ ) knots.push( 0 );
+		for ( let i = 1; i < n - k; i ++ ) knots.push( i / ( n - k ) );
+		for ( let i = 0; i <= k; i ++ ) knots.push( 1 );
+		let s = k;
+		while ( s < n - 1 && t >= knots[ s + 1 ] ) s ++;
+		const d = [];
+		for ( let j = 0; j <= k; j ++ ) d.push( C[ j + s - k ].slice() );
+		for ( let r = 1; r <= k; r ++ ) for ( let j = k; j >= r; j -- ) {
+
+			const i = j + s - k;
+			const den = knots[ i + k - r + 1 ] - knots[ i ];
+			const a = den > 0 ? ( t - knots[ i ] ) / den : 0;
+			for ( let c = 0; c < 3; c ++ ) d[ j ][ c ] = ( 1 - a ) * d[ j - 1 ][ c ] + a * d[ j ][ c ];
+
+		}
+
+		pt( out, d[ k ] );
+
+	};
+
+	const a3 = [ 0, 0, 0 ], b3 = [ 0, 0, 0 ];
+	for ( let e = 0; e < maxE; e ++ ) {
+
+		const s = g.edges[ 2 * e ], t = g.edges[ 2 * e + 1 ];
+		const P0 = [ pos[ 4 * s ], pos[ 4 * s + 1 ], pos[ 4 * s + 2 ] ], P1 = [ pos[ 4 * t ], pos[ 4 * t + 1 ], pos[ 4 * t + 2 ] ];
+		ctrl.length = 0;
+		ctrl.push( P0 );
+		if ( bundled ) {
+
+			const lca = g.edgeLca[ e ];
+			const c = ( id ) => [ cp[ 4 * id ], cp[ 4 * id + 1 ], cp[ 4 * id + 2 ] ];
+			for ( let l = 0; l < lca; l ++ ) ctrl.push( c( g.anc[ s * D + l ] ) );
+			if ( lca < D ) ctrl.push( c( g.anc[ s * D + lca ] ) );
+			for ( let l = lca - 1; l >= 0; l -- ) ctrl.push( c( g.anc[ t * D + l ] ) );
+
+		}
+
+		ctrl.push( P1 );
+		const n = ctrl.length;
+		for ( let i = 1; i < n - 1; i ++ ) for ( let k = 0; k < 3; k ++ ) ctrl[ i ][ k ] = beta * ctrl[ i ][ k ] + ( 1 - beta ) * ( P0[ k ] + ( P1[ k ] - P0[ k ] ) * ( i / ( n - 1 ) ) );
+		for ( let j = 0; j < SEG; j ++ ) {
+
+			const t0 = j / SEG, t1 = ( j + 1 ) / SEG;
+			if ( n > 2 ) {
+
+				evalB( ctrl, t0, a3 ); evalB( ctrl, Math.min( t1, 0.999999 ), b3 );
+				if ( j === SEG - 1 ) pt( b3, P1 );
+
+			} else {
+
+				for ( let k = 0; k < 3; k ++ ) { a3[ k ] = P0[ k ] + ( P1[ k ] - P0[ k ] ) * t0; b3[ k ] = P0[ k ] + ( P1[ k ] - P0[ k ] ) * t1; }
+
+			}
+
+			for ( const [ q, tt ] of [ [ a3, t0 ], [ b3, t1 ] ] ) {
+
+				verts[ v ] = q[ 0 ]; verts[ v + 1 ] = q[ 1 ]; verts[ v + 2 ] = q[ 2 ];
+				for ( let k = 0; k < 3; k ++ ) cols[ v + k ] = col[ 4 * s + k ] * ( 1 - tt ) + col[ 4 * t + k ] * tt;
+				v += 3;
+
+			}
+
+		}
+
+	}
+
+	const geo = new THREE.BufferGeometry();
+	geo.setAttribute( 'position', new THREE.BufferAttribute( verts, 3 ) );
+	geo.setAttribute( 'color', new THREE.BufferAttribute( cols, 3 ) );
+	const opacity = + P( 'eo', Math.min( 0.75, 9 / Math.sqrt( g.E ) ) );
+	const mat = new THREE.LineBasicNodeMaterial( { vertexColors: true, transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false } );
+	const lines = new THREE.LineSegments( geo, mat );
+	lines.frustumCulled = false;
+	lines.name = 'stand-in edges';
+	return lines;
+
+}
+
+try {
+
+	const app = await createApp( document.getElementById( 'app' ) );
+	window.__app = app;
+
+	// ?real=1: use the real ForceLayout + EdgeRenderer (built in parallel) instead of the stand-ins
+	const real = + P( 'real', 0 ) === 1;
+	let layout;
+	if ( real ) {
+
+		const { ForceLayout } = await import( '../src/gpu/ForceLayout.js' );
+		const { EdgeRenderer } = await import( '../src/render/EdgeRenderer.js' );
+		layout = app.use( new ForceLayout() );
+		layout.focusTarget = 0;
+		app.use( new EdgeRenderer() );
+		app.events.addEventListener( 'frame', () => {
+
+			const f = app.buffers?.uniforms.focus;
+			if ( f ) f.value += ( layout.focusTarget - f.value ) * 0.15;
+
+		} );
+
+	} else {
+
+		layout = app.use( new StubLayout() );
+		layout.mode = P( 'layout', 'force' );
+
+	}
+
+	const bg = app.use( new Background() );
+	const nodes = P( 'nodes', 'renderer' ) === 'debug' ? app.use( new DebugNodes() ) : app.use( new NodeRenderer( { size: + P( 'size', 1 ) } ) );
+	const labels = app.use( new Labels( { mode: P( 'labels', 'auto' ) } ) );
+	const post = + P( 'post', 1 ) ? app.use( new PostFX( { bloom: + P( 'bloom', 0.8 ), quality: P( 'quality', 'auto' ), toneMapping: P( 'tone', 'neutral' ) } ) ) : null;
+	Object.assign( window, { __layout: layout, __bg: bg, __nodes: nodes, __labels: labels, __post: post } );
+
+	const ds = P( 'ds', 'imsv/lesmis' );
+	const t0 = performance.now();
+	let graph;
+	if ( ds === 'synth' ) graph = prepareGraph( synthGraph( { n: + P( 'n', 20000 ), avgDegree: + P( 'deg', 20 ), branching: [ 8, 8 ] } ), { palette: P( 'palette', 'paper' ) } );
+	else graph = await loadPrepared( `/data/${ds}.json`, { palette: P( 'palette', 'paper' ) } );
+	const tPrep = performance.now() - t0;
+	app.setGraph( graph );
+	const buffers = app.buffers;
+
+	if ( real && P( 'layout', 'force' ) === 'sphere' ) layout.setLayoutMode( 'sphere' );
+	if ( real ) {
+
+		// let the layout settle before fitting the camera
+		const tEnd = performance.now() + + P( 'settle', 6000 );
+		while ( performance.now() < tEnd && ( layout.running || P( 'layout', 'force' ) === 'sphere' ) ) await new Promise( ( r ) => setTimeout( r, 100 ) );
+
+	}
+
+	let edges = null;
+	const edgeMode = real ? 'none' : P( 'edges', 'bundled' );
+	if ( edgeMode !== 'none' ) {
+
+		edges = buildEdges( graph, buffers, edgeMode );
+		app.scene.add( edges );
+
+	}
+
+	// camera: fit the bounding sphere
+	function fit( zoom = + P( 'zoom', 1 ) ) {
+
+		const s = app.boundingSphere();
+		const vfov = THREE.MathUtils.degToRad( app.camera.fov );
+		const fov = Math.min( vfov, 2 * Math.atan( Math.tan( vfov / 2 ) * app.camera.aspect ) ); // portrait: horizontal fov
+		const dist = ( s.radius / Math.sin( fov / 2 ) ) * 1.02 / zoom;
+		const yaw = THREE.MathUtils.degToRad( + P( 'yaw', 0 ) ), pitch = THREE.MathUtils.degToRad( + P( 'pitch', 0 ) );
+		app.camera.position.set( s.center.x + dist * Math.sin( yaw ) * Math.cos( pitch ), s.center.y + dist * Math.sin( pitch ), s.center.z + dist * Math.cos( yaw ) * Math.cos( pitch ) );
+		app.controls?.target.copy( s.center );
+		app.camera.lookAt( s.center );
+
+	}
+
+	fit();
+	window.__fit = fit;
+
+	const indexOf = ( v ) => {
+
+		if ( v === null || v === undefined || v === '' ) return - 1;
+		if ( /^-?\d+$/.test( v ) ) return + v;
+		return graph.labels ? graph.labels.indexOf( v ) : - 1;
+
+	};
+
+	/** Highlight helpers (what the interaction module will do). */
+	function select( i, { snap = false } = {} ) {
+
+		const N = graph.N, t = new Float32Array( 4 * N );
+		if ( i >= 0 ) {
+
+			for ( let k = 0; k < N; k ++ ) t[ 4 * k + 2 ] = 1;
+			t[ 4 * i ] = 1; t[ 4 * i + 2 ] = 0;
+			for ( let k = graph.adjStart[ i ]; k < graph.adjStart[ i ] + graph.degree[ i ]; k ++ ) {
+
+				const j = graph.adjList[ k ];
+				t[ 4 * j + 1 ] = 1; t[ 4 * j + 2 ] = 0;
+
+			}
+
+		}
+
+		const hov = buffers.uniforms.hoverIndex.value;
+		if ( hov >= 0 ) t[ 4 * hov + 3 ] = 1;
+		buffers.setStateTargets( t );
+		buffers.uniforms.selectedIndex.value = i;
+		layout.focusTarget = i >= 0 ? 1 : 0;
+		if ( snap ) {
+
+			buffers.nodeState.value.array.set( t );
+			buffers.nodeState.value.needsUpdate = true;
+			buffers.uniforms.focus.value = layout.focusTarget;
+
+		}
+
+	}
+
+	function hover( i, opts ) {
+
+		buffers.uniforms.hoverIndex.value = i;
+		select( buffers.uniforms.selectedIndex.value, opts );
+
+	}
+
+	Object.assign( window, { __select: select, __hover: hover, __graph: graph, __indexOf: indexOf } );
+	const h = indexOf( P( 'hover', '' ) );
+	if ( h >= 0 ) hover( h, { snap: true } );
+	const sel = indexOf( P( 'sel', '' ) );
+	if ( sel >= 0 ) select( sel, { snap: true } );
+
+	const hud = document.getElementById( 'hud' );
+	app.events.addEventListener( 'frame', () => {
+
+		if ( app.frame % 15 === 0 ) hud.textContent = `${graph.name}  N=${graph.N} E=${graph.E}  prep ${tPrep.toFixed( 0 )} ms  ${app.fps.toFixed( 1 )} fps  ${app.frameMs.toFixed( 1 )} ms/frame`;
+
+	} );
+
+	// ready after a few rendered frames
+	await new Promise( ( resolve ) => {
+
+		const f0 = app.frame;
+		const check = () => ( app.frame - f0 >= 3 ? resolve() : requestAnimationFrame( check ) );
+		check();
+
+	} );
+	window.__ready = true;
+
+} catch ( e ) {
+
+	console.error( e );
+	window.__error = e && e.stack ? e.stack : String( e );
+
+}
+</script>
+</body>
+</html>

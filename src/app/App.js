@@ -175,8 +175,11 @@ export class App {
 		this.positionsVersion ++;
 		if ( this._readbackBuffer ) {
 
-			this._readbackBuffer.dispose();
+			// a mapAsync may still be in flight: dispose once it settles
+			const rb = this._readbackBuffer;
 			this._readbackBuffer = null;
+			if ( this._readbackBusy ) this._staleReadbacks = [ ...( this._staleReadbacks || [] ), rb ];
+			else rb.dispose();
 
 		}
 
@@ -259,11 +262,17 @@ export class App {
 
 		} ).catch( ( e ) => {
 
-			console.warn( 'readback failed', e );
+			if ( e && e.name !== 'AbortError' ) console.warn( 'readback failed', e );
 
 		} ).finally( () => {
 
 			this._readbackBusy = false;
+			if ( this._staleReadbacks ) {
+
+				for ( const old of this._staleReadbacks ) old.dispose();
+				this._staleReadbacks = null;
+
+			}
 
 		} );
 

@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>dev: ui + real modules</title>
+<style>
+html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+#app { position: fixed; inset: 0; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script type="module">
+// Integration preview: the interaction / camera / UI module wired to the real ForceLayout,
+// NodeRenderer, EdgeRenderer, Labels, Background and PostFX (what main.js is expected to do).
+// Query: ?ds=imsv/lesmis &autorotate=0
+import '../src/ui/ui.css';
+import { createApp } from '../src/app/App.js';
+import { loadPrepared, fetchManifest } from '../src/data/load.js';
+import { colorize } from '../src/graph/prepare.js';
+import { ForceLayout } from '../src/gpu/ForceLayout.js';
+import { NodeRenderer } from '../src/render/NodeRenderer.js';
+import { EdgeRenderer } from '../src/render/EdgeRenderer.js';
+import { Labels } from '../src/render/Labels.js';
+import { Background } from '../src/render/Background.js';
+import { PostFX } from '../src/render/PostFX.js';
+import { CameraRig } from '../src/interact/CameraRig.js';
+import { Interaction } from '../src/interact/Interaction.js';
+import { Panel, DEFAULT_SETTINGS } from '../src/ui/Panel.js';
+import { NodeCard } from '../src/ui/NodeCard.js';
+
+const params = new URLSearchParams( location.search );
+try {
+
+	const app = await createApp( document.getElementById( 'app' ) );
+	window.__app = app;
+	const settings = { ...DEFAULT_SETTINGS, dataset: params.get( 'ds' ) || DEFAULT_SETTINGS.dataset };
+	const rig = new CameraRig();
+	if ( rig.reducedMotion || params.get( 'autorotate' ) === '0' ) settings.autoRotate = false;
+	rig.autoRotate = settings.autoRotate;
+
+	const layout = app.use( new ForceLayout() );
+	// settings.charge / gravity are multipliers on ForceLayout's d3-style values (charge −30,
+	// automatic gravity), damping is d3's velocityDecay
+	function applyForces() {
+
+		const g = app.graph;
+		layout.charge = - 30 * settings.charge;
+		layout.linkDistance = settings.linkDistance;
+		layout.theta = settings.theta;
+		layout.velocityDecay = settings.damping;
+		layout.gravity = settings.gravity === 1 || ! g ? null : Math.min( 0.2, ( 0.35 * 30 * settings.charge * g.N ) / ( g.layoutRadius * g.layoutRadius ) ) * settings.gravity;
+
+	}
+
+	applyForces();
+	app.events.addEventListener( 'graph', applyForces );
+	const edges = app.use( new EdgeRenderer( { beta: settings.bundling, opacity: settings.edgeOpacity, width: settings.edgeWidth, blendMode: settings.edgeBlend } ) );
+	const nodes = app.use( new NodeRenderer( { size: settings.nodeSize } ) );
+	app.use( new Background() );
+	const labels = app.use( new Labels( { mode: settings.labels } ) );
+	const post = app.use( new PostFX( { bloom: settings.bloom, quality: settings.quality } ) );
+
+	let panel = null;
+	const cycle = ( list, v ) => list[ ( list.indexOf( v ) + 1 ) % list.length ];
+	const interaction = new Interaction( {
+		layout, rig,
+		onDropFile: ( file ) => panel.toast( `Dropped “${file.name}” (file loading is wired in main.js)`, { type: 'info' } ),
+		onDropRejected: ( file ) => panel.toast( `Unsupported file “${file.name}”. Use .json, .txt or .csv.` ),
+		onCommand: ( name ) => {
+
+			if ( name === 'toggle-run' ) return set( 'running', ! settings.running );
+			if ( name === 'cycle-labels' ) return set( 'labels', cycle( [ 'auto', 'all', 'off' ], settings.labels ) );
+			if ( name === 'help' ) return panel.toggleHelp(), true;
+			return false; // escape / fit / reheat: defaults
+
+		},
+	} );
+	interaction.picking.setRadiusFunction( ( i ) => nodes.worldRadius( i ) );
+	app.use( interaction );
+	app.use( rig );
+	const card = app.use( new NodeCard( { interaction, rig } ) );
+
+	function apply( key, v ) {
+
+		switch ( key ) {
+
+			case 'dataset': load( v ); break;
+			case 'layoutMode':
+				layout.setLayoutMode( v );
+				if ( v !== 'sphere' && settings.immersive ) set( 'immersive', false );
+				if ( ! settings.immersive ) setTimeout( () => rig.fitToGraph(), 1100 );
+				break;
+			case 'running': v ? layout.resume() : layout.pause(); break;
+			case 'autoRotate': rig.setAutoRotate( v ); break;
+			case 'immersive': rig.setImmersive( v ); break;
+			case 'bundling': edges.setBundling( v ); break;
+			case 'edgeOpacity': edges.opacity = v; break;
+			case 'edgeWidth': edges.width = v; break;
+			case 'edgeBlend': edges.blendMode = v; break;
+			case 'nodeSize': nodes.size = v; break;
+			case 'bloom': post.bloomStrength = v; break;
+			case 'quality': post.quality = v; break;
+			case 'labels': labels.mode = v; break;
+			case 'palette':
+				if ( app.graph ) app.buffers.setColors( colorize( app.graph.leafRank, v ) );
+				card.setPalette( v );
+				break;
+			case 'charge': case 'linkDistance': case 'gravity': case 'theta': case 'damping':
+				applyForces();
+				if ( settings.running ) layout.reheat( 0.3 );
+				break;
+
+		}
+
+	}
+
+	/** Programmatic change: settings + panel + modules. */
+	function set( key, v ) {
+
+		settings[ key ] = v;
+		panel.set( key, v );
+		apply( key, v );
+		return true;
+
+	}
+
+	async function load( id ) {
+
+		panel.setLoading( 'Loading dataset…', null );
+		try {
+
+			app.setGraph( await loadPrepared( `/data/${id}.json`, { palette: settings.palette } ) );
+
+		} catch ( e ) {
+
+			panel.toast( `Could not load ${id}: ${e.message}` );
+
+		} finally {
+
+			panel.setLoading( null );
+
+		}
+
+	}
+
+	panel = new Panel( {
+		settings,
+		onChange: ( key, v ) => apply( key, v ),
+		onAction: ( name ) => {
+
+			if ( name === 'fit' ) rig.fitToGraph();
+			else if ( name === 'reheat' ) layout.reheat();
+			else if ( name === 'reset' ) {
+
+				layout.resetPositions();
+				rig.keepFramed( 4 );
+
+			} else panel.toast( `“${name}” is wired in main.js`, { type: 'info' } );
+
+		},
+		onOpenFile: ( file ) => panel.toast( `Would open “${file.name}”`, { type: 'info' } ),
+		onInsets: ( insets ) => rig.setInsets( insets ),
+	} );
+	rig.setInsets( panel.insets(), { animate: false } );
+	fetchManifest( '/data/manifest.json' ).then( ( m ) => panel.setManifest( m ) ).catch( ( e ) => panel.toast( e.message ) );
+	app.events.addEventListener( 'immersive', ( e ) => {
+
+		if ( settings.immersive !== e.detail.immersive ) panel.set( 'immersive', e.detail.immersive );
+
+	} );
+	app.events.addEventListener( 'frame', () => {
+
+		const g = app.graph;
+		if ( g ) panel.update( { nodes: g.N, edges: g.E, clusters: g.stats.clusters, levels: g.D, fps: app.fps, alpha: layout.alpha, running: layout.running } );
+
+	} );
+
+	await load( settings.dataset );
+	window.__ui = { app, settings, layout, rig, interaction, panel, card, nodes, edges, labels, post, set };
+	window.__ready = true;
+
+} catch ( e ) {
+
+	console.error( e );
+	window.__error = e.message || String( e );
+
+}
+</script>
+</body>
+</html>

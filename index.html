@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<meta name="theme-color" content="#04060c" />
+<meta name="description" content="3D graph visualization with three.js WebGPU: GPU force-directed layout, hierarchical edge bundling and glow, after ImsvGraphVis (Kwon et al., TVCG 2016)." />
+<title>Graph · WebGPU</title>
+<style>
+html, body { margin: 0; height: 100%; background: #04060c; overflow: hidden; overscroll-behavior: none; color: #d8e2f0; font: 14px/1.4 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+#app { position: fixed; inset: 0; }
+#boot { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; transition: opacity .6s; }
+#boot.hidden { opacity: 0; }
+#boot .msg { max-width: 34rem; padding: 1.5rem; text-align: center; color: #9fb0c8; }
+#boot .msg h1 { font-size: 1.1rem; font-weight: 600; color: #e6eef8; margin: 0 0 .5rem; }
+#boot .msg a { color: #6ee7f0; }
+#boot .spinner { width: 28px; height: 28px; border-radius: 50%; border: 2px solid #ffffff20; border-top-color: #6ee7f0; animation: spin 1s linear infinite; margin: 0 auto .75rem; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="boot"><div class="msg"><div class="spinner"></div>Starting WebGPU…</div></div>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>

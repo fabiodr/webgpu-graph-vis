@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>dev: data pipeline</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#ccc;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+#app{position:fixed;inset:0}
+#hud{position:fixed;left:8px;top:8px;right:8px;white-space:pre-wrap;pointer-events:none;text-shadow:0 0 3px #000}
+#bar{position:fixed;left:0;top:0;height:3px;background:#6cf;width:0;transition:width .1s}
+</style>
+</head>
+<body>
+<div id="app"></div><div id="bar"></div><div id="hud"></div>
+<script type="module">
+// Data pipeline dev page: DataClient (module Web Worker) -> generate / fetch / parse, Louvain,
+// prepareGraph -> DebugNodes on the hierarchical seed positions (no force layout here).
+//   ?ds=<manifest id>        e.g. generated/hsbm-500 (file) or generated/hsbm-20k (generate spec)
+//   ?model=<id>&n=..&...     ad-hoc generator spec (any model param as a query key; seed=)
+//   ?url=/data/imsv/karate.json
+//   &pos=sphere              show the paper's sphere layout instead of the seed positions
+//   &supersede=1             first start a 20k/400k generation, then supersede it (checks that
+//                            the older request resolves { cancelled: true } with a real Worker)
+import { createApp } from '../src/app/App.js';
+import { fetchManifest } from '../src/data/load.js';
+import { DataClient } from '../src/data/client.js';
+import { DebugNodes } from '../src/debug/DebugNodes.js';
+
+const params = new URLSearchParams( location.search );
+const hud = document.getElementById( 'hud' );
+const bar = document.getElementById( 'bar' );
+const log = [];
+const print = ( line ) => {
+
+	log.push( line );
+	hud.textContent = log.slice( - 24 ).join( '\n' );
+
+};
+
+const report = window.__report = { progress: [] };
+
+try {
+
+	const app = await createApp( document.getElementById( 'app' ) );
+	window.__app = app;
+	app.use( new DebugNodes( { size: Number( params.get( 'size' ) || 4 ) } ) );
+
+	const client = window.__client = new DataClient( { baseUrl: '/' } ); // manifest paths are relative to the site root
+	let lastStage = null;
+	client.onProgress( ( p ) => {
+
+		bar.style.width = `${( p.fraction * 100 ).toFixed( 1 )}%`;
+		report.progress.push( [ p.stage, + p.fraction.toFixed( 3 ) ] );
+		if ( p.stage !== lastStage ) print( `  ${p.stage.padEnd( 9 )} ${( p.fraction * 100 ).toFixed( 0 ).padStart( 3 )}%  ${p.message}` );
+		lastStage = p.stage;
+
+	} );
+
+	const manifest = await fetchManifest( '/data/manifest.json' );
+	const pick = ( id ) => {
+
+		const entry = manifest.datasets.find( ( d ) => d.id === id );
+		if ( ! entry ) throw new Error( `dataset ${id} not in manifest` );
+		return entry;
+
+	};
+
+	let request, label, expect = null;
+	if ( params.get( 'model' ) ) {
+
+		const spec = { model: params.get( 'model' ), params: {}, seed: Number( params.get( 'seed' ) || 1 ) };
+		for ( const [ k, v ] of params ) if ( ! [ 'model', 'seed', 'pos', 'size', 'supersede' ].includes( k ) ) spec.params[ k ] = v === 'true' ? true : v === 'false' ? false : Number( v );
+		label = `generate ${JSON.stringify( spec )}`;
+		request = () => client.generate( spec );
+
+	} else if ( params.get( 'url' ) ) {
+
+		label = `url ${params.get( 'url' )}`;
+		request = () => client.loadUrl( params.get( 'url' ) );
+
+	} else {
+
+		const entry = pick( params.get( 'ds' ) || 'generated/hsbm-500' );
+		expect = entry;
+		label = `${entry.id} (${entry.file ? 'file ' + entry.file : 'generate ' + JSON.stringify( entry.generate )})`;
+		request = () => client.load( entry );
+
+	}
+
+	if ( params.has( 'supersede' ) ) {
+
+		print( 'supersede test: starting generated/lfr-20k-dense, superseding after 300 ms' );
+		const t0 = performance.now();
+		const big = client.load( pick( 'generated/lfr-20k-dense' ) );
+		await new Promise( ( r ) => setTimeout( r, 300 ) );
+		const pending = request();
+		const first = await big;
+		report.superseded = { result: first, ms: Math.round( performance.now() - t0 ) };
+		print( `  superseded request resolved ${JSON.stringify( first )} after ${report.superseded.ms} ms` );
+		request = () => pending;
+
+	}
+
+	print( label );
+	const t0 = performance.now();
+	const r = await request();
+	if ( r.cancelled ) throw new Error( 'unexpectedly cancelled' );
+	const ms = performance.now() - t0;
+	const g = r.graph;
+	app.setGraph( g );
+
+	let radius;
+	if ( params.get( 'pos' ) === 'sphere' ) {
+
+		const pos = new Float32Array( 4 * g.N );
+		for ( let i = 0; i < g.N; i ++ ) for ( let k = 0; k < 3; k ++ ) pos[ 4 * i + k ] = g.sphereDir[ 4 * i + k ] * g.layoutRadius;
+		app.buffers.setPositions( pos );
+		radius = g.layoutRadius;
+
+	} else radius = app.boundingSphere().radius;
+
+	app.camera.position.set( 0, 0, radius * ( params.get( 'pos' ) === 'sphere' ? 0.01 : 2.6 ) );
+	app.camera.lookAt( 0, 0, params.get( 'pos' ) === 'sphere' ? radius : 0 );
+	if ( params.get( 'pos' ) === 'sphere' && app.controls ) app.controls.target.set( 0, 0, radius );
+
+	const leafSizes = ( () => {
+
+		const s = new Uint32Array( g.stats.clustersPerLevel[ 0 ] || 0 );
+		if ( g.D ) for ( let i = 0; i < g.N; i ++ ) s[ g.anc[ i * g.D ] - g.levelOffset[ 0 ] ] ++;
+		const v = Array.from( s ).sort( ( a, b ) => a - b );
+		return v.length ? { min: v[ 0 ], median: v[ v.length >> 1 ], max: v[ v.length - 1 ] } : null;
+
+	} )();
+
+	Object.assign( report, {
+		name: g.name, N: g.N, E: g.E, D: g.D, clustersPerLevel: g.stats.clustersPerLevel, leafSizes,
+		hierarchy: r.meta.hierarchy, format: r.meta.format, kind: r.meta.kind,
+		timings: Object.fromEntries( Object.entries( r.timings ).map( ( [ k, v ] ) => [ k, Math.round( v ) ] ) ),
+		clientMs: Math.round( ms ),
+		matchesManifest: expect ? expect.nodes === g.N && expect.edges === g.E && expect.levels === g.D : null,
+		labels: g.labels ? g.labels.slice( 0, 5 ) : null,
+		typedArrays: Object.values( g ).filter( ( v ) => ArrayBuffer.isView( v ) ).length,
+	} );
+
+	print( '' );
+	print( `${g.name}` );
+	print( `N=${g.N.toLocaleString( 'en-US' )}  E=${g.E.toLocaleString( 'en-US' )}  D=${g.D}  clusters/level=${g.stats.clustersPerLevel.join( '/' )}  leaf ${leafSizes ? `${leafSizes.min}/${leafSizes.median}/${leafSizes.max}` : '-'}` );
+	print( `hierarchy: ${r.meta.hierarchy ? r.meta.hierarchy.method : 'none'}${r.meta.hierarchy?.modularity ? '  Q=' + r.meta.hierarchy.modularity.map( ( q ) => q.toFixed( 3 ) ).join( '/' ) : ''}` );
+	print( `worker ms: ${Object.entries( report.timings ).filter( ( [ k ] ) => k !== 'roundTrip' ).map( ( [ k, v ] ) => `${k} ${v}` ).join( ', ' )}  |  round trip ${Math.round( r.timings.roundTrip )}` );
+	if ( expect ) print( `manifest counts match: ${report.matchesManifest}` );
+	window.__ready = true;
+
+} catch ( e ) {
+
+	console.error( e );
+	print( 'ERROR: ' + ( e.message || e ) );
+	window.__error = e.message || String( e );
+
+}
+</script>
+</body>
+</html>

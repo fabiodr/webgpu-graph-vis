@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>dev: ui</title>
+<style>
+html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+#app { position: fixed; inset: 0; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script type="module">
+// Dev page for the interaction / camera / UI module:
+//   App + DebugNodes (+ dev highlight rings and straight edges reading nodeStateTarget, since the
+//   stub layout does not ease nodeState) + Interaction (stub layout) + CameraRig + Panel + NodeCard.
+// Query: ?ds=imsv/lesmis  &autorotate=0  &sheet (no-op, use a narrow viewport)
+import '../src/ui/ui.css';
+import * as THREE from 'three/webgpu';
+import { instanceIndex, vec3, float, uv, smoothstep, length, vec2, max, mix, attribute, varying, uniform } from 'three/tsl';
+import { createApp } from '../src/app/App.js';
+import { loadPrepared, fetchManifest } from '../src/data/load.js';
+import { prepareGraph, colorize } from '../src/graph/prepare.js';
+import { synthGraph } from '../src/debug/synth.js';
+import { DebugNodes } from '../src/debug/DebugNodes.js';
+import { CameraRig } from '../src/interact/CameraRig.js';
+import { Interaction } from '../src/interact/Interaction.js';
+import { Panel, DEFAULT_SETTINGS } from '../src/ui/Panel.js';
+import { NodeCard } from '../src/ui/NodeCard.js';
+
+const params = new URLSearchParams( location.search );
+const NODE_SIZE = 10; // DebugNodes sprite size; world radius = radii[i] * NODE_SIZE / 2
+
+/** Stub with the ForceLayout API: positions are edited on the CPU (and mirrored to the GPU). */
+class StubLayout {
+
+	constructor() {
+
+		this.order = 0;
+		this.running = true;
+		this.alpha = 1;
+		this.layoutMode = 'force';
+		this.calls = [];
+		this.dragCalls = 0;
+		this.blend = 0;
+		this.charge = 1; this.linkDistance = 30; this.gravity = 1; this.theta = 0.8; this.velocityDecay = 0.4;
+
+	}
+
+	init( app ) {
+
+		this.app = app;
+
+	}
+
+	setGraph( buffers, graph ) {
+
+		this.buffers = buffers;
+		this.graph = graph;
+		this.base = new Float32Array( graph.initPos ); // force-mode positions (+ drags), w = pinned
+		this.blend = this.layoutMode === 'sphere' ? 1 : 0;
+		this.dragIndex = - 1;
+		this._write();
+
+	}
+
+	update( dt ) {
+
+		if ( this.running ) this.alpha = Math.max( 0, this.alpha * Math.exp( - dt * 0.6 ) - 1e-4 );
+		const target = this.layoutMode === 'sphere' ? 1 : 0;
+		if ( this.blend !== target ) {
+
+			this.blend = target > this.blend ? Math.min( 1, this.blend + dt ) : Math.max( 0, this.blend - dt );
+			this._write();
+
+		}
+
+	}
+
+	_write() {
+
+		const g = this.graph, b = this.buffers, arr = b.nodePos.value.array, R = b.uniforms.sphereRadius.value;
+		const s = this.blend * this.blend * ( 3 - 2 * this.blend );
+		for ( let i = 0; i < g.N; i ++ ) {
+
+			for ( let k = 0; k < 3; k ++ ) arr[ 4 * i + k ] = this.base[ 4 * i + k ] * ( 1 - s ) + g.sphereDir[ 4 * i + k ] * R * s;
+			arr[ 4 * i + 3 ] = this.base[ 4 * i + 3 ];
+
+		}
+
+		if ( this.dragIndex >= 0 ) for ( let k = 0; k < 3; k ++ ) arr[ 4 * this.dragIndex + k ] = this.base[ 4 * this.dragIndex + k ];
+		b.uniforms.layoutBlend.value = s;
+		b.nodePos.value.needsUpdate = true;
+		b.computeClusterCentroidsCPU( arr );
+		// mirror to the CPU readback so picking sees the change immediately (the version counter is
+		// left to real readbacks, as with the GPU layout)
+		if ( this.app.positions && this.app.positions.length === arr.length ) this.app.positions.set( arr );
+
+	}
+
+	reheat() { this.alpha = 1; this.calls.push( [ 'reheat' ] ); }
+	pause() { this.running = false; this.calls.push( [ 'pause' ] ); }
+	resume() { this.running = true; this.calls.push( [ 'resume' ] ); }
+	setLayoutMode( m ) { this.layoutMode = m; this.running = true; this.alpha = 1; this.calls.push( [ 'setLayoutMode', m ] ); }
+	startDrag( i ) { this.dragIndex = i; this.calls.push( [ 'startDrag', i ] ); }
+	drag( i, p ) {
+
+		this.dragCalls ++;
+		this.base[ 4 * i ] = p.x; this.base[ 4 * i + 1 ] = p.y; this.base[ 4 * i + 2 ] = p.z;
+		this._write();
+
+	}
+
+	endDrag( i, { pin = false } = {} ) {
+
+		// like ForceLayout: endDrag only ever pins; unpinning is setPinned( i, false )
+		this.dragIndex = - 1;
+		if ( pin ) this.base[ 4 * i + 3 ] = 1;
+		this.calls.push( [ 'endDrag', i, pin ] );
+		this._write();
+
+	}
+
+	setPinned( i, on ) { this.base[ 4 * i + 3 ] = on ? 1 : 0; this.calls.push( [ 'setPinned', i, on ] ); this._write(); }
+	isPinned( i ) { return this.base[ 4 * i + 3 ] > 0.5; }
+	unpinAll() { for ( let i = 0; i < this.graph.N; i ++ ) this.base[ 4 * i + 3 ] = 0; this.calls.push( [ 'unpinAll' ] ); this._write(); }
+	resetPositions() { this.base.set( this.graph.initPos ); this.calls.push( [ 'resetPositions' ] ); this._write(); }
+
+}
+
+/** Dev-only highlight: rings for selected / neighbours / hovered and straight edges, from nodeStateTarget. */
+class DevHighlight {
+
+	constructor() {
+
+		this.order = 12;
+		this.accent = uniform( new THREE.Color( 0x5ce0e2 ) );
+
+	}
+
+	init( app ) {
+
+		this.app = app;
+
+	}
+
+	setGraph( buffers, graph, app ) {
+
+		for ( const m of [ this.rings, this.edges ] ) if ( m ) {
+
+			app.scene.remove( m );
+			m.material.dispose();
+			m.geometry?.dispose();
+
+		}
+
+		const st = buffers.nodeStateTarget.element( instanceIndex );
+		const c = buffers.nodeColor.element( instanceIndex );
+		const mat = new THREE.SpriteNodeMaterial( { transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending } );
+		mat.positionNode = buffers.nodePos.element( instanceIndex ).xyz;
+		mat.scaleNode = c.w.mul( NODE_SIZE * 2.2 ).mul( mix( float( 1 ), float( 1.35 ), st.x ) );
+		const d = length( uv().sub( vec2( 0.5 ) ) ).mul( 2 );
+		const ring = smoothstep( float( 0.66 ), float( 0.74 ), d ).mul( smoothstep( float( 0.98 ), float( 0.88 ), d ) );
+		const strength = max( st.x, max( st.y.mul( 0.4 ), st.w.mul( 0.85 ) ) );
+		mat.colorNode = mix( vec3( this.accent ), vec3( 1, 1, 1 ), st.w.mul( float( 1 ).sub( st.x ) ) );
+		mat.opacityNode = ring.mul( strength );
+		const rings = new THREE.Sprite( mat );
+		rings.count = graph.N;
+		rings.frustumCulled = false;
+		rings.renderOrder = 2;
+		app.scene.add( rings );
+		this.rings = rings;
+
+		// straight edges: 2 vertices per edge, attributes self/other node index
+		const E = graph.E;
+		const self = new Float32Array( 2 * E ), other = new Float32Array( 2 * E );
+		for ( let e = 0; e < E; e ++ ) {
+
+			const a = graph.edges[ 2 * e ], b = graph.edges[ 2 * e + 1 ];
+			self[ 2 * e ] = a; other[ 2 * e ] = b; self[ 2 * e + 1 ] = b; other[ 2 * e + 1 ] = a;
+
+		}
+
+		const geo = new THREE.BufferGeometry();
+		geo.setAttribute( 'position', new THREE.BufferAttribute( new Float32Array( 6 * E ), 3 ) );
+		geo.setAttribute( 'selfIdx', new THREE.BufferAttribute( self, 1 ) );
+		geo.setAttribute( 'otherIdx', new THREE.BufferAttribute( other, 1 ) );
+		const lm = new THREE.LineBasicNodeMaterial( { transparent: true, depthWrite: false, blending: THREE.AdditiveBlending } );
+		const si = attribute( 'selfIdx', 'float' ).toUint(), oi = attribute( 'otherIdx', 'float' ).toUint();
+		lm.positionNode = buffers.nodePos.element( si ).xyz;
+		const sa = buffers.nodeStateTarget.element( si ), sb = buffers.nodeStateTarget.element( oi );
+		const hi = varying( max( sa.x, sb.x ) );
+		const focus = buffers.uniforms.focus;
+		lm.colorNode = mix( vec3( buffers.nodeColor.element( si ).xyz ).mul( 1.6 ), vec3( this.accent ), hi.mul( 0.6 ) );
+		lm.opacityNode = mix( mix( float( 0.28 ), float( 0.05 ), focus ), float( 0.9 ), hi );
+		const edges = new THREE.LineSegments( geo, lm );
+		edges.frustumCulled = false;
+		edges.renderOrder = - 1;
+		app.scene.add( edges );
+		this.edges = edges;
+
+	}
+
+}
+
+let app;
+try {
+
+	app = await createApp( document.getElementById( 'app' ) );
+	window.__app = app;
+	const settings = { ...DEFAULT_SETTINGS, dataset: params.get( 'ds' ) || DEFAULT_SETTINGS.dataset };
+	const layout = app.use( new StubLayout() );
+	app.use( new DebugNodes( { size: NODE_SIZE } ) );
+	const highlight = app.use( new DevHighlight() );
+	const rig = new CameraRig();
+	if ( rig.reducedMotion || params.get( 'autorotate' ) === '0' ) settings.autoRotate = false;
+	rig.autoRotate = settings.autoRotate;
+
+	let panel = null;
+	const interaction = new Interaction( {
+		layout, rig,
+		onDropFile: ( file ) => panel.toast( `Would open “${file.name}” (${( file.size / 1024 ).toFixed( 1 )} kB)`, { type: 'info' } ),
+		onDropRejected: ( file ) => panel.toast( `Unsupported file “${file.name}”. Use .json, .txt or .csv.` ),
+		onCommand: ( name ) => {
+
+			if ( name === 'toggle-run' ) return apply( 'running', ! settings.running, true );
+			if ( name === 'cycle-labels' ) {
+
+				const order = [ 'auto', 'all', 'off' ];
+				return apply( 'labels', order[ ( order.indexOf( settings.labels ) + 1 ) % 3 ], true );
+
+			}
+
+			if ( name === 'help' ) {
+
+				panel.toggleHelp();
+				return true;
+
+			}
+
+			return false;
+
+		},
+	} );
+	interaction.picking.setRadiusFunction( ( i ) => app.graph.radii[ i ] * NODE_SIZE * 0.5 );
+	app.use( interaction );
+	app.use( rig );
+	const card = app.use( new NodeCard( { interaction, rig } ) );
+
+	const accentOf = () => getComputedStyle( document.documentElement ).getPropertyValue( '--wgv-accent-rgb' ).trim().split( /\s+/ ).map( Number );
+
+	async function loadDataset( id ) {
+
+		panel.setLoading( 'Loading dataset…', null );
+		try {
+
+			const graph = await loadPrepared( `/data/${id}.json`, { palette: settings.palette } );
+			app.setGraph( graph );
+
+		} catch ( e ) {
+
+			panel.toast( `Could not load ${id}: ${e.message}` );
+
+		} finally {
+
+			panel.setLoading( null );
+
+		}
+
+	}
+
+	function apply( key, value, fromKey = false ) {
+
+		settings[ key ] = value;
+		if ( fromKey ) panel.set( key, value );
+		switch ( key ) {
+
+			case 'dataset': loadDataset( value ); break;
+			case 'running': value ? layout.resume() : layout.pause(); break;
+			case 'autoRotate': rig.setAutoRotate( value ); break;
+			case 'layoutMode':
+				layout.setLayoutMode( value );
+				if ( value !== 'sphere' && settings.immersive ) apply( 'immersive', false, true );
+				if ( ! settings.immersive ) setTimeout( () => rig.fitToGraph(), 1050 );
+				break;
+			case 'immersive': rig.setImmersive( value ); break;
+			case 'palette':
+				app.buffers.setColors( colorize( app.graph.leafRank, value ) );
+				card.setPalette( value );
+				highlight.accent.value.setRGB( ...accentOf().map( ( v ) => v / 255 ) ).convertSRGBToLinear();
+				break;
+			case 'nodeSize': interaction.picking.radiusScale = value; break;
+
+		}
+
+		return true;
+
+	}
+
+	const generators = [
+		{ id: 'planted', name: 'Hierarchical (planted)', description: 'Nested communities with a known two-level hierarchy (fast, no clustering needed).', params: [
+			{ key: 'n', label: 'Nodes', type: 'int', min: 50, max: 20000, step: 10, log: true, value: 600 },
+			{ key: 'avgDegree', label: 'Avg degree', type: 'float', min: 2, max: 40, step: 0.5, value: 8 },
+			{ key: 'branching', label: 'Branching', type: 'int', min: 2, max: 12, value: 5 },
+			{ key: 'pIn', label: 'Cohesion', type: 'float', min: 0.3, max: 0.98, step: 0.01, value: 0.75 },
+		] },
+		{ id: 'sbm', name: 'Stochastic block model', description: 'Planted blocks; dense inside, sparse between.', params: [
+			{ key: 'n', label: 'Nodes', type: 'int', min: 100, max: 20000, step: 100, log: true, value: 2000 },
+			{ key: 'blocks', label: 'Blocks', type: 'int', min: 2, max: 64, value: 12 },
+			{ key: 'directed', label: 'Directed', type: 'bool', value: false },
+			{ key: 'weights', label: 'Weights', type: 'select', value: 'none', options: [ { value: 'none', label: 'None' }, { value: 'uniform', label: 'Uniform' }, { value: 'powerlaw', label: 'Power' } ] },
+		] },
+	];
+
+	panel = new Panel( {
+		settings,
+		generators,
+		onChange: ( key, value ) => apply( key, value ),
+		onAction: async ( name, payload ) => {
+
+			if ( name === 'fit' ) rig.fitToGraph();
+			else if ( name === 'reset' ) {
+
+				layout.resetPositions();
+				rig.fitToGraph();
+
+			} else if ( name === 'reheat' ) layout.reheat();
+			else if ( name === 'generate' ) {
+
+				if ( payload.model !== 'planted' ) return panel.toast( `“${payload.model}” is not available on this dev page.`, { type: 'info' } );
+				const p = payload.params;
+				panel.setLoading( `Generating ${p.n.toLocaleString( 'en-US' )} nodes…`, 0.2 );
+				await new Promise( ( r ) => setTimeout( r, 30 ) );
+				const g = synthGraph( { n: p.n, avgDegree: p.avgDegree, branching: [ p.branching, p.branching ], pIn: p.pIn, seed: 7, name: `Planted ${p.n}` } );
+				panel.setLoading( 'Preparing…', 0.7 );
+				await new Promise( ( r ) => setTimeout( r, 30 ) );
+				const prepared = prepareGraph( g, { palette: settings.palette } );
+				app.setGraph( prepared );
+				panel.setDatasetInfo( { id: 'generated:planted', name: g.name, nodes: prepared.N, edges: prepared.E, levels: prepared.D } );
+				panel.setLoading( null );
+
+			}
+
+		},
+		onOpenFile: ( file ) => panel.toast( `Would open “${file.name}”`, { type: 'info' } ),
+		onInsets: ( insets ) => rig.setInsets( insets ),
+	} );
+	rig.setInsets( panel.insets(), { animate: false } );
+
+	fetchManifest( '/data/manifest.json' ).then( ( m ) => panel.setManifest( m ) ).catch( ( e ) => panel.toast( e.message ) );
+	app.events.addEventListener( 'immersive', ( e ) => {
+
+		if ( settings.immersive !== e.detail.immersive ) panel.set( 'immersive', e.detail.immersive );
+
+	} );
+	app.events.addEventListener( 'frame', () => {
+
+		const g = app.graph;
+		if ( g ) panel.update( { nodes: g.N, edges: g.E, clusters: g.stats.clusters, levels: g.D, fps: app.fps, alpha: layout.alpha, running: layout.running } );
+
+	} );
+
+	const graph = await loadPrepared( `/data/${settings.dataset}.json`, { palette: settings.palette } );
+	app.setGraph( graph );
+	window.__ui = { app, settings, layout, rig, interaction, panel, card, apply };
+	window.__ready = true;
+
+} catch ( e ) {
+
+	console.error( e );
+	window.__error = e.message || String( e );
+
+}
+</script>
+</body>
+</html>
