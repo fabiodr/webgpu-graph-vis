@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>dev: nodes, lighting, environment</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui;overflow:hidden}
+#app{position:fixed;inset:0}
+#hud{position:fixed;left:10px;bottom:8px;white-space:pre;opacity:.75;z-index:2;pointer-events:none;text-shadow:0 0 3px #000}
+#ui{position:fixed;right:8px;top:8px;z-index:3;background:rgba(10,13,22,.82);border:1px solid #232a3c;border-radius:8px;padding:8px 10px;width:230px;max-height:calc(100% - 36px);overflow:auto}
+#ui h4{margin:8px 0 4px;font:600 10px system-ui;letter-spacing:.08em;text-transform:uppercase;color:#6f7b95}
+#ui h4:first-child{margin-top:0}
+#ui label{display:grid;grid-template-columns:78px 1fr 34px;gap:6px;align-items:center;margin:2px 0}
+#ui select,#ui input[type=range]{width:100%;min-width:0}
+#ui select{background:#131826;color:#c9d2e6;border:1px solid #2a3350;border-radius:4px;font:11px system-ui;grid-column:2 / 4}
+#ui output{text-align:right;font-variant-numeric:tabular-nums}
+#ui button{background:#1a2135;color:#c9d2e6;border:1px solid #2a3350;border-radius:4px;font:11px system-ui;padding:3px 7px;margin:4px 4px 0 0;cursor:pointer}
+</style>
+</head>
+<body>
+<div id="app"></div><div id="hud"></div><div id="ui"></div>
+<script type="module">
+// Dev page for the lighting package: the real App with the real ForceLayout and EdgeRenderer plus
+// src/render/NodeRenderer.js (lit impostor spheres) and src/render/gfx/Environment.js (sky → PMREM,
+// backdrop, key light, shadows, fog). The scene pass is LOCAL to this page so the material variants
+// can be exercised without the production pipeline: pass( scene, camera, { samples } ), optionally
+// with an MRT { output, velocity } that is set up like the production one (RGBA16F, normal blending
+// per attachment, cleared to 0). gfxState is written here and the 'gfx' event dispatched, exactly
+// what the pipeline package will do.
+//
+// Query parameters (every switch is also in the panel, top right; ui=0 hides the panel)
+//   ds=imsv/lesmis           dataset under /data/ (generated/hsbm-500, generated/lfr-2k, …)
+//   synth=20000&deg=6&br=8,8 synthetic clustered graph instead (src/debug/synth.js)
+//   layout=force|sphere      layout mode          run=0  keep the seed positions (no simulation)
+//   settle=6000              ms to wait for the layout before the camera is fitted (0 = no wait)
+//   ticks=0                  layout ticks per frame (0 = adaptive); e.g. 12 settles fast in software rendering
+//   preset=aurora|studio|void          Environment preset (with its node look hints)
+//   lit=1|0  samples=4|1  velocity=0|1  tier=high|ultra|medium|low     material variant
+//   shadows=1|0  map=2048  soft=0.3    shadow switches (gfxState.shadows / shadowMapSize, softness)
+//   view=beauty|velocity     velocity: the motion-vector attachment (needs velocity=1), ×vgain
+//   rough metal coat coatrough emissive rim variation shade flash glow coreshift   node look (NodeRenderer.setLook)
+//   key envint fog  ldir=x,y,z         key intensity, environment intensity, fog 0..1, light direction
+//   size=1  minpx=1.5  halo=1          node size multiplier, minimum pixel radius, halo pass
+//   edges=1|0  eo=1  post=1|0  bloom=0.8  exposure=1
+//   sel=<index|label|max>  hover=<index|label>      selection / hover emphasis (written directly)
+//   ripple=<index|label|max>  front=<hops>  glow=degree   nodeFx tests: static ripple front, glow weights
+//   zoom=1 yaw=0 pitch=0     camera around the fitted graph
+//   focus=<index|label|max|shadow>  dist=9          close-up: look at a node from `dist` radii away;
+//                            'shadow' frames a pair of nodes where one shadows the other
+//   spin=<deg per frame>     orbit the camera every frame (motion-vector / shadow-update tests)
+// Helpers on window (for scripts/shot.mjs --eval / --report)
+//   __set( { preset, lit, samples, velocity, tier, shadows, map, view } )   change switches
+//   __stats()                variant, shadow / sky render counters, bounds, fps
+//   __shaderInfo()           storage buffers and texture samples per stage of every compiled node shader
+//   __checkVelocity( { mode: 'camera' | 'node' | 'layout', count } )   motion vectors vs CPU values
+//                            ( { ok, maxError, … }: ok needs every sampled pixel to carry a written vector )
+//   __shadowIdle( frames )   renders frames with the layout at rest, returns the shadow renders
+//   __select( i ), __hover( i ), __ripple( i, front ), __focus( i | 'shadow', dist ), __fit()
+import * as THREE from 'three/webgpu';
+import { pass, mrt, output, vec4 } from 'three/tsl';
+import { createApp } from '../src/app/App.js';
+import { loadPrepared } from '../src/data/load.js';
+import { prepareGraph } from '../src/graph/prepare.js';
+import { synthGraph } from '../src/debug/synth.js';
+import { ForceLayout } from '../src/gpu/ForceLayout.js';
+import { EdgeRenderer } from '../src/render/EdgeRenderer.js';
+import { NodeRenderer, NODE_LOOK } from '../src/render/NodeRenderer.js';
+import { Environment, ENV_PRESETS } from '../src/render/gfx/Environment.js';
+import { PostFX } from '../src/render/PostFX.js';
+import { gfxState, gfxUniforms } from '../src/render/gfx/shared.js';
+
+const params = new URLSearchParams( location.search );
+const P = ( k, d ) => ( params.has( k ) ? params.get( k ) : d );
+const num = ( k, d ) => ( params.has( k ) ? Number( params.get( k ) ) : d );
+const sleep = ( ms ) => new Promise( ( r ) => setTimeout( r, ms ) );
+
+try {
+
+	const app = await createApp( document.getElementById( 'app' ) );
+	window.__app = app;
+
+	// keep the WGSL of every shader module three creates (see __shaderInfo)
+	const shaderModules = [];
+	const device = app.renderer.backend.device;
+	const createShaderModule = device.createShaderModule.bind( device );
+	device.createShaderModule = ( descriptor ) => {
+
+		shaderModules.push( { label: descriptor.label, code: descriptor.code } );
+		return createShaderModule( descriptor );
+
+	};
+
+	window.__shaderModules = shaderModules;
+
+	// ── switches ──
+	const cfg = {
+		preset: P( 'preset', 'aurora' ),
+		lit: num( 'lit', 1 ) === 1,
+		samples: num( 'samples', 4 ),
+		velocity: num( 'velocity', 0 ) === 1,
+		tier: P( 'tier', 'high' ),
+		shadows: num( 'shadows', 1 ) === 1,
+		map: num( 'map', 2048 ),
+		view: P( 'view', 'beauty' ),
+	};
+
+	// ── modules ──
+	const layout = app.use( new ForceLayout( { autoStart: num( 'run', 1 ) === 1, ticksPerFrame: num( 'ticks', 0 ) } ) );
+	const edges = num( 'edges', 1 ) === 1 ? app.use( new EdgeRenderer( { opacity: num( 'eo', 1 ) } ) ) : null;
+	const nodes = app.use( new NodeRenderer( { size: num( 'size', 1 ), minPixelRadius: num( 'minpx', 1.5 ), halo: num( 'halo', 1 ) === 1 } ) );
+	const env = app.use( new Environment( { preset: cfg.preset, shadowSoftness: num( 'soft', 0.3 ) } ) );
+	const post = num( 'post', 1 ) === 1 ? new PostFX( { bloom: num( 'bloom', 0.8 ), quality: 'high', exposure: num( 'exposure', 1 ) } ) : null;
+	Object.assign( window, { __layout: layout, __edges: edges, __nodes: nodes, __env: env, __post: post, __gfx: gfxState, __gfxUniforms: gfxUniforms } );
+
+	// look parameters from the URL (after the preset's hints)
+	env.setPreset( cfg.preset );
+	const lookKeys = { rough: 'roughness', metal: 'metalness', coat: 'clearcoat', coatrough: 'clearcoatRoughness', emissive: 'emissive', rim: 'rim', variation: 'variation', shade: 'shade', flash: 'flash', glow: 'glow', coreshift: 'coreShift' };
+	for ( const k in lookKeys ) if ( params.has( k ) ) nodes.setLook( { [ lookKeys[ k ] ]: num( k ) } );
+	if ( params.has( 'key' ) ) env.keyIntensity = num( 'key' );
+	if ( params.has( 'envint' ) ) env.envIntensity = num( 'envint' );
+	if ( params.has( 'fog' ) ) env.fog = num( 'fog' );
+	if ( params.has( 'ldir' ) ) env.setKeyDirection( P( 'ldir' ).split( ',' ).map( Number ) );
+
+	// ── local scene pass (+ optional velocity MRT, as the production pipeline will provide it) ──
+	// one MRT node for the lifetime of the page: render contexts are keyed by it (aa recipe §8)
+	const velocityMRT = mrt( { output, velocity: vec4( 0 ) } );
+	velocityMRT.setBlendMode( 'velocity', new THREE.BlendMode( THREE.NormalBlending ) );
+	velocityMRT.setClearColor( 'velocity', new THREE.Color( 0, 0, 0 ), 0 );
+	let postUsed = false;
+
+	function rebuild() {
+
+		const old = app.scenePass;
+		const scenePass = pass( app.scene, app.camera, { samples: cfg.samples > 1 ? cfg.samples : 0 } );
+		if ( cfg.velocity ) {
+
+			scenePass.setMRT( velocityMRT );
+			scenePass.getTexture( 'velocity' ); // an attachment only exists once it was requested (TRAA does that in production)
+
+		}
+
+		app.scenePass = scenePass;
+
+		Object.assign( gfxState, { tier: cfg.tier, samples: cfg.samples > 1 ? cfg.samples : 1, velocity: cfg.velocity, shadows: cfg.shadows, shadowMapSize: cfg.map, lit: cfg.lit } );
+		app.events.dispatchEvent( new CustomEvent( 'gfx', { detail: gfxState } ) );
+
+		if ( cfg.view === 'velocity' && cfg.velocity ) {
+
+			// 0.5 grey = no motion; ±1 / vgain NDC = full scale
+			app.pipeline.outputColorTransform = false;
+			app.setOutput( () => vec4( scenePass.getTextureNode( 'velocity' ).rg.mul( num( 'vgain', 25 ) ).add( 0.5 ), 0.5, 1 ) );
+
+		} else if ( post ) {
+
+			if ( ! postUsed ) {
+
+				app.use( post ); // init() builds the chain on app.scenePass
+				postUsed = true;
+
+			} else post.build();
+
+		} else {
+
+			app.pipeline.outputColorTransform = true;
+			app.setOutput( () => scenePass );
+
+		}
+
+		if ( old && old !== scenePass ) old.dispose();
+
+	}
+
+	rebuild();
+
+	// ── graph ──
+	const ds = P( 'ds', 'imsv/lesmis' );
+	const t0 = performance.now();
+	let graph;
+	if ( params.has( 'synth' ) ) {
+
+		const br = P( 'br', '8,8' ).split( ',' ).map( Number ).filter( ( x ) => x > 0 );
+		graph = prepareGraph( synthGraph( { n: num( 'synth', 20000 ), avgDegree: num( 'deg', 6 ), branching: br.length ? br : [ 8, 8 ] } ), { palette: P( 'palette', 'paper' ) } );
+
+	} else graph = await loadPrepared( `/data/${ds}.json`, { palette: P( 'palette', 'paper' ) } );
+	const prepMs = performance.now() - t0;
+	app.setGraph( graph );
+	const buffers = app.buffers;
+	window.__graph = graph;
+	if ( P( 'layout', 'force' ) === 'sphere' ) layout.setLayoutMode( 'sphere' );
+	if ( num( 'run', 1 ) !== 1 ) layout.pause();
+
+	const settle = num( 'settle', 6000 );
+	if ( settle > 0 && num( 'run', 1 ) === 1 ) {
+
+		const tEnd = performance.now() + settle;
+		await sleep( 400 );
+		while ( performance.now() < tEnd && layout.running ) await sleep( 100 );
+
+	}
+
+	// a fresh position readback (app.positions lags the GPU by a frame or two)
+	async function positions() {
+
+		const v = app.positionsVersion;
+		for ( let i = 0; i < 100 && app.positionsVersion < v + 2; i ++ ) await sleep( 30 );
+		return app.positions;
+
+	}
+
+	const indexOf = ( v ) => {
+
+		if ( v === null || v === undefined || v === '' ) return - 1;
+		if ( v === 'max' ) return graph.degree.indexOf( graph.maxDegree );
+		if ( /^-?\d+$/.test( v ) ) return + v;
+		return graph.labels ? graph.labels.indexOf( v ) : - 1;
+
+	};
+
+	// ── camera ──
+	const nodePos = ( i, p = app.positions ) => new THREE.Vector3( p[ 4 * i ], p[ 4 * i + 1 ], p[ 4 * i + 2 ] );
+
+	function planes( dist, R ) {
+
+		app.camera.near = Math.max( R * 0.002, ( dist - R * 1.6 ) * 0.5 );
+		app.camera.far = dist + R * 4;
+		app.camera.updateProjectionMatrix();
+
+	}
+
+	function fit( zoom = num( 'zoom', 1 ), yawDeg = num( 'yaw', 0 ), pitchDeg = num( 'pitch', 0 ) ) {
+
+		const s = app.boundingSphere();
+		const vfov = THREE.MathUtils.degToRad( app.camera.fov );
+		const fov = Math.min( vfov, 2 * Math.atan( Math.tan( vfov / 2 ) * app.camera.aspect ) );
+		const dist = ( s.radius / Math.sin( fov / 2 ) ) * 1.02 / zoom;
+		const yaw = THREE.MathUtils.degToRad( yawDeg ), pitch = THREE.MathUtils.degToRad( pitchDeg );
+		app.camera.position.set( s.center.x + dist * Math.sin( yaw ) * Math.cos( pitch ), s.center.y + dist * Math.sin( pitch ), s.center.z + dist * Math.cos( yaw ) * Math.cos( pitch ) );
+		app.controls.target.copy( s.center );
+		app.camera.lookAt( s.center );
+		planes( dist, s.radius );
+
+	}
+
+	/** Pair ( receiver, caster ): the caster sits between the receiver and the key light. */
+	function shadowPair() {
+
+		const p = app.positions, N = graph.N, L = env.keyDirection;
+		const step = Math.max( 1, Math.floor( N / 3000 ) );
+		let best = null;
+		const v = new THREE.Vector3();
+		for ( let i = 0; i < N; i += step ) {
+
+			const ri = nodes.worldRadius( i ), pi = nodePos( i, p );
+			for ( let j = 0; j < N; j ++ ) {
+
+				if ( j === i ) continue;
+				v.set( p[ 4 * j ] - pi.x, p[ 4 * j + 1 ] - pi.y, p[ 4 * j + 2 ] - pi.z );
+				const t = v.dot( L );
+				if ( t <= 0 ) continue;
+				const lateral = Math.sqrt( Math.max( 0, v.lengthSq() - t * t ) );
+				const rj = nodes.worldRadius( j );
+				if ( lateral > ri + 0.6 * rj || lateral < 0.35 * rj || t < ri + rj ) continue;
+				// a similar-sized caster close by whose shadow covers part of the receiver: the round edge shows
+				const score = Math.min( ri, rj ) / ( 1 + 0.15 * t / ri ) - Math.abs( lateral - 0.8 * ri ) * 0.5;
+				if ( ! best || score > best.score ) best = { receiver: i, caster: j, t, lateral, score };
+
+			}
+
+		}
+
+		return best;
+
+	}
+
+	/** Close-up of node i (or of a shadowing pair) from `dist` node radii away. */
+	function focus( what, dist = num( 'dist', 9 ) ) {
+
+		const L = env.keyDirection;
+		const s = app.boundingSphere();
+		let target, r, dir;
+		if ( what === 'shadow' ) {
+
+			const pair = shadowPair();
+			if ( ! pair ) return null;
+			const a = nodePos( pair.receiver ), b = nodePos( pair.caster );
+			target = a.clone().lerp( b, 0.35 );
+			r = Math.max( nodes.worldRadius( pair.receiver ), nodes.worldRadius( pair.caster ), a.distanceTo( b ) * 0.4 );
+			// look at the lit side of the receiver from beside the light, away from the graph centre
+			const out = target.clone().sub( s.center );
+			const side = out.sub( L.clone().multiplyScalar( out.dot( L ) ) );
+			if ( side.lengthSq() < 1e-6 ) side.set( 1, 0, 0 ).cross( L );
+			dir = L.clone().multiplyScalar( 0.5 ).add( side.normalize().multiplyScalar( 0.87 ) ).normalize();
+			window.__pair = pair;
+
+		} else {
+
+			const i = typeof what === 'number' ? what : indexOf( what );
+			if ( i < 0 ) return null;
+			target = nodePos( i );
+			r = nodes.worldRadius( i );
+			const yaw = THREE.MathUtils.degToRad( num( 'yaw', 0 ) ), pitch = THREE.MathUtils.degToRad( num( 'pitch', 0 ) );
+			dir = new THREE.Vector3( Math.sin( yaw ) * Math.cos( pitch ), Math.sin( pitch ), Math.cos( yaw ) * Math.cos( pitch ) );
+
+		}
+
+		const d = r * dist;
+		app.camera.position.copy( target ).addScaledVector( dir, d );
+		app.controls.target.copy( target );
+		app.camera.lookAt( target );
+		app.camera.near = Math.max( d * 0.05, 0.01 );
+		app.camera.far = d + s.radius * 6;
+		app.camera.updateProjectionMatrix();
+		return { target: target.toArray(), radius: r };
+
+	}
+
+	await positions();
+	if ( params.has( 'focus' ) ) focus( P( 'focus' ) === 'shadow' ? 'shadow' : P( 'focus' ) ); else fit();
+
+	// ── emphasis and effect channels (what Interaction / the analysis tools write) ──
+	function select( i, hover = buffers.uniforms.hoverIndex.value ) {
+
+		const N = graph.N, st = new Float32Array( 4 * N );
+		if ( i >= 0 ) {
+
+			for ( let k = 0; k < N; k ++ ) st[ 4 * k + 2 ] = 1;
+			st[ 4 * i ] = 1; st[ 4 * i + 2 ] = 0;
+			for ( let k = graph.adjStart[ i ]; k < graph.adjStart[ i ] + graph.degree[ i ]; k ++ ) {
+
+				const j = graph.adjList[ k ];
+				st[ 4 * j + 1 ] = 1; st[ 4 * j + 2 ] = 0;
+
+			}
+
+		}
+
+		if ( hover >= 0 ) st[ 4 * hover + 3 ] = 1;
+		buffers.nodeState.value.array.set( st );
+		buffers.nodeState.value.needsUpdate = true;
+		buffers.setStateTargets( st );
+		buffers.uniforms.focus.value = i >= 0 ? 1 : 0;
+		buffers.uniforms.selectedIndex.value = i;
+		buffers.uniforms.hoverIndex.value = hover;
+
+	}
+
+	function ripple( source, front = 1 ) {
+
+		const N = graph.N, fx = new Float32Array( buffers.nodeFx.value.array );
+		const dist = new Int32Array( N ).fill( - 1 );
+		if ( source >= 0 ) {
+
+			const queue = [ source ];
+			dist[ source ] = 0;
+			for ( let q = 0; q < queue.length; q ++ ) {
+
+				const a = queue[ q ];
+				for ( let k = graph.adjStart[ a ]; k < graph.adjStart[ a ] + graph.degree[ a ]; k ++ ) {
+
+					const b = graph.adjList[ k ];
+					if ( dist[ b ] < 0 ) {
+
+						dist[ b ] = dist[ a ] + 1;
+						queue.push( b );
+
+					}
+
+				}
+
+			}
+
+		}
+
+		for ( let i = 0; i < N; i ++ ) fx[ 4 * i ] = dist[ i ];
+		buffers.setFx( fx );
+		buffers.uniforms.rippleFront.value = front;
+		buffers.uniforms.rippleGain.value = source >= 0 ? 1 : 0;
+
+	}
+
+	function glowByDegree() {
+
+		const fx = new Float32Array( buffers.nodeFx.value.array );
+		for ( let i = 0; i < graph.N; i ++ ) fx[ 4 * i + 2 ] = Math.pow( graph.degree[ i ] / Math.max( 1, graph.maxDegree ), 1.5 );
+		buffers.setFx( fx );
+
+	}
+
+	if ( params.has( 'sel' ) || params.has( 'hover' ) ) select( indexOf( P( 'sel', '' ) ), indexOf( P( 'hover', '' ) ) );
+	if ( params.has( 'ripple' ) ) ripple( indexOf( P( 'ripple' ) ), num( 'front', 1 ) );
+	if ( P( 'glow', '' ) === 'degree' ) glowByDegree();
+
+	// ── orbit for motion tests ──
+	const spin = num( 'spin', 0 );
+	if ( spin ) app.use( { order: 32, update() {
+
+		const t = app.controls.target;
+		app.camera.position.sub( t ).applyAxisAngle( new THREE.Vector3( 0, 1, 0 ), THREE.MathUtils.degToRad( spin ) ).add( t );
+		app.camera.lookAt( t );
+
+	} } );
+
+	// ── checks ──
+	const frames = async ( n ) => {
+
+		const f0 = app.frame;
+		while ( app.frame < f0 + n ) await sleep( 30 );
+
+	};
+
+	window.__stats = () => ( {
+		variant: nodes.variant, materials: [ ...nodes._materials.keys() ], gfx: { ...gfxState }, env: { ...env.stats, preset: env.preset },
+		shadowMap: { enabled: app.renderer.shadowMap.enabled, castShadow: env.light.castShadow, size: env.light.shadow.mapSize.x, radius: + env.light.shadow.radius.toFixed( 2 ), intensity: + env.light.shadow.intensity.toFixed( 3 ), allocated: !! ( env.light.shadow.map && app.renderer.backend.has( env.light.shadow.map.depthTexture ) && app.renderer.backend.get( env.light.shadow.map.depthTexture ).texture ) },
+		sky: { environment: !! app.scene.environment, generator: !! env._generator },
+		ambient: { sky: gfxUniforms.ambientSky.value.toArray().map( ( v ) => + v.toFixed( 3 ) ), ground: gfxUniforms.ambientGround.value.toArray().map( ( v ) => + v.toFixed( 3 ) ) },
+		fog: { start: + gfxUniforms.fogStart.value.toFixed( 2 ), density: + gfxUniforms.fogDensity.value.toExponential( 3 ) },
+		N: graph.N, E: graph.E, frame: app.frame, fps: + app.fps.toFixed( 2 ), moveFrame: buffers.moveFrame, layoutRunning: layout.running,
+	} );
+
+	/**
+	 * Bindings per shader stage, from the WGSL three actually compiled (captured at
+	 * GPUDevice.createShaderModule): every module that reads the node buffers, i.e. the sphere variants
+	 * used so far, the halo and the shadow pass.
+	 */
+	window.__shaderInfo = () => {
+
+		const count = ( code, re ) => ( code.match( re ) || [] ).length;
+		const names = ( code ) => [ ...code.matchAll( /var<storage[^>]*>\s+(\w+)/g ) ].map( ( m ) => m[ 1 ] );
+		const out = {};
+		for ( const m of shaderModules ) {
+
+			const [ stage, ...rest ] = ( m.label || '' ).split( '_' );
+			const name = rest.join( '_' );
+			if ( ! /NodeRenderer|Shadow|shadow/.test( name ) && ! /nodePos/.test( m.code ) ) continue;
+			if ( stage !== 'vertex' && stage !== 'fragment' ) continue;
+			const o = out[ name ] || ( out[ name ] = {} );
+			o[ stage + 'Storage' ] = names( m.code );
+			o[ stage + 'Bytes' ] = m.code.length;
+			if ( stage === 'fragment' ) {
+
+				o.textureSamples = count( m.code, /textureSample\w*\s*\(/g );
+				o.textureLoads = count( m.code, /textureLoad\s*\(/g );
+
+			}
+
+		}
+
+		return out;
+
+	};
+
+	/** Shadow map renders during `n` frames with nothing moving (layout paused, camera optionally orbiting). */
+	window.__shadowIdle = async ( n = 12 ) => {
+
+		const wasPaused = layout.paused;
+		layout.pause();
+		await frames( 4 ); // let the last move and the state easing settle
+		await sleep( 1100 ); // selection hold
+		await frames( 2 );
+		const r0 = env.stats.shadowRenders, f0 = app.frame;
+		await frames( n );
+		const result = { frames: app.frame - f0, shadowRenders: env.stats.shadowRenders - r0 };
+		// control: one forced update must render exactly once
+		env.updateShadow();
+		await frames( 3 );
+		result.afterForce = env.stats.shadowRenders - r0 - result.shadowRenders;
+		if ( ! wasPaused ) layout.resume();
+		return result;
+
+	};
+
+	/**
+	 * Motion vectors against the CPU. One frame is rendered between two snapshots, inside three's
+	 * animation loop (a tick called by hand would re-use the previous scene-pass image: PassNode
+	 * renders once per nodeFrame.frameId, which only advances in three's own frame callback):
+	 *   mode 'camera'  layout paused, the camera moves and turns
+	 *   mode 'node'    layout paused, camera fixed, one node is dragged (through the layout's drag path)
+	 *   mode 'layout'  the layout runs (every node moves) and the camera moves
+	 * Expected value at the pixel of a node centre: NDC( front point now ) − NDC( front point − node
+	 * motion, previous view-projection ); node positions now / before are read back from nodePos /
+	 * nodePrev, so the check does not depend on how the motion was produced.
+	 */
+	window.__checkVelocity = async ( { mode = 'camera', count = 10 } = {} ) => {
+
+		if ( ! gfxState.velocity ) return { error: 'velocity=1 needed' };
+		const renderer = app.renderer, camera = app.camera;
+		const wasPaused = layout.paused;
+		if ( mode === 'layout' ) {
+
+			layout.resume();
+			layout.reheat( 0.5 );
+
+		} else layout.pause();
+		await frames( 3 );
+		renderer.setAnimationLoop( null );
+		await sleep( 400 ); // readbacks of the running loop finish
+		let dragged = - 1;
+		if ( mode === 'node' ) {
+
+			// the node nearest to the screen centre moves sideways by 1.5 of its radii
+			const p = await renderer.getArrayBufferAsync( buffers.nodePos.value ).then( ( b ) => new Float32Array( b ) );
+			let bestD = Infinity;
+			const v = new THREE.Vector3();
+			for ( let i = 0; i < graph.N; i ++ ) {
+
+				v.set( p[ 4 * i ], p[ 4 * i + 1 ], p[ 4 * i + 2 ] ).project( camera );
+				const d = v.x * v.x + v.y * v.y;
+				if ( Math.abs( v.z ) < 1 && d < bestD ) {
+
+					bestD = d; dragged = i;
+
+				}
+
+			}
+
+			const right = new THREE.Vector3().setFromMatrixColumn( camera.matrixWorld, 0 );
+			const to = new THREE.Vector3( p[ 4 * dragged ], p[ 4 * dragged + 1 ], p[ 4 * dragged + 2 ] ).addScaledVector( right, nodes.worldRadius( dragged ) * 1.5 );
+			layout.startDrag( dragged );
+			layout.drag( dragged, to );
+
+		} else {
+
+			const t = app.controls.target;
+			camera.position.sub( t ).applyAxisAngle( new THREE.Vector3( 0, 1, 0 ), 0.02 ).multiplyScalar( 0.985 ).add( t );
+			camera.position.y += camera.position.distanceTo( t ) * 0.01;
+			app.controls.enabled = false;
+			camera.lookAt( t );
+
+		}
+
+		const prevVP = gfxUniforms.viewProj.value.clone(); // view-projection of the last rendered frame
+		await new Promise( ( done ) => renderer.setAnimationLoop( () => {
+
+			app._tick();
+			renderer.setAnimationLoop( null );
+			done();
+
+		} ) );
+		const VP = gfxUniforms.viewProj.value.clone();
+		const now = new Float32Array( await renderer.getArrayBufferAsync( buffers.nodePos.value ) );
+		const before = new Float32Array( await renderer.getArrayBufferAsync( buffers.nodePrev.value ) );
+		const rt = app.scenePass.renderTarget;
+		const index = rt.textures.findIndex( ( t ) => t.name === 'velocity' );
+		const camPos = camera.position.clone();
+		const N = graph.N;
+		const R = ( i ) => nodes.worldRadius( i );
+		const c = new THREE.Vector3(), o = new THREE.Vector3(), ray = new THREE.Ray(), sph = new THREE.Sphere();
+		// candidates: nodes in view, largest on screen first; the dragged one always
+		const order = [];
+		for ( let i = 0; i < N; i ++ ) {
+
+			c.set( now[ 4 * i ], now[ 4 * i + 1 ], now[ 4 * i + 2 ] );
+			const ndc = c.clone().applyMatrix4( VP );
+			if ( Math.abs( ndc.x ) > 0.92 || Math.abs( ndc.y ) > 0.92 || ndc.z < 0 || ndc.z > 1 ) continue;
+			order.push( [ i, R( i ) / c.distanceTo( camPos ) ] );
+
+		}
+
+		order.sort( ( a, b ) => b[ 1 ] - a[ 1 ] );
+		if ( dragged >= 0 ) order.unshift( [ dragged, 0 ] );
+		const out = [];
+		let maxErr = 0, maxMotion = 0;
+		for ( const [ i ] of order ) {
+
+			if ( out.length >= count ) break;
+			c.set( now[ 4 * i ], now[ 4 * i + 1 ], now[ 4 * i + 2 ] );
+			ray.origin.copy( camPos );
+			ray.direction.copy( c ).sub( camPos ).normalize();
+			const d = c.distanceTo( camPos );
+			let occluded = false;
+			for ( let j = 0; j < N && ! occluded; j ++ ) {
+
+				if ( j === i ) continue;
+				o.set( now[ 4 * j ], now[ 4 * j + 1 ], now[ 4 * j + 2 ] );
+				if ( o.distanceTo( camPos ) > d ) continue;
+				sph.center.copy( o ); sph.radius = R( j ) * 1.6;
+				occluded = ray.intersectsSphere( sph );
+
+			}
+
+			if ( occluded ) continue;
+			const front = c.clone().addScaledVector( ray.direction, - R( i ) );
+			const prev = front.clone().sub( new THREE.Vector3( now[ 4 * i ] - before[ 4 * i ], now[ 4 * i + 1 ] - before[ 4 * i + 1 ], now[ 4 * i + 2 ] - before[ 4 * i + 2 ] ) );
+			const a = front.clone().applyMatrix4( VP ), b = prev.clone().applyMatrix4( prevVP );
+			const px = Math.floor( ( a.x * 0.5 + 0.5 ) * rt.width ), py = Math.floor( ( 0.5 - a.y * 0.5 ) * rt.height ); // readback origin: top left
+			if ( px < 2 || py < 2 || px > rt.width - 3 || py > rt.height - 3 ) continue;
+			const data = await renderer.readRenderTargetPixelsAsync( rt, px, py, 1, 1, index );
+			const dec = ( v ) => ( data instanceof Uint16Array ? THREE.DataUtils.fromHalfFloat( v ) : v );
+			const read = [ dec( data[ 0 ] ), dec( data[ 1 ] ) ], expected = [ a.x - b.x, a.y - b.y ];
+			const err = Math.hypot( read[ 0 ] - expected[ 0 ], read[ 1 ] - expected[ 1 ] );
+			maxErr = Math.max( maxErr, err );
+			maxMotion = Math.max( maxMotion, Math.hypot( ...expected ) );
+			out.push( { node: i, dragged: i === dragged, expected: expected.map( ( v ) => + v.toFixed( 5 ) ), read: read.map( ( v ) => + v.toFixed( 5 ) ), alpha: + dec( data[ 3 ] ).toFixed( 2 ) } );
+
+		}
+
+		// a background pixel must be untouched (cleared to 0)
+		const corner = await renderer.readRenderTargetPixelsAsync( rt, 1, 1, 1, 1, index );
+		const cd = ( v ) => ( corner instanceof Uint16Array ? THREE.DataUtils.fromHalfFloat( v ) : v );
+		if ( dragged >= 0 ) layout.endDrag( dragged );
+		if ( wasPaused ) layout.pause(); else layout.resume();
+		app.controls.enabled = true;
+		app._last = performance.now();
+		renderer.setAnimationLoop( () => app._tick() );
+		const background = [ cd( corner[ 0 ] ), cd( corner[ 1 ] ), cd( corner[ 3 ] ) ];
+		// a sampled pixel without a written vector (alpha 0) means the frame was not rendered or the node was missed
+		const written = out.every( ( o ) => o.alpha > 0.5 );
+		const ok = out.length > 0 && written && maxErr < 5e-4 && background.every( ( v ) => v === 0 );
+		return { mode, ok, checked: out.length, written, maxError: + maxErr.toExponential( 2 ), maxMotion: + maxMotion.toFixed( 5 ), background, samples: out };
+
+	};
+
+	// ── panel ──
+	const ui = document.getElementById( 'ui' );
+	if ( num( 'ui', 1 ) !== 1 ) ui.style.display = 'none';
+	const section = ( title ) => ui.insertAdjacentHTML( 'beforeend', `<h4>${title}</h4>` );
+	function choice( label, key, options, apply ) {
+
+		const el = document.createElement( 'label' );
+		el.innerHTML = `<span>${label}</span><select>${options.map( ( o ) => `<option value="${o}">${o}</option>` ).join( '' )}</select>`;
+		const sel = el.querySelector( 'select' );
+		sel.value = String( typeof cfg[ key ] === 'boolean' ? ( cfg[ key ] ? 'on' : 'off' ) : cfg[ key ] );
+		sel.addEventListener( 'change', () => apply( sel.value ) );
+		ui.appendChild( el );
+		return sel;
+
+	}
+
+	function slider( label, min, max, step, get, set ) {
+
+		const el = document.createElement( 'label' );
+		el.innerHTML = `<span>${label}</span><input type="range" min="${min}" max="${max}" step="${step}"><output></output>`;
+		const input = el.querySelector( 'input' ), out = el.querySelector( 'output' );
+		const sync = () => {
+
+			input.value = get();
+			out.textContent = ( + get() ).toFixed( 2 );
+
+		};
+
+		input.addEventListener( 'input', () => {
+
+			set( + input.value );
+			out.textContent = ( + input.value ).toFixed( 2 );
+
+		} );
+		sync();
+		ui.appendChild( el );
+		return sync;
+
+	}
+
+	const syncs = [];
+	function setSwitches( o ) {
+
+		const structural = [ 'lit', 'samples', 'velocity', 'tier', 'shadows', 'map', 'view' ].some( ( k ) => k in o && o[ k ] !== cfg[ k ] );
+		Object.assign( cfg, o );
+		if ( 'preset' in o ) env.setPreset( cfg.preset );
+		if ( structural ) rebuild();
+		for ( const s of syncs ) s();
+		return window.__stats();
+
+	}
+
+	section( 'Environment' );
+	choice( 'preset', 'preset', Object.keys( ENV_PRESETS ), ( v ) => setSwitches( { preset: v } ) );
+	syncs.push( slider( 'key light', 0, 8, 0.05, () => env.keyIntensity, ( v ) => ( env.keyIntensity = v ) ) );
+	syncs.push( slider( 'environment', 0, 3, 0.05, () => env.envIntensity, ( v ) => ( env.envIntensity = v ) ) );
+	syncs.push( slider( 'fog', 0, 1, 0.01, () => env.fog, ( v ) => ( env.fog = v ) ) );
+	syncs.push( slider( 'shadow soft', 0, 1, 0.01, () => env.shadowSoftness, ( v ) => ( env.shadowSoftness = v ) ) );
+	section( 'Variant' );
+	choice( 'lit', 'lit', [ 'on', 'off' ], ( v ) => setSwitches( { lit: v === 'on' } ) );
+	choice( 'samples', 'samples', [ 4, 1 ], ( v ) => setSwitches( { samples: + v } ) );
+	choice( 'velocity', 'velocity', [ 'off', 'on' ], ( v ) => setSwitches( { velocity: v === 'on' } ) );
+	choice( 'tier', 'tier', [ 'low', 'medium', 'high', 'ultra' ], ( v ) => setSwitches( { tier: v } ) );
+	choice( 'shadows', 'shadows', [ 'on', 'off' ], ( v ) => setSwitches( { shadows: v === 'on' } ) );
+	choice( 'shadow map', 'map', [ 1024, 2048, 4096 ], ( v ) => setSwitches( { map: + v } ) );
+	choice( 'view', 'view', [ 'beauty', 'velocity' ], ( v ) => setSwitches( { view: v } ) );
+	section( 'Node look' );
+	const look = ( key ) => [ () => nodes.look[ key ], ( v ) => nodes.setLook( { [ key ]: v } ) ];
+	syncs.push( slider( 'roughness', 0.05, 1, 0.01, ...look( 'roughness' ) ) );
+	syncs.push( slider( 'metalness', 0, 1, 0.01, ...look( 'metalness' ) ) );
+	syncs.push( slider( 'clearcoat', 0, 1, 0.01, ...look( 'clearcoat' ) ) );
+	syncs.push( slider( 'coat rough', 0.03, 1, 0.01, ...look( 'clearcoatRoughness' ) ) );
+	syncs.push( slider( 'emissive', 0, 3, 0.01, ...look( 'emissive' ) ) );
+	syncs.push( slider( 'rim', 0, 2, 0.01, ...look( 'rim' ) ) );
+	syncs.push( slider( 'variation', 0, 1, 0.01, ...look( 'variation' ) ) );
+	syncs.push( slider( 'shade', 0, 1, 0.01, ...look( 'shade' ) ) );
+	syncs.push( slider( 'flash', 0, 3, 0.01, ...look( 'flash' ) ) );
+	syncs.push( slider( 'node size', 0.2, 4, 0.05, () => nodes.size, ( v ) => ( nodes.size = v ) ) );
+	const row = document.createElement( 'div' );
+	for ( const [ text, fn ] of [ [ 'fit', () => fit( 1 ) ], [ 'shadow pair', () => focus( 'shadow' ) ], [ 'select hub', () => select( indexOf( 'max' ) ) ], [ 'clear', () => select( - 1, - 1 ) ], [ 'reheat', () => layout.reheat() ], [ 'defaults', () => {
+
+		nodes.setLook( NODE_LOOK );
+		env.setPreset( cfg.preset );
+		for ( const s of syncs ) s();
+
+	} ] ] ) {
+
+		const b = document.createElement( 'button' );
+		b.textContent = text;
+		b.addEventListener( 'click', fn );
+		row.appendChild( b );
+
+	}
+
+	ui.appendChild( row );
+
+	Object.assign( window, { __set: setSwitches, __select: select, __hover: ( i ) => select( buffers.uniforms.selectedIndex.value, i ), __ripple: ripple, __focus: focus, __fit: fit, __indexOf: indexOf, __positions: positions, __frames: frames } );
+
+	const hud = document.getElementById( 'hud' );
+	app.events.addEventListener( 'frame', () => {
+
+		if ( app.frame % 10 === 0 ) hud.textContent = `${graph.name}  N=${graph.N} E=${graph.E}  prep ${prepMs.toFixed( 0 )} ms  ${app.fps.toFixed( 1 )} fps\n${nodes.variant}  ${env.preset}  shadow renders ${env.stats.shadowRenders}  sky renders ${env.stats.skyRenders}`;
+
+	} );
+	if ( num( 'ui', 1 ) !== 1 ) hud.style.display = 'none';
+
+	await frames( 3 );
+	window.__ready = true;
+
+} catch ( e ) {
+
+	console.error( e );
+	window.__error = e && e.stack ? e.stack : String( e );
+
+}
+</script>
+</body>
+</html>
