@@ -91,7 +91,8 @@ try {
 	if ( rep ) summary.report = await page.evaluate( `(async () => (${rep}))()` );
 	summary.fps = await page.evaluate( () => window.__app && window.__app.fps );
 	mkdirSync( dirname( out ), { recursive: true } );
-	await page.screenshot( { path: out } );
+	// software rendering can take longer than Playwright's default 30 s to present a frame
+	await page.screenshot( { path: out, timeout: Math.max( 30000, timeout ) } );
 	summary.ok = pageErrors.length === 0;
 
 } catch ( e ) {
@@ -100,7 +101,7 @@ try {
 	try {
 
 		mkdirSync( dirname( out ), { recursive: true } );
-		await page.screenshot( { path: out } );
+		await page.screenshot( { path: out, timeout: 60000 } );
 
 	} catch ( _ ) { /* ignore */ }
 

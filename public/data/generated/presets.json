@@ -5,31 +5,29 @@
 		{
 			"id": "generated/hsbm-20k",
 			"tier": "stress",
-			"order": 6,
+			"order": 7,
 			"name": "Communities · 20k",
 			"description": "Hierarchical SBM, 20,000 nodes, average degree 24 (240k edges), 3 nested levels. Target scale.",
 			"source": "Generated: Hierarchical SBM (webgpu-graph-vis src/data/generators.js), seed 1",
 			"nodes": 20000,
 			"edges": 239772,
-			"levels": 4,
+			"levels": 3,
 			"clustersPerLevel": [
-				293,
-				212,
-				39,
-				30
+				229,
+				36,
+				6
 			],
 			"leafSizes": {
-				"count": 293,
-				"min": 7,
-				"median": 53,
-				"p90": 137,
+				"count": 229,
+				"min": 11,
+				"median": 83,
+				"p90": 150,
 				"max": 199
 			},
 			"modularity": [
-				0.594,
-				0.6676,
-				0.8589,
-				0.8657
+				0.6249,
+				0.8651,
+				0.7789
 			],
 			"generate": {
 				"model": "hsbm",
@@ -44,32 +42,36 @@
 				},
 				"seed": 1
 			},
-			"estimatedBytes": 2850679
+			"estimatedBytes": 2768072
 		},
 		{
 			"id": "generated/lfr-20k-dense",
 			"tier": "stress",
-			"order": 7,
+			"order": 8,
 			"name": "LFR · 20k dense",
 			"description": "LFR benchmark, 20,000 nodes, average degree 40 (≈400k edges), μ = 0.3. Maximum stress test.",
 			"source": "Generated: LFR benchmark (webgpu-graph-vis src/data/generators.js), seed 1",
 			"nodes": 20000,
 			"edges": 384444,
-			"levels": 2,
+			"levels": 4,
 			"clustersPerLevel": [
-				392,
-				117
+				189,
+				134,
+				27,
+				4
 			],
 			"leafSizes": {
-				"count": 392,
-				"min": 6,
-				"median": 42,
-				"p90": 91,
-				"max": 194
+				"count": 189,
+				"min": 30,
+				"median": 109,
+				"p90": 168,
+				"max": 199
 			},
 			"modularity": [
-				0.4169,
-				0.6763
+				0.5029,
+				0.6764,
+				0.6603,
+				0.3072
 			],
 			"generate": {
 				"model": "lfr",
@@ -85,7 +87,7 @@
 				},
 				"seed": 1
 			},
-			"estimatedBytes": 4320456
+			"estimatedBytes": 4407144
 		}
 	]
 }

@@ -16,6 +16,9 @@ html, body { margin: 0; height: 100%; background: #000; overflow: hidden; oversc
 // Dev page for the interaction / camera / UI module:
 //   App + DebugNodes (+ dev highlight rings and straight edges reading nodeStateTarget, since the
 //   stub layout does not ease nodeState) + Interaction (stub layout) + CameraRig + Panel + NodeCard.
+// The panel is the real one over the settings schema; only the settings this page has a module for
+// do something (dataset, layout mode, run / pause, immersive, auto-rotate, palette, node size).
+// The whole application with every control wired is dev/shell.html.
 // Query: ?ds=imsv/lesmis  &autorotate=0  &sheet (no-op, use a narrow viewport)
 import '../src/ui/ui.css';
 import * as THREE from 'three/webgpu';
@@ -28,6 +31,7 @@ import { DebugNodes } from '../src/debug/DebugNodes.js';
 import { CameraRig } from '../src/interact/CameraRig.js';
 import { Interaction } from '../src/interact/Interaction.js';
 import { Panel, DEFAULT_SETTINGS } from '../src/ui/Panel.js';
+import { Help } from '../src/ui/Help.js';
 import { NodeCard } from '../src/ui/NodeCard.js';
 
 const params = new URLSearchParams( location.search );
@@ -317,6 +321,7 @@ try {
 	panel = new Panel( {
 		settings,
 		generators,
+		help: new Help(),
 		onChange: ( key, value ) => apply( key, value ),
 		onAction: async ( name, payload ) => {
 
@@ -358,7 +363,7 @@ try {
 	app.events.addEventListener( 'frame', () => {
 
 		const g = app.graph;
-		if ( g ) panel.update( { nodes: g.N, edges: g.E, clusters: g.stats.clusters, levels: g.D, fps: app.fps, alpha: layout.alpha, running: layout.running } );
+		if ( g ) panel.update( { nodes: g.N, edges: g.E, communities: g.stats.clusters, levels: g.D } );
 
 	} );
 

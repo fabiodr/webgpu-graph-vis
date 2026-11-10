@@ -117,8 +117,8 @@
 			"source": "Generated: Ring of cliques (webgpu-graph-vis src/data/generators.js), seed 1",
 			"nodes": 192,
 			"edges": 672,
-			"levels": 1,
-			"bytes": 7759,
+			"levels": 2,
+			"bytes": 8253,
 			"order": 0,
 			"tier": "readable"
 		},
@@ -131,8 +131,8 @@
 			"source": "Generated: Hierarchical SBM (webgpu-graph-vis src/data/generators.js), seed 1",
 			"nodes": 500,
 			"edges": 2492,
-			"levels": 3,
-			"bytes": 27866,
+			"levels": 2,
+			"bytes": 26918,
 			"order": 1,
 			"tier": "readable"
 		},
@@ -146,7 +146,7 @@
 			"nodes": 2000,
 			"edges": 11367,
 			"levels": 2,
-			"bytes": 132678,
+			"bytes": 131362,
 			"order": 2,
 			"tier": "overview"
 		},
@@ -159,9 +159,23 @@
 			"source": "Generated: Hierarchical SBM (webgpu-graph-vis src/data/generators.js), seed 1",
 			"nodes": 5000,
 			"edges": 39817,
-			"levels": 2,
-			"bytes": 409111,
+			"levels": 3,
+			"bytes": 419276,
 			"order": 3,
+			"tier": "overview"
+		},
+		{
+			"id": "generated/galaxy-3k",
+			"file": "data/generated/galaxy-3k.json",
+			"group": "generated",
+			"name": "Hubs and satellites · 3k",
+			"description": "6 groups of 8 systems: a hub with satellites, some with moons. Tree-like, strong hubs, a clear two-level hierarchy.",
+			"source": "Generated: Hubs and satellites (webgpu-graph-vis src/data/generators.js), seed 1",
+			"nodes": 3000,
+			"edges": 3472,
+			"levels": 2,
+			"bytes": 47166,
+			"order": 4,
 			"tier": "overview"
 		},
 		{
@@ -173,9 +187,9 @@
 			"source": "Generated: Barabási–Albert (webgpu-graph-vis src/data/generators.js), seed 1",
 			"nodes": 5000,
 			"edges": 19990,
-			"levels": 3,
-			"bytes": 218290,
-			"order": 4,
+			"levels": 2,
+			"bytes": 200546,
+			"order": 5,
 			"tier": "overview"
 		},
 		{
@@ -187,9 +201,9 @@
 			"source": "Generated: LFR benchmark (webgpu-graph-vis src/data/generators.js), seed 1",
 			"nodes": 10000,
 			"edges": 74560,
-			"levels": 2,
-			"bytes": 790640,
-			"order": 5,
+			"levels": 3,
+			"bytes": 805326,
+			"order": 6,
 			"tier": "overview"
 		},
 		{
@@ -213,8 +227,8 @@
 			"source": "Generated: Hierarchical SBM (webgpu-graph-vis src/data/generators.js), seed 1",
 			"nodes": 20000,
 			"edges": 239772,
-			"levels": 4,
-			"order": 6,
+			"levels": 3,
+			"order": 7,
 			"tier": "stress"
 		},
 		{
@@ -239,8 +253,8 @@
 			"source": "Generated: LFR benchmark (webgpu-graph-vis src/data/generators.js), seed 1",
 			"nodes": 20000,
 			"edges": 384444,
-			"levels": 2,
-			"order": 7,
+			"levels": 4,
+			"order": 8,
 			"tier": "stress"
 		},
 		{
@@ -252,9 +266,9 @@
 			"source": "Generated: 3D lattice (webgpu-graph-vis src/data/generators.js), seed 1",
 			"nodes": 1728,
 			"edges": 4752,
-			"levels": 4,
-			"bytes": 77774,
-			"order": 8,
+			"levels": 2,
+			"bytes": 65813,
+			"order": 9,
 			"tier": "sanity"
 		},
 		{
@@ -266,9 +280,23 @@
 			"source": "Generated: Random geometric 3D (webgpu-graph-vis src/data/generators.js), seed 1",
 			"nodes": 3000,
 			"edges": 14987,
+			"levels": 4,
+			"bytes": 173937,
+			"order": 10,
+			"tier": "sanity"
+		},
+		{
+			"id": "generated/mesh-torus",
+			"file": "data/generated/mesh-torus.json",
+			"group": "generated",
+			"name": "Torus mesh 60×30",
+			"description": "1,800-node triangle mesh wrapped both ways. Layout sanity check: should unfold into a torus.",
+			"source": "Generated: Surface mesh (webgpu-graph-vis src/data/generators.js), seed 1",
+			"nodes": 1800,
+			"edges": 5400,
 			"levels": 3,
-			"bytes": 165540,
-			"order": 9,
+			"bytes": 75041,
+			"order": 11,
 			"tier": "sanity"
 		},
 		{
@@ -281,8 +309,8 @@
 			"nodes": 2000,
 			"edges": 8000,
 			"levels": 4,
-			"bytes": 115259,
-			"order": 10,
+			"bytes": 114872,
+			"order": 12,
 			"tier": "sanity"
 		}
 	]

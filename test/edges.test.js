@@ -1,11 +1,17 @@
-// Tests for src/render/EdgeRenderer.js: the pure-JS curve mirror (evalEdgeCurveCPU), which the dev
-// page (dev/edges.html, window.__verify) checks against the actual GPU shader code.
+// Tests for the edge renderer's curves (src/gpu/EdgeCurves.js, src/render/EdgeRenderer.js): the
+// pure-JS curve mirror (evalEdgeCurveCPU), which the dev page (dev/edges.html, window.__verify)
+// checks against the samples the GPU kernel wrote; explicit control paths against the implicit
+// hierarchy formula of the first renderer; the path upload and the "run only when something
+// changed" logic of the cache (with a stand-in renderer that counts compute calls).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { normalizeGraph } from '../src/data/format.js';
 import { prepareGraph } from '../src/graph/prepare.js';
-import { evalEdgeCurveCPU, autoSegments, autoOpacity } from '../src/render/EdgeRenderer.js';
+import { hierarchicalPaths, straightPaths } from '../src/graph/bundling.js';
+import { GraphBuffers } from '../src/gpu/GraphBuffers.js';
+import { EdgeCurves, encodePathRefs, maxSegmentsForBudget } from '../src/gpu/EdgeCurves.js';
+import { evalEdgeCurveCPU, autoSegments, autoOpacity, autoDefocusLimit, strandSubdivision, autoCurveMemory, EDGE_DEFAULTS, LOOK_DEFAULTS } from '../src/render/EdgeRenderer.js';
 
 const load = ( id, flat = false ) => {
 
@@ -170,10 +176,10 @@ for ( const id of [ 'karate', 'lesmis', 'football', 'celegansneural' ] ) {
 		let worst = 0;
 		for ( let e = 0; e < g.E; e ++ ) {
 
-			const ref = evalEdgeCurveCPU( g, e, 0, g.initPos, cp, { beta: 1 } );
+			const ref = evalEdgeCurveCPU( g, e, 0, g.initPos, cp, { beta: 1, unhook: 0 } );
 			const P = ref.controlPoints;
 			const pts = [];
-			for ( let k = 0; k <= 200; k ++ ) pts.push( evalEdgeCurveCPU( g, e, k / 200, g.initPos, cp, { beta: 1 } ).position );
+			for ( let k = 0; k <= 200; k ++ ) pts.push( evalEdgeCurveCPU( g, e, k / 200, g.initPos, cp, { beta: 1, unhook: 0 } ).position );
 			// convex hull property (checked with the bounding box of the control polygon)
 			for ( const p of pts ) for ( let q = 0; q < 3; q ++ ) {
 
@@ -230,6 +236,57 @@ for ( const id of [ 'karate', 'lesmis', 'football', 'celegansneural' ] ) {
 
 }
 
+for ( const id of [ 'karate', 'lesmis', 'football', 'celegansneural' ] ) {
+
+	test( `${id} force: no curve passes behind its end points (unhook); edges without a centroid behind them are untouched`, () => {
+
+		const g = load( id );
+		// a layout in which many centroids lie behind a node: the seed with every node pushed outward
+		const pos = g.initPos.map( ( v, i ) => ( i % 4 === 3 ? v : v * ( 1 + 0.6 * Math.sin( 12.9898 * ( i >> 2 ) ) ) ) );
+		const cp = centroids( g, pos );
+		let hooked = 0, kept = 0;
+		for ( let e = 0; e < g.E; e ++ ) {
+
+			const s = nodeAt( pos, g.edges[ 2 * e ] ), t = nodeAt( pos, g.edges[ 2 * e + 1 ] );
+			const d = [ t[ 0 ] - s[ 0 ], t[ 1 ] - s[ 1 ], t[ 2 ] - s[ 2 ] ], len = Math.hypot( ...d );
+			const along = ( p ) => ( ( p[ 0 ] - s[ 0 ] ) * d[ 0 ] + ( p[ 1 ] - s[ 1 ] ) * d[ 1 ] + ( p[ 2 ] - s[ 2 ] ) * d[ 2 ] ) / len;
+			const P = evalEdgeCurveCPU( g, e, 0, pos, cp ).controlPoints;
+			const inside = P.every( ( p ) => along( p ) >= 0 && along( p ) <= len );
+			let back0 = 0, back1 = 0, diff = 0;
+			for ( let k = 0; k <= 64; k ++ ) {
+
+				const p0 = evalEdgeCurveCPU( g, e, k / 64, pos, cp, { unhook: 0 } ).position;
+				const p1 = evalEdgeCurveCPU( g, e, k / 64, pos, cp ).position; // unhook = 1 is the default
+				back0 = Math.max( back0, - along( p0 ), along( p0 ) - len );
+				back1 = Math.max( back1, - along( p1 ), along( p1 ) - len );
+				diff = Math.max( diff, dist( p0, p1 ) );
+
+			}
+
+			assert.ok( back1 <= 1e-6 * g.layoutRadius, `edge ${e} passes ${back1} behind an end point` );
+			if ( back0 > 0.01 * g.layoutRadius ) {
+
+				hooked ++;
+				assert.ok( diff > 0, `edge ${e} hooks without unhooking, and with it is the same curve` );
+
+			}
+
+			if ( inside ) {
+
+				kept ++;
+				assert.ok( diff <= 1e-9 * g.layoutRadius, `edge ${e} has no centroid behind its ends but moved by ${diff}` );
+
+			}
+
+		}
+
+		assert.ok( hooked > 0, 'the test layout has hooks without unhooking' );
+		assert.ok( kept > 0, 'the test layout has edges that unhooking leaves alone' );
+
+	} );
+
+}
+
 test( 'D = 0 hierarchy: every edge is the straight segment (L = 2)', () => {
 
 	const g = load( 'lesmis', true );
@@ -276,5 +333,426 @@ test( 'auto segments and opacity', () => {
 		prev = a;
 
 	}
+
+	// strand defocus is bounded by density: full up to 5k edges, none from 200k
+	assert.equal( autoDefocusLimit( 0 ), 10 );
+	assert.equal( autoDefocusLimit( 254 ), 10 );
+	assert.equal( autoDefocusLimit( 5000 ), 10 );
+	assert.equal( autoDefocusLimit( 200000 ), 0 );
+	assert.equal( autoDefocusLimit( 384444 ), 0 );
+	prev = Infinity;
+	for ( const E of [ 5000, 1e4, 4e4, 1e5, 2e5 ] ) {
+
+		const d = autoDefocusLimit( E );
+		assert.ok( d >= 0 && d <= prev );
+		prev = d;
+
+	}
+
+	assert.ok( Math.abs( autoDefocusLimit( 40000 ) - 4.36 ) < 0.01 );
+
+} );
+
+// ── explicit control paths ───────────────────────────────────────────────────────────────────
+
+/**
+ * The curve of the first renderer, written out from the hierarchy (anc / edgeLca) without any
+ * path arrays: the reference that hierarchicalPaths + the generalised mirror must reproduce.
+ * Position only; frozen on purpose, do not "simplify" it into a call of evalEdgeCurveCPU.
+ */
+function legacyCurve( g, e, t, nodePos4, clusterPos4, o = {} ) {
+
+	const beta = o.beta ?? 0.85, blend = o.layoutBlend ?? 0, R = o.sphereRadius ?? g.layoutRadius;
+	const lvOff = 0.1, lvScale = 0.35, lvExp = 2, hl = o.highlight ?? 0, hlLevel = o.highlightLevel ?? 0.75;
+	const D = g.D, s = g.edges[ 2 * e ], tg = g.edges[ 2 * e + 1 ];
+	const lca = Math.min( g.edgeLca[ e ], D );
+	const L = 2 + 2 * lca + ( lca < D ? 1 : 0 );
+	const at = ( a, i ) => [ a[ 4 * i ], a[ 4 * i + 1 ], a[ 4 * i + 2 ] ];
+	const pS = at( nodePos4, s ), pT = at( nodePos4, tg );
+	const lerp3 = ( a, b, k ) => a.map( ( v, q ) => v + ( b[ q ] - v ) * k );
+	const len = ( a ) => Math.hypot( a[ 0 ], a[ 1 ], a[ 2 ] );
+	const logMap = ( r ) => {
+
+		const l = Math.max( len( r ), 1e-6 ), dn = r.map( ( v ) => v / l );
+		const perp = [ dn[ 0 ], dn[ 1 ], 0 ], sn = len( perp );
+		const k = sn > 1e-7 ? Math.atan2( sn, dn[ 2 ] ) / sn : 1;
+		return perp.map( ( v ) => v * k );
+
+	};
+
+	const levS = len( pS ) / R, levT = len( pT ) / R, vS = logMap( pS ), vT = logMap( pT );
+	const point = ( k ) => {
+
+		if ( k === 0 ) return { p: pS, lev: levS };
+		if ( k === L - 1 ) return { p: pT, lev: levT };
+		const srcSide = 2 * k <= L - 1;
+		const lv = srcSide ? k - 1 : L - 2 - k;
+		const cl = g.anc[ ( srcSide ? s : tg ) * D + lv ];
+		const level = 1 + lvOff + lvScale * ( lv > 0 ? Math.pow( lv, lvExp ) : 0 );
+		return { p: at( clusterPos4, cl ), lev: level + ( hlLevel - level ) * hl };
+
+	};
+
+	const x = Math.min( Math.max( t, 0 ), 1 ) * ( L + 1 );
+	const j = Math.min( Math.floor( x ), L ), u = x - j, v = 1 - u, u2 = u * u, u3 = u2 * u;
+	const b = [ ( v * v * v ) / 6, ( 3 * u3 - 6 * u2 + 4 ) / 6, ( - 3 * u3 + 3 * u2 + 3 * u + 1 ) / 6, u3 / 6 ];
+	const cF = [ 0, 0, 0 ], V = [ 0, 0, 0 ];
+	let cL = 0;
+	for ( let i = 0; i < 4; i ++ ) {
+
+		const k = Math.min( Math.max( j + i - 2, 0 ), L - 1 ), a = k / ( L - 1 );
+		const { p, lev } = point( k );
+		const f = lerp3( lerp3( pS, pT, a ), p, beta ), w = lerp3( lerp3( vS, vT, a ), logMap( p ), beta );
+		for ( let q = 0; q < 3; q ++ ) {
+
+			cF[ q ] += b[ i ] * ( f[ q ] - pS[ q ] ); V[ q ] += b[ i ] * w[ q ];
+
+		}
+
+		cL += b[ i ] * ( ( levS + ( levT - levS ) * a ) * ( 1 - beta ) + lev * beta );
+
+	}
+
+	const r = len( V ), sinc = r > 1e-4 ? Math.sin( r ) / r : 1 - ( r * r ) / 6;
+	const dir = [ V[ 0 ] * sinc, V[ 1 ] * sinc, Math.cos( r ) + V[ 2 ] * sinc ];
+	return lerp3( pS.map( ( p, q ) => p + cF[ q ] ), dir.map( ( d ) => d * R * cL ), blend );
+
+}
+
+for ( const id of [ 'karate', 'lesmis', 'football', 'celegansneural' ] ) {
+
+	test( `${id}: explicit hierarchical paths reproduce the first renderer's curve`, () => {
+
+		const g = load( id );
+		const paths = hierarchicalPaths( g );
+		const sphere = spherePos( g );
+		const cases = [
+			[ g.initPos, { layoutBlend: 0 } ],
+			[ sphere, { layoutBlend: 1 } ],
+			[ sphere, { layoutBlend: 1, highlight: 0.6 } ],
+			[ g.initPos.map( ( v, i ) => 0.5 * v + 0.5 * sphere[ i ] ), { layoutBlend: 0.5 } ],
+		];
+		let worst = 0;
+		for ( const [ pos, o ] of cases ) {
+
+			const cp = centroids( g, pos );
+			for ( let e = 0; e < g.E; e ++ ) for ( const beta of [ 0.3, 0.85, 1 ] ) for ( const tt of [ 0, 0.07, 0.25, 0.5, 0.81, 1 ] ) {
+
+				const want = legacyCurve( g, e, tt, pos, cp, { ...o, beta } );
+				const implicit = evalEdgeCurveCPU( g, e, tt, pos, cp, { ...o, beta, unhook: 0 } ); // default path set
+				const explicit = evalEdgeCurveCPU( g, e, tt, pos, cp, { ...o, beta, unhook: 0, paths } );
+				worst = Math.max( worst, dist( want, implicit.position ), dist( want, explicit.position ) );
+
+			}
+
+		}
+
+		assert.ok( worst < 1e-9 * g.layoutRadius, `max deviation ${worst}` );
+
+	} );
+
+}
+
+test( 'explicit paths: no interior points = the straight segment; node refs are honoured', () => {
+
+	const g = load( 'lesmis' );
+	const pos = g.initPos, cp = centroids( g, pos );
+	const straight = straightPaths( g.E );
+	for ( let e = 0; e < g.E; e += 7 ) {
+
+		// the spline of [ s, s, s, t, t, t ] stays on the segment (its speed is not uniform)
+		const s = nodeAt( pos, g.edges[ 2 * e ] ), t = nodeAt( pos, g.edges[ 2 * e + 1 ] ), d = dist( s, t );
+		let last = - 1;
+		for ( const tt of [ 0, 0.2, 0.37, 0.5, 0.8, 1 ] ) {
+
+			const r = evalEdgeCurveCPU( g, e, tt, pos, cp, { paths: straight, beta: 1 } );
+			assert.equal( r.L, 2 );
+			const k = dist( r.position, s ) / d;
+			assert.ok( dist( r.position, s.map( ( v, q ) => v + ( t[ q ] - v ) * k ) ) < 1e-9 * g.layoutRadius );
+			assert.ok( k > last && k <= 1 + 1e-12 );
+			if ( tt === 0.5 ) assert.ok( Math.abs( k - 0.5 ) < 1e-12 );
+			last = k;
+
+		}
+
+	}
+
+	// edge 0 routed over two nodes: the control polygon is [ s, a, b, t ] with the nodes' positions
+	const a = 5, b = 9;
+	const pathStart = new Uint32Array( g.E + 1 ).fill( 2 );
+	pathStart[ 0 ] = 0;
+	const paths = { pathStart, pathRefs: Uint32Array.of( a, b ), maxInterior: 2 };
+	const r = evalEdgeCurveCPU( g, 0, 0.5, pos, cp, { paths, beta: 1 } );
+	assert.equal( r.L, 4 );
+	assert.deepEqual( r.controlPoints, [ nodeAt( pos, g.edges[ 0 ] ), nodeAt( pos, a ), nodeAt( pos, b ), nodeAt( pos, g.edges[ 1 ] ) ] );
+	assert.equal( evalEdgeCurveCPU( g, 1, 0.5, pos, cp, { paths } ).L, 2 ); // the other edges are straight
+	// sphere layout: nodes on a path keep their own radial level, so the whole curve stays on the sphere
+	const sp = spherePos( g ), scp = centroids( g, sp );
+	for ( const tt of [ 0.1, 0.3, 0.5, 0.7, 0.9 ] ) {
+
+		const p = evalEdgeCurveCPU( g, 0, tt, sp, scp, { paths, beta: 1, layoutBlend: 1 } ).position;
+		assert.ok( Math.abs( Math.hypot( ...p ) - g.layoutRadius ) < 1e-6 * g.layoutRadius );
+
+	}
+
+} );
+
+test( 'path refs: GPU encoding and memory budget', () => {
+
+	const g = load( 'lesmis' );
+	const paths = hierarchicalPaths( g );
+	const out = encodePathRefs( g, paths.pathRefs, paths.pathRefs.length, new Uint32Array( paths.pathRefs.length ) );
+	for ( let k = 0; k < out.length; k ++ ) {
+
+		const c = paths.pathRefs[ k ] - g.N;
+		assert.equal( out[ k ] >>> 31, 1 ); // hierarchical paths only hold clusters
+		assert.equal( out[ k ] & 0x07ffffff, c );
+		assert.equal( ( out[ k ] >>> 27 ) & 15, g.clusterHeight[ c ] );
+
+	}
+
+	assert.deepEqual( Array.from( encodePathRefs( g, Uint32Array.of( 3, g.N + 2 ), 2, new Uint32Array( 2 ) ) ), [ 3, ( 0x80000000 | ( g.clusterHeight[ 2 ] << 27 ) | 2 ) >>> 0 ] );
+	// 384,444 edges (the dense LFR preset): 8 segments fit the 64 MiB budget, 16 do not
+	assert.equal( maxSegmentsForBudget( 384444 ), 9 );
+	assert.ok( 384444 * 9 * 16 < 64 * 1048576 );
+	assert.equal( maxSegmentsForBudget( 0 ), Math.floor( 64 * 1048576 / 16 ) - 1 );
+	assert.equal( maxSegmentsForBudget( 1000, 16 * 1000 ), 1 ); // never below one segment
+
+} );
+
+test( 'curve cache: path upload, validation, segments', () => {
+
+	const g = load( 'lesmis' );
+	const buffers = new GraphBuffers( g );
+	const curves = new EdgeCurves();
+	curves.setGraph( buffers, g, { segments: 12 } );
+	const paths = hierarchicalPaths( g );
+	const info = buffers.edgeInfo.value.array;
+	assert.equal( info.length, 4 * ( g.E + 1 ) );
+	for ( let e = 0; e <= g.E; e ++ ) assert.equal( info[ 4 * e + 3 ], paths.pathStart[ e ] );
+	for ( let e = 0; e < g.E; e ++ ) assert.deepEqual( [ info[ 4 * e ], info[ 4 * e + 1 ], info[ 4 * e + 2 ] ], [ g.edges[ 2 * e ], g.edges[ 2 * e + 1 ], g.edgeLca[ e ] ] );
+	assert.equal( curves.stats.pathRefs, paths.pathRefs.length );
+	assert.equal( curves.stats.maxInterior, paths.maxInterior );
+	assert.equal( curves.segments, 12 );
+	assert.equal( curves.uniforms.stride.value, 13 );
+	assert.equal( curves.samples.value.array.length, 4 * g.E * 13 );
+	assert.equal( curves.stats.bytes, 16 * g.E * 13 );
+
+	// more segments: the buffer grows once and the renderer is told; fewer: it is kept
+	let reallocs = 0;
+	curves.onRealloc = () => reallocs ++;
+	assert.equal( curves.setSegments( 40 ), 40 );
+	assert.equal( reallocs, 1 );
+	assert.equal( curves.setSegments( 8 ), 8 );
+	assert.equal( reallocs, 1 );
+	assert.equal( curves.capacity, 41 );
+	assert.equal( curves.uniforms.stride.value, 9 );
+	curves.memoryBudget = 16 * g.E * 5; // room for 5 samples per edge
+	assert.equal( curves.maxSegments(), 4 );
+	assert.equal( curves.setSegments( 64 ), 4 );
+
+	// swapping the set: straight lines, then a bad one
+	curves.setPaths( straightPaths( g.E ) );
+	assert.equal( curves.stats.pathRefs, 0 );
+	for ( let e = 0; e <= g.E; e ++ ) assert.equal( info[ 4 * e + 3 ], 0 );
+	assert.throws( () => curves.setPaths( { pathStart: new Uint32Array( g.E ), pathRefs: new Uint32Array( 0 ) } ), /expected E \+ 1/ );
+	assert.throws( () => curves.setPaths( { pathStart: Array.from( paths.pathStart ), pathRefs: paths.pathRefs } ), TypeError );
+	const short = { pathStart: paths.pathStart, pathRefs: paths.pathRefs.subarray( 0, 10 ) };
+	assert.throws( () => curves.setPaths( short ), /exceeds pathRefs.length/ );
+	const bad = { pathStart: paths.pathStart, pathRefs: paths.pathRefs.slice() };
+	bad.pathRefs[ 3 ] = g.N + g.C;
+	assert.throws( () => curves.setPaths( bad ), /neither a node/ );
+	const down = { pathStart: paths.pathStart.slice(), pathRefs: paths.pathRefs };
+	down.pathStart[ 5 ] = down.pathStart[ 4 ] - 1;
+	assert.throws( () => curves.setPaths( down ), /decreases|exceeds/ );
+	// a failed swap leaves the previous set in place
+	assert.equal( curves.stats.pathRefs, 0 );
+	curves.setPaths( null );
+	assert.equal( curves.stats.pathRefs, paths.pathRefs.length );
+	curves.dispose();
+
+} );
+
+test( 'curve cache: room reserved for a finer sampling (first sphere morph)', () => {
+
+	const g = load( 'lesmis' );
+	const buffers = new GraphBuffers( g );
+	const curves = new EdgeCurves();
+	let reallocs = 0;
+	curves.onRealloc = () => reallocs ++;
+	curves.setGraph( buffers, g, { segments: 32, reserve: 64 } );
+	assert.equal( curves.segments, 32 );
+	assert.equal( curves.uniforms.stride.value, 33 );
+	assert.equal( curves.capacity, 65 );
+	assert.equal( curves.stats.bytes, 16 * g.E * 65 );
+	// the morph: only the stride changes
+	const samples = curves.samples;
+	assert.equal( curves.setSegments( 64 ), 64 );
+	assert.equal( curves.samples, samples );
+	assert.equal( curves.uniforms.stride.value, 65 );
+	assert.equal( reallocs, 0 );
+	assert.equal( curves.stats.reallocations, 0 );
+	// not honoured past the reserve budget, nor past the memory budget
+	curves.reserveBudget = 16 * g.E * 40;
+	curves.setGraph( buffers, g, { segments: 32, reserve: 64 } );
+	assert.equal( curves.capacity, 33 );
+	curves.reserveBudget = Infinity;
+	curves.memoryBudget = 16 * g.E * 41; // at most 40 segments
+	curves.setGraph( buffers, g, { segments: 32, reserve: 64 } );
+	assert.equal( curves.capacity, 41 );
+	assert.equal( curves.segments, 32 );
+	// a reserve below the wanted count changes nothing
+	curves.setGraph( buffers, g, { segments: 32, reserve: 8 } );
+	assert.equal( curves.capacity, 33 );
+	assert.equal( reallocs, 0 );
+	curves.dispose();
+
+} );
+
+test( 'curve cache: the kernel runs only when something changed', () => {
+
+	const g = load( 'lesmis' );
+	const buffers = new GraphBuffers( g );
+	const curves = new EdgeCurves();
+	curves.setGraph( buffers, g, { segments: 8 } );
+	const app = { frame: 0, time: 0, renderer: { computes: 0, compute() { this.computes ++; } } };
+	const step = ( n = 1 ) => {
+
+		let ran = 0;
+		for ( let i = 0; i < n; i ++ ) {
+
+			app.frame ++; app.time += 1 / 60;
+			if ( curves.update( app ) ) ran ++;
+
+		}
+
+		return ran;
+
+	};
+
+	// moveFrame = Infinity ("unknown"): every frame evaluates
+	assert.equal( step( 5 ), 5 );
+	// the layout stamps the frame in which it last moved the nodes: one more run, then nothing
+	buffers.moveFrame = app.frame;
+	assert.equal( step( 50 ), 1 );
+	assert.equal( step( 500 ), 0 );
+	assert.equal( curves.stats.updates, 6 );
+	assert.equal( curves.stats.skipped, 549 );
+	assert.equal( app.renderer.computes, 6 );
+
+	// each of these costs exactly one evaluation
+	curves.uniforms.beta.value = 0.5;
+	assert.equal( step( 10 ), 1 );
+	curves.setPaths( straightPaths( g.E ) );
+	assert.equal( step( 10 ), 1 );
+	curves.setSegments( 6 );
+	assert.equal( step( 10 ), 1 );
+	curves.invalidate();
+	assert.equal( step( 10 ), 1 );
+	buffers.uniforms.graphCenter.value.set( 1, 0, 0 );
+	assert.equal( step( 10 ), 1 );
+	curves.uniforms.highlightLevel.value = 0.6;
+	assert.equal( step( 10 ), 1 );
+
+	// nodes move for 20 frames (the layout runs before the curves in a frame)
+	let ran = 0;
+	for ( let i = 0; i < 20; i ++ ) {
+
+		buffers.moveFrame = app.frame + 1;
+		ran += step();
+
+	}
+
+	assert.equal( ran, 20 );
+	assert.equal( step( 30 ), 1 ); // one settling run (covers a move stamped after our update)
+	assert.equal( step( 30 ), 0 );
+
+	// highlight easing bends curves only in sphere mode
+	const target = buffers.nodeStateTarget.value, attr = buffers.edgeAttr.value;
+	const write = ( attribute, index, value ) => {
+
+		attribute.array[ index ] = value;
+		attribute.needsUpdate = true;
+
+	};
+
+	write( target, 4 * 3, 1 ); // a CPU write: node 3 selected
+	assert.equal( step( 100 ), 0 );
+	buffers.uniforms.layoutBlend.value = 1;
+	assert.equal( step( 100 ), 1 ); // the blend changed
+	write( target, 4 * 3, 0 ); // deselected
+	let eased = step( 200 );
+	assert.ok( eased >= 60 && eased <= 80, `${eased} runs while the highlight eases (1.2 s at 60 fps)` );
+	assert.equal( step( 100 ), 0 );
+	// writes the kernel does not read cost nothing: hover (w), neighbour and dim flags (y, z), an
+	// upload without a change, the per-edge width, metric and seed
+	write( target, 4 * 5 + 3, 1 );
+	assert.equal( step( 50 ), 0 );
+	write( target, 4 * 5 + 1, 1 );
+	write( target, 4 * 7 + 2, 1 );
+	assert.equal( step( 50 ), 0 );
+	target.needsUpdate = true;
+	buffers.nodeState.value.needsUpdate = true;
+	assert.equal( step( 50 ), 0 );
+	write( attr, 4 * 2, 2 );
+	write( attr, 4 * 2 + 2, 0.5 );
+	assert.equal( step( 50 ), 0 );
+	// the highlight weight of an edge and the eased state itself are read
+	write( attr, 4 * 2 + 1, 1 );
+	eased = step( 200 );
+	assert.ok( eased >= 60 && eased <= 80, `${eased} runs after an edge highlight` );
+	write( buffers.nodeState.value, 4 * 9, 1 );
+	eased = step( 200 );
+	assert.ok( eased >= 60 && eased <= 80, `${eased} runs after a write to the eased state` );
+	assert.equal( step( 100 ), 0 );
+	// morphing: every frame
+	ran = 0;
+	for ( let i = 0; i < 10; i ++ ) {
+
+		buffers.uniforms.layoutBlend.value = 1 - ( i + 1 ) / 10;
+		ran += step();
+
+	}
+
+	assert.equal( ran, 10 );
+	assert.equal( step( 50 ), 0 );
+	// invalidate( seconds ) keeps evaluating for that long
+	curves.invalidate( 0.5 );
+	const forced = step( 100 );
+	assert.ok( forced >= 29 && forced <= 32, `${forced}` );
+	curves.dispose();
+
+} );
+
+test( 'strands: subdivided in the vertex stage, bounded by a vertex budget; close-up widths; device memory', () => {
+
+	// small graphs: 96 segments per edge from 32 cached ones, 80 from 20
+	assert.equal( strandSubdivision( 32, 254 ), 3 );
+	assert.equal( strandSubdivision( 20, 2492 ), 4 );
+	assert.equal( strandSubdivision( 40, 2492 ), 2, 'the sphere layout caches twice the samples' );
+	assert.equal( strandSubdivision( 96, 254 ), 1 );
+	// the draw stays below the vertex limit …
+	for ( const [ S, E ] of [ [ 20, 20000 ], [ 15, 40000 ], [ 12, 100000 ], [ 8, 384444 ], [ 32, 2000 ] ] ) {
+
+		const sub = strandSubdivision( S, E );
+		assert.ok( sub >= 1 && sub <= 4 );
+		if ( sub > 1 ) assert.ok( 2 * E * ( S * sub + 1 ) <= EDGE_DEFAULTS.strandVertexLimit, `${E} edges: ${2 * E * ( S * sub + 1 )} vertices` );
+
+	}
+
+	assert.equal( strandSubdivision( 20, 20000 ), 3 );
+	assert.equal( strandSubdivision( 15, 40000 ), 2 );
+	// … and never reduces what the cache has
+	assert.equal( strandSubdivision( 8, 384444 ), 1 );
+	assert.equal( strandSubdivision( 20, 2492, 1000 ), 1 );
+	// strands stay lines near the camera, tubes keep their body, hubs do not burn out
+	assert.equal( EDGE_DEFAULTS.maxPixelWidth, 8 );
+	assert.ok( LOOK_DEFAULTS.tubeMaxPixelWidth >= 16 );
+	assert.ok( LOOK_DEFAULTS.tubeGlow <= 0.8 && LOOK_DEFAULTS.tubeTaper > 0 && LOOK_DEFAULTS.tubeTaper < 1 );
+	assert.ok( LOOK_DEFAULTS.solidGlowThin > LOOK_DEFAULTS.solidGlow && LOOK_DEFAULTS.solidGlow >= 0.5 );
+	// the curve cache exists twice (GPU + three's CPU copy): a smaller budget on touch devices
+	assert.equal( autoCurveMemory( false ), 64 * 1024 * 1024 );
+	assert.equal( autoCurveMemory( true ), 24 * 1024 * 1024 );
+	assert.equal( EDGE_DEFAULTS.memoryBudget, null );
 
 } );

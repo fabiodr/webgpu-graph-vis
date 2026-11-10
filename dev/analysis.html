@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>dev: analysis</title>
+<style>
+html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; color: #c9d2e3; font: 12px/1.45 system-ui, sans-serif; }
+#app { position: fixed; inset: 0; }
+#hud { position: fixed; left: 12px; bottom: 12px; z-index: 5; pointer-events: none; min-width: 250px; max-width: 330px; padding: 10px 12px; border-radius: 10px; background: rgba( 10, 13, 20, 0.72 ); border: 1px solid rgba( 255, 255, 255, 0.08 ); }
+#hud h1 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: #eef2fa; }
+#hud .row { display: flex; justify-content: space-between; gap: 12px; white-space: nowrap; }
+#hud .row b { font-weight: 500; color: #eef2fa; }
+#hud .bar { height: 10px; border-radius: 5px; margin: 6px 0 2px; }
+#hud .ends { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; opacity: 0.8; }
+#hud .progress { height: 3px; border-radius: 2px; background: rgba( 255, 255, 255, 0.12 ); margin-top: 6px; overflow: hidden; }
+#hud .progress i { display: block; height: 100%; background: #7fd4ff; }
+#summary { position: fixed; right: 12px; top: 12px; bottom: 12px; z-index: 5; width: 290px; overflow: hidden; pointer-events: none; padding: 10px 12px; border-radius: 10px; background: rgba( 10, 13, 20, 0.72 ); border: 1px solid rgba( 255, 255, 255, 0.08 ); white-space: pre-wrap; font: 11px/1.45 ui-monospace, Menlo, monospace; display: none; }
+#swatches { position: fixed; left: 12px; top: 12px; z-index: 5; width: 300px; display: none; }
+#swatches div { height: 22px; border-radius: 4px; margin-bottom: 4px; padding: 0 8px; line-height: 22px; color: #000; font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="hud"></div>
+<div id="summary"></div>
+<div id="swatches"></div>
+<script type="module">
+// Dev page of the analysis package: the real App with the real layout, renderers, camera and
+// interaction (as main.js wires them, without the settings panel) plus Lens and Tools.
+//
+// Query parameters
+//   ds=imsv/lesmis        dataset id of the manifest (loaded through the data worker)
+//   size=<metric>         node size lens      (degree, core, pagerank, eigenvector, betweenness,
+//   color=<metric>        node colour lens     closeness, harmonic, clustering, triangles,
+//   glow=<metric>         glow lens            component, relevance)
+//   ramp=viridis|magma|ice|ember|mint   reverse=1      colour ramp
+//   intensity=0.4         how much of its light the bright end of the ramp keeps (1 = the ramp as
+//                         defined, which burns out under the bloom)
+//   cgamma=1  sgamma=1.5  gamma of the colour / size channel (above 1 sets the leaders apart)
+//   top=0.05              fraction of the nodes that glow
+//   palette=paper|rainbow|aurora|ember  cluster palette (lens.setPalette)
+//   select=<node>         select a node (the source of the 'relevance' metric)
+//   ripple=<node>[,<node>…]   start a ripple; its uniforms are logged per frame in
+//                         __analysis.rippleLog ( [ time, front, gain ] )
+//   khop=<node>,<k>       k-hop neighbourhood  ·  path=<a>,<b>  shortest path  ·  all=1 every geodesic
+//   edges=<metric>[,<metric>…]   request per-edge channels together (triangles, embeddedness,
+//                         betweenness); the results are kept in __analysis.edge / .edges (no
+//                         renderer shows them yet)
+//   summary=1             compute the graph summary and show it
+//   refine=<ms>           time limit of the refinement of metrics that no channel shows (default
+//                         20000); with untilexact=0 it also stops the metrics on a channel, which
+//                         is how a screenshot of an early estimate is taken
+//   preview=<ms>          first preview interval of slow metrics (default 200)
+//   inline=1              run the analytics handler on the main thread instead of a worker
+//   swatches=1            show all ramps
+//   labels=auto|all|off   autorotate=1   bloom=0.8
+// Nodes are indices or labels. window.__analysis = { app, lens, tools, client, layout, rig,
+// interaction, nodes, done (true once every requested lens / summary promise has settled),
+// applied (what those promises resolved to), log, refinement ( [ { pivots, error } ]: mean
+// distance of each estimate of the colour metric to the last one, in ramp units ) }.
+import '../src/ui/ui.css';
+import { createApp } from '../src/app/App.js';
+import { fetchManifest } from '../src/data/load.js';
+import { DataClient } from '../src/data/client.js';
+import { ForceLayout } from '../src/gpu/ForceLayout.js';
+import { NodeRenderer } from '../src/render/NodeRenderer.js';
+import { EdgeRenderer } from '../src/render/EdgeRenderer.js';
+import { Labels } from '../src/render/Labels.js';
+import { Environment } from '../src/render/gfx/Environment.js';
+import { CameraRig } from '../src/interact/CameraRig.js';
+import { Interaction } from '../src/interact/Interaction.js';
+import { AnalysisClient } from '../src/analysis/client.js';
+import { Lens } from '../src/analysis/Lens.js';
+import { Tools } from '../src/analysis/Tools.js';
+import { rampList } from '../src/util/color.js';
+
+const params = new URLSearchParams( location.search );
+const P = ( k, d ) => ( params.has( k ) ? params.get( k ) : d );
+const hud = document.getElementById( 'hud' );
+const fmt = ( v ) => ( ! Number.isFinite( v ) ? '–' : Math.abs( v ) >= 1000 ? v.toFixed( 0 ) : Math.abs( v ) >= 10 ? v.toFixed( 1 ) : Math.abs( v ) >= 0.01 || v === 0 ? v.toFixed( 3 ) : v.toExponential( 2 ) );
+
+try {
+
+	const app = await createApp( document.getElementById( 'app' ) );
+	window.__app = app;
+	const rig = new CameraRig();
+	rig.autoRotate = P( 'autorotate', '0' ) === '1';
+	const layout = app.use( new ForceLayout() );
+	app.use( new EdgeRenderer() );
+	const nodes = app.use( new NodeRenderer() );
+	app.use( new Environment() );
+	const labels = app.use( new Labels( { mode: P( 'labels', 'auto' ) } ) );
+	app.gfx.set( 'bloom', + P( 'bloom', 0.8 ) );
+	const interaction = new Interaction( { layout, rig } );
+	interaction.picking.setRadiusFunction( ( i ) => nodes.worldRadius( i ) );
+	app.use( interaction );
+	app.use( rig );
+
+	const client = new AnalysisClient( { inline: P( 'inline', '0' ) === '1', preview: + P( 'preview', 200 ) } );
+	const lens = app.use( new Lens( {
+		client, ramp: P( 'ramp', 'viridis' ), preview: + P( 'preview', 200 ), refineMs: + P( 'refine', 20000 ), untilExact: P( 'untilexact', '1' ) !== '0',
+		...( params.has( 'intensity' ) ? { intensity: + P( 'intensity' ) } : {} ), ...( params.has( 'sgamma' ) ? { sizeGamma: + P( 'sgamma' ) } : {} ),
+	} ) );
+	const tools = app.use( new Tools() );
+	const A = window.__analysis = { app, lens, tools, client, layout, rig, interaction, nodes, done: false, applied: {}, log: [], refinement: [], rippleLog: [], edge: null, edges: {}, summary: null };
+
+	// ── legend ───────────────────────────────────────────────────────────────────────────
+	function render() {
+
+		const s = lens.state, g = app.graph;
+		const parts = [ `<h1>${g ? g.name : ''} · ${g ? g.N.toLocaleString( 'en-US' ) : 0} nodes · ${g ? g.E.toLocaleString( 'en-US' ) : 0} edges</h1>` ];
+		const status = ( id ) => {
+
+			const m = s.metrics[ id ];
+			if ( ! m ) return '';
+			if ( m.error ) return ' · error';
+			if ( m.exact ) return ' · exact';
+			if ( m.total > 0 ) return ` · ${m.pivots.toLocaleString( 'en-US' )} / ${m.total.toLocaleString( 'en-US' )} pivots${m.final ? ' (stopped)' : ''}`;
+			return m.ready ? '' : ' · computing…';
+
+		};
+
+		const c = lens.legend( 'color' );
+		if ( c ) {
+
+			parts.push( `<div class="row"><span>Colour</span><b>${c.label} (${c.categorical ? 'categories' : c.scale})${status( c.metric )}</b></div>` );
+			if ( ! c.categorical ) parts.push( `<div class="bar" style="background:${c.css}"></div><div class="ends"><span>${fmt( c.min )}</span><span>${fmt( c.max )}</span></div>` );
+			if ( c.intensity !== lens.options.intensity ) parts.push( `<div class="row"><span>Intensity</span><b>${c.intensity}</b></div>` );
+
+		} else parts.push( `<div class="row"><span>Colour</span><b>clusters (${s.palette})</b></div>` );
+		const z = lens.legend( 'size' );
+		parts.push( `<div class="row"><span>Size</span><b>${z ? `${z.label} (${z.scale})${status( z.metric )}` : 'degree'}</b></div>` );
+		const w = lens.legend( 'glow' );
+		if ( w ) parts.push( `<div class="row"><span>Glow</span><b>top ${( 100 * w.top ).toFixed( 0 )} % by ${w.label}: ${w.count} nodes${status( w.metric )}</b></div>` );
+		const t = tools.state;
+		if ( t.path ) parts.push( `<div class="row"><span>Path</span><b>${t.path.source} → ${t.path.target}: ${t.path.length} hops${t.path.all ? `, ${t.path.pathCount} geodesics` : ''}</b></div>` );
+		if ( t.khop ) parts.push( `<div class="row"><span>k-hop</span><b>${t.khop.count} nodes within ${t.khop.k} of ${t.khop.sources}</b></div>` );
+		if ( t.ripple ) parts.push( `<div class="row"><span>Ripple</span><b>front ${t.ripple.front.toFixed( 2 )} / ${t.ripple.maxDist} · gain ${t.ripple.gain.toFixed( 2 )}</b></div>` );
+		const busy = Object.values( s.metrics ).filter( ( m ) => ! m.final && m.total > 0 );
+		if ( busy.length ) parts.push( `<div class="progress"><i style="width:${( 100 * Math.min( ...busy.map( ( m ) => m.progress ) ) ).toFixed( 1 )}%"></i></div>` );
+		hud.innerHTML = parts.join( '' );
+
+	}
+
+	const estimates = []; // normalised values of the colour metric at each 'data' event
+	app.events.addEventListener( 'lens', ( e ) => {
+
+		const d = e.detail, m = d.color ? d.metrics[ d.color ] : null;
+		A.log.push( { t: Math.round( performance.now() ), reason: d.reason, color: d.color, pivots: m ? m.pivots : 0 } );
+		// the DOM labels cache per-node pill colours: let them re-read what the lens shows
+		if ( d.reason !== 'progress' ) labels.setColors?.( lens.colors );
+		if ( d.reason === 'data' && m && m.ready && m.total > 0 && app.graph.N <= 20000 ) {
+
+			estimates.push( { pivots: m.pivots, values: Float32Array.from( lens.values( d.color ).normalized ) } );
+			const last = estimates.at( - 1 ).values;
+			A.refinement = estimates.map( ( x ) => ( { pivots: x.pivots, error: + ( x.values.reduce( ( sum, v, i ) => sum + Math.abs( v - last[ i ] ), 0 ) / last.length ).toFixed( 5 ) } ) );
+
+		}
+
+		render();
+
+	} );
+	for ( const type of [ 'path', 'khop', 'ripple' ] ) app.events.addEventListener( type, render );
+	app.events.addEventListener( 'frame', () => {
+
+		const r = tools.state.ripple;
+		if ( r ) {
+
+			A.rippleLog.push( [ + app.time.toFixed( 3 ), + r.front.toFixed( 4 ), + r.gain.toFixed( 4 ) ] );
+			render();
+
+		}
+
+	} );
+
+	if ( P( 'swatches', '0' ) === '1' ) {
+
+		const el = document.getElementById( 'swatches' );
+		el.style.display = 'block';
+		el.innerHTML = rampList().map( ( r ) => `<div style="background:${r.css}">${r.id}</div>` ).join( '' );
+
+	}
+
+	// ── data ─────────────────────────────────────────────────────────────────────────────
+	const data = new DataClient();
+	const manifest = await fetchManifest( '/data/manifest.json' );
+	const id = P( 'ds', 'imsv/lesmis' );
+	const entry = manifest.datasets.find( ( d ) => d.id === id );
+	if ( ! entry ) throw new Error( `Unknown dataset "${id}"` );
+	const loaded = await data.load( entry.file ? { ...entry, file: '/' + entry.file } : entry, { palette: P( 'palette', 'paper' ) } );
+	const graph = loaded.graph;
+	app.setGraph( graph );
+	rig.fitToGraph( { animate: false } );
+	rig.keepFramed?.( 6 );
+
+	const node = ( text ) => {
+
+		const t = String( text ).trim();
+		if ( /^\d+$/.test( t ) ) return + t;
+		const i = graph.labels ? graph.labels.findIndex( ( l ) => String( l ) === t ) : - 1;
+		if ( i < 0 ) throw new Error( `Unknown node "${t}"` );
+		return i;
+
+	};
+
+	// ── apply the query ──────────────────────────────────────────────────────────────────
+	const waits = [];
+	const track = ( name, promise ) => waits.push( promise.then( ( v ) => ( A.applied[ name ] = v ), ( e ) => ( A.applied[ name ] = 'error: ' + e.message ) ) );
+	if ( params.has( 'select' ) ) interaction.select( node( P( 'select' ) ) );
+	if ( P( 'size' ) ) track( 'size', lens.setSize( P( 'size' ) ) );
+	if ( P( 'color' ) ) track( 'color', lens.setColor( P( 'color' ), { ramp: P( 'ramp', 'viridis' ), reverse: P( 'reverse', '0' ) === '1', gamma: + P( 'cgamma', 1 ) } ) );
+	if ( P( 'glow' ) ) track( 'glow', lens.setGlow( P( 'glow' ), { top: + P( 'top', 0.05 ) } ) );
+	if ( P( 'khop' ) ) {
+
+		const [ a, k ] = P( 'khop' ).split( ',' );
+		tools.khop( node( a ), + ( k || 2 ) );
+
+	}
+
+	if ( P( 'path' ) ) {
+
+		const [ a, b ] = P( 'path' ).split( ',' );
+		tools.path( node( a ), node( b ), { all: P( 'all', '0' ) === '1' } );
+
+	}
+
+	if ( P( 'ripple' ) ) track( 'ripple', tools.ripple( P( 'ripple' ).split( ',' ).map( node ) ).finished );
+	// several channels are asked for in one go, as an edge renderer would (width by one, alpha by another)
+	for ( const metric of ( P( 'edges' ) || '' ).split( ',' ).filter( Boolean ) ) track( 'edges:' + metric, lens.edgeChannel( metric ).then( ( r ) => ( A.edge = A.edges[ metric ] = r, r ? `${r.metric}: ${r.values.length} values, exact ${r.exact}` : null ) ) );
+	if ( P( 'summary', '0' ) === '1' ) {
+
+		const el = document.getElementById( 'summary' );
+		el.style.display = 'block';
+		const show = ( s ) => {
+
+			A.summary = s;
+			const top = ( key ) => ( s.top[ key ] ? s.top[ key ].labels.slice( 0, 5 ).map( ( l, k ) => `  ${l}  ${fmt( s.top[ key ].values[ k ] )}` ).join( '\n' ) + ( s.top[ key ].exact ? '' : '\n  (sampled)' ) : '  …' );
+			el.textContent = [
+				`SUMMARY · ${s.stage}`,
+				`nodes ${s.nodes}  edges ${s.edges}  density ${fmt( s.density )}`,
+				`degree min ${s.degree.min} median ${s.degree.median} mean ${fmt( s.degree.mean )} max ${s.degree.max}`,
+				`degree bins ${s.degree.bins.map( ( b ) => b.count ).join( ' ' )}`,
+				`assortativity ${fmt( s.assortativity )}`,
+				`components ${s.components.count} (largest ${( 100 * s.components.largestFraction ).toFixed( 1 )} %)`,
+				`clustering avg ${fmt( s.clustering.average )} transitivity ${fmt( s.clustering.transitivity )}`,
+				`triangles ${s.clustering.triangles}  degeneracy ${s.core.degeneracy}`,
+				s.distance ? `path length ${fmt( s.distance.averagePathLength )}  eff. diameter ${fmt( s.distance.effectiveDiameter )}${s.distance.exact ? '' : ` (${s.distance.pivots} pivots)`}` : 'path length …',
+				s.diameter ? `diameter ${s.diameter.exact ? s.diameter.lower : `${s.diameter.lower} to ${s.diameter.upper}`}  (${s.diameter.endpointLabels.join( ' ↔ ' )})` : 'diameter …',
+				'', 'degree', top( 'degree' ), 'pagerank', top( 'pagerank' ), 'betweenness', top( 'betweenness' ), 'closeness', top( 'closeness' ),
+				s.timings.total !== undefined ? `\n${s.timings.total.toFixed( 0 )} ms in the worker` : '',
+			].join( '\n' );
+
+		};
+
+		track( 'summary', lens.summary( { onPreview: show } ).then( ( s ) => ( show( s ), s.stage ) ) );
+
+	}
+
+	render();
+	window.__ready = true;
+	await Promise.all( waits );
+	render();
+	A.done = true;
+
+} catch ( e ) {
+
+	console.error( e );
+	window.__error = e.message || String( e );
+
+}
+</script>
+</body>
+</html>

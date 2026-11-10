@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>dev: atmosphere</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#aab4c8;font:12px/1.35 system-ui,sans-serif;overflow:hidden}
+#app{position:fixed;inset:0}
+#ui{position:fixed;left:8px;top:8px;z-index:2;width:244px;max-height:calc(100% - 16px);overflow:auto;padding:8px 10px;border-radius:10px;
+	background:rgba(10,13,20,.78);border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(8px)}
+#ui h2{margin:9px 0 4px;font:600 10px system-ui;letter-spacing:.08em;text-transform:uppercase;color:#6f7b93}
+#ui h2:first-child{margin-top:0}
+.seg{display:flex;gap:2px;flex-wrap:wrap;margin:2px 0}
+.seg button{flex:1 1 auto;padding:3px 5px;border-radius:5px;border:1px solid rgba(255,255,255,.1);background:none;color:inherit;font:inherit;cursor:pointer}
+.seg button.on{background:#2b6cff;border-color:#2b6cff;color:#fff}
+.sl{display:grid;grid-template-columns:78px 1fr 34px;align-items:center;gap:6px}
+.sl input{width:100%;min-width:0}
+.sl span:last-child{text-align:right;font-variant-numeric:tabular-nums}
+#ui select{width:100%;background:#131826;color:#c9d2e6;border:1px solid #2a3350;border-radius:5px;font:inherit;padding:2px}
+#stats{margin-top:6px;white-space:pre;font:11px/1.4 ui-monospace,monospace;color:#8f9bb3}
+#err{position:fixed;left:8px;bottom:8px;color:#ff7a7a;white-space:pre-wrap;z-index:3}
+@media (max-width:640px){#ui{width:200px;max-height:46%}}
+</style>
+</head>
+<body>
+<div id="app"></div><div id="ui"></div><div id="err"></div>
+<script type="module">
+// Dev page for the atmosphere package on the real App and the real modules (ForceLayout,
+// EdgeRenderer, NodeRenderer, Environment, ClusterField, TextLabels in the overlay pass, Lens,
+// Tools, Interaction, CameraRig): the community field, the community labels with semantic zoom,
+// the depth motes and the node look under the render graph's tiers.
+//
+// Query (all optional; the graphics switches of the App work too: quality= ao= dof= shadows=
+// traa= scale= debug= post= …)
+//   ds=imsv/lesmis            any id of public/data/manifest.json (generated/hsbm-500, generated/lfr-2k,
+//                             generated/hsbm-20k, …), or gen:<model>:<nodes>:<average degree> for a
+//                             generated graph that is not in the manifest (gen:hsbm:20000:6)
+//   quality=auto|low|medium|high|ultra
+//   field=0.5                 field.strength (0 = off)       level=auto|<height>
+//   fradius=1.5  fcore=0.35  fabsorb=0.15  fsat=0.8  fover=<views>   field parameters (fover: overdraw budget)
+//   fadapt=0                  field.adaptive = false: no stepping back inside the graph / on large graphs
+//   zlabels=<n>               labels.maxZoomLabels (budget of the semantic zoom in graphs beyond autoMaxNodes)
+//   clabels=auto|on|off       labels.clusterLabels           labels=auto|all|off   labels.mode
+//   dust=<0..1>               env.dust (default: the preset's)
+//   preset=aurora|studio|void Environment preset             fog=<0..1>
+//   layout=force|flat|sphere|radial|stress
+//   view=far|overview|mid|close|node   camera distance preset (see __atmo.view), yaw= pitch= degrees, far=2.2,
+//                             ndist=16 (node view: distance in node radii)
+//   sel=<index|label|max>     select a node                  focus=<cluster index>  field.focus()
+//   lens=<metric>             lens.setColor( metric ), e.g. pagerank
+//   settle=20000              ms the layout may run before the camera is placed (0 = seed positions)
+//   fast=1                    settle in the low tier with edges, labels and field hidden (software
+//                             rendering: a frame of a 20k graph takes most of a minute otherwise)
+//   ticks=0                   layout ticks per frame (0 = adaptive; 12 settles fast in software rendering)
+//   pause=1                   pause the layout afterwards
+//   spin=<deg per frame>      orbit the camera every frame (motion-vector / TRAA checks)
+//   frames=4                  frames rendered after the setup before window.__ready
+//   ui=0                      hide the controls
+//
+// Scripted checks: window.__ui = { app, gfx, layout, nodes, edges, env, field, labels, lens, tools,
+// interaction, rig } as in the app, and window.__atmo:
+//   frames( n )               Promise: n rendered frames
+//   view( name, { yaw, pitch, cluster } )   far | overview | mid | close | node (camera distance presets:
+//                             the fitted graph; halfway to the largest community; that community
+//                             filling the view; the highest-degree node of it close up)
+//   select( index | label | 'max' | -1 )
+//   stats()                   field / labels / env statistics, gfx tier, memory counters
+//   memory()                  renderer.info.memory counters
+//   leakCheck( { tiers, graphs } )   Promise<rows>: switches through the tiers and loads graphs,
+//                             recording memory() and the scene's mesh / material census after each
+//   shaderInfo()              storage buffers and texture taps per stage of the package's shaders
+//   load( id )                Promise: load another dataset
+import { createApp } from '../src/app/App.js';
+import { fetchManifest } from '../src/data/load.js';
+import { DataClient } from '../src/data/client.js';
+import { ForceLayout, LAYOUT_MODES } from '../src/gpu/ForceLayout.js';
+import { NodeRenderer } from '../src/render/NodeRenderer.js';
+import { EdgeRenderer } from '../src/render/EdgeRenderer.js';
+import { Environment, ENV_PRESETS } from '../src/render/gfx/Environment.js';
+import { ClusterField } from '../src/render/ClusterField.js';
+import { TextLabels } from '../src/render/TextLabels.js';
+import { CameraRig } from '../src/interact/CameraRig.js';
+import { Interaction } from '../src/interact/Interaction.js';
+import { Lens } from '../src/analysis/Lens.js';
+import { Tools } from '../src/analysis/Tools.js';
+import { gfxState, gfxUniforms } from '../src/render/gfx/shared.js';
+import { TIER_ORDER } from '../src/app/Quality.js';
+import * as THREE from 'three/webgpu';
+
+const params = new URLSearchParams( location.search );
+const P = ( k, d ) => ( params.has( k ) ? params.get( k ) : d );
+const num = ( k, d ) => ( params.has( k ) ? Number( params.get( k ) ) : d );
+const sleep = ( ms ) => new Promise( ( r ) => setTimeout( r, ms ) );
+
+try {
+
+	const app = await createApp( document.getElementById( 'app' ) ); // graphics switches come from the URL
+	const gfx = app.gfx;
+	window.__app = app;
+
+	// keep the WGSL of every shader module three creates (see shaderInfo)
+	const shaderModules = [];
+	const device = app.renderer.backend.device;
+	const createShaderModule = device.createShaderModule.bind( device );
+	device.createShaderModule = ( descriptor ) => {
+
+		shaderModules.push( { label: descriptor.label, code: descriptor.code } );
+		return createShaderModule( descriptor );
+
+	};
+
+	const frames = ( n ) => new Promise( ( resolve ) => {
+
+		const f0 = app.frame;
+		const check = () => ( app.frame - f0 >= n ? resolve() : requestAnimationFrame( check ) );
+		check();
+
+	} );
+
+	const rig = new CameraRig( { autoRotate: false } );
+	const data = new DataClient( { baseUrl: '/' } );
+	const layout = app.use( new ForceLayout( { data, ticksPerFrame: num( 'ticks', 0 ) } ) );
+	const edges = app.use( new EdgeRenderer() );
+	const nodes = app.use( new NodeRenderer() );
+	const env = app.use( new Environment( { preset: P( 'preset', 'aurora' ) } ) );
+	const field = app.use( new ClusterField( { strength: num( 'field', 0.5 ), level: params.has( 'level' ) && P( 'level' ) !== 'auto' ? num( 'level' ) : 'auto' } ) );
+	const labels = app.use( new TextLabels( { mode: P( 'labels', 'auto' ) } ) );
+	gfx.attachLabels( labels );
+	const interaction = new Interaction( { layout, rig } );
+	interaction.picking.setRadiusFunction( ( i ) => nodes.worldRadius( i ) );
+	app.use( interaction );
+	app.use( rig );
+	const lens = app.use( new Lens() );
+	const tools = app.use( new Tools() );
+	window.__ui = { app, gfx, layout, nodes, edges, env, field, labels, lens, tools, interaction, rig, data };
+
+	if ( params.has( 'fradius' ) ) field.radius = num( 'fradius' );
+	if ( params.has( 'fcore' ) ) field.core = num( 'fcore' );
+	if ( params.has( 'fabsorb' ) ) field.absorb = num( 'fabsorb' );
+	if ( params.has( 'fsat' ) ) field.saturation = num( 'fsat' );
+	if ( params.has( 'fover' ) ) field.maxOverdraw = num( 'fover' );
+	if ( params.has( 'fadapt' ) ) field.adaptive = num( 'fadapt' ) !== 0;
+	if ( params.has( 'zlabels' ) ) labels.maxZoomLabels = num( 'zlabels' );
+	if ( params.has( 'clabels' ) ) labels.clusterLabels = P( 'clabels' );
+	if ( params.has( 'dust' ) ) env.dust = num( 'dust' );
+	if ( params.has( 'fog' ) ) env.fog = num( 'fog' );
+	if ( params.has( 'bloom' ) ) gfx.set( 'bloom', num( 'bloom' ) );
+
+	// ── data ────────────────────────────────────────────────────────────────────────────────
+	const manifest = await fetchManifest( '/data/manifest.json' );
+	let graph = null, dsId = '';
+	const settle = async ( ms ) => {
+
+		const t0 = performance.now();
+		await frames( 2 );
+		while ( performance.now() - t0 < ms && ! layout.settled ) await sleep( 200 );
+
+	};
+
+	async function load( id, { settleMs = num( 'settle', 20000 ) } = {} ) {
+
+		let entry = manifest.datasets.find( ( d ) => d.id === id );
+		const gen = /^gen:(\w+):(\d+)(?::([\d.]+))?$/.exec( id );
+		if ( gen ) entry = { id, name: id, generate: { model: gen[ 1 ], params: { n: + gen[ 2 ], ...( gen[ 3 ] ? { avgDegree: + gen[ 3 ] } : {} ) }, seed: 1 } };
+		if ( ! entry ) throw new Error( `dataset ${id} not in manifest` );
+		const r = await data.load( entry );
+		if ( r.cancelled ) return null;
+		graph = r.graph;
+		dsId = id;
+		app.setGraph( graph );
+		if ( P( 'layout', 'force' ) !== 'force' ) layout.setLayoutMode( P( 'layout' ) );
+		rig.fitToGraph( { animate: false } );
+		if ( settleMs > 0 ) {
+
+			// settle cheaply: the tier and what is drawn do not change where the layout ends up
+			const fast = P( 'fast', '1' ) !== '0' && gfx.tier !== 'low';
+			const setting = gfx.setting, shown = [ edges.visible, labels.visible, field.visible ];
+			if ( fast ) {
+
+				gfx.setQuality( 'low' );
+				edges.visible = labels.visible = field.visible = false;
+
+			}
+
+			await settle( settleMs );
+			if ( fast ) {
+
+				[ edges.visible, labels.visible, field.visible ] = shown;
+				gfx.setQuality( setting );
+				await frames( 1 );
+
+			}
+
+		}
+
+		rig.fitToGraph( { animate: false } );
+		field.snap?.();
+		return graph;
+
+	}
+
+	const indexOf = ( v ) => {
+
+		if ( v === null || v === undefined || v === '' ) return - 1;
+		if ( v === 'max' ) {
+
+			let best = 0;
+			for ( let i = 1; i < graph.N; i ++ ) if ( graph.degree[ i ] > graph.degree[ best ] ) best = i;
+			return best;
+
+		}
+
+		if ( /^-?\d+$/.test( String( v ) ) ) return + v;
+		return graph.labels ? graph.labels.indexOf( v ) : - 1;
+
+	};
+
+	const select = ( v ) => interaction.select( indexOf( v ) );
+
+	// ── camera distance presets ─────────────────────────────────────────────────────────────
+	const _c = new THREE.Vector3(), _d = new THREE.Vector3();
+	/** Centre and robust radius of a community from the readback; default: the largest one with a volume. */
+	function community( cluster = null ) {
+
+		const pos = app.positions;
+		const c = cluster ?? ( field.clusters && field.clusters.length ? field.clusters[ 0 ] : - 1 );
+		if ( c < 0 || graph.D === 0 ) return null;
+		const l = graph.clusterHeight[ c ] - 1;
+		let x = 0, y = 0, z = 0, n = 0, hub = - 1;
+		for ( let i = 0; i < graph.N; i ++ ) {
+
+			if ( graph.anc[ i * graph.D + l ] !== c ) continue;
+			x += pos[ 4 * i ]; y += pos[ 4 * i + 1 ]; z += pos[ 4 * i + 2 ]; n ++;
+			if ( hub < 0 || graph.degree[ i ] > graph.degree[ hub ] ) hub = i;
+
+		}
+
+		x /= n; y /= n; z /= n;
+		let s = 0;
+		for ( let i = 0; i < graph.N; i ++ ) if ( graph.anc[ i * graph.D + l ] === c ) s += ( pos[ 4 * i ] - x ) ** 2 + ( pos[ 4 * i + 1 ] - y ) ** 2 + ( pos[ 4 * i + 2 ] - z ) ** 2;
+		return { cluster: c, center: new THREE.Vector3( x, y, z ), radius: Math.sqrt( s / n ), size: n, hub };
+
+	}
+
+	let viewName = 'overview';
+	function view( name = 'overview', { yaw = num( 'yaw', 0 ), pitch = num( 'pitch', 0 ), cluster = null } = {} ) {
+
+		viewName = name;
+		const sphere = app.boundingSphere();
+		const direction = new THREE.Vector3( 0, 0, 1 ).applyEuler( new THREE.Euler( - pitch * Math.PI / 180, yaw * Math.PI / 180, 0, 'YXZ' ) );
+		rig.fitToGraph( { animate: false, direction } );
+		if ( name === 'overview' ) return name;
+		const fit = app.camera.position.distanceTo( ( rig.controls || app.controls ).target );
+		if ( name === 'far' ) {
+
+			// the graph as a small object: the distance at which communities are names
+			rig.flyTo( _c.copy( sphere.center ), fit * num( 'far', 2.2 ), { animate: false, direction } );
+			return name;
+
+		}
+
+		const com = community( cluster );
+		if ( name === 'node' ) {
+
+			// one bead close up: the selected node, else the hub of the community, from `ndist` radii away
+			const i = interaction.selectedIndex >= 0 ? interaction.selectedIndex : com ? com.hub : indexOf( 'max' );
+			rig.focusNode( i, { animate: false, distance: nodes.worldRadius( i ) * num( 'ndist', 16 ) } );
+			return name;
+
+		}
+
+		if ( ! com ) return 'overview';
+		if ( name === 'mid' ) {
+
+			// halfway: between the graph centre and the community, at 45 % of the fitted distance
+			_c.copy( sphere.center ).lerp( com.center, 0.6 );
+			rig.flyTo( _c, fit * 0.45, { animate: false, direction } );
+
+		} else {
+
+			// the community fills the view
+			_d.copy( com.center );
+			rig.flyTo( _d, Math.max( com.radius * 3.4, sphere.radius * 0.06 ), { animate: false, direction } );
+
+		}
+
+		return name;
+
+	}
+
+	// ── controls ────────────────────────────────────────────────────────────────────────────
+	const ui = document.getElementById( 'ui' );
+	if ( P( 'ui', '1' ) === '0' ) ui.style.display = 'none';
+	const el = ( tag, props = {}, ...children ) => {
+
+		const e = Object.assign( document.createElement( tag ), props );
+		e.append( ...children );
+		return e;
+
+	};
+
+	const refreshers = [];
+	const refresh = () => refreshers.forEach( ( f ) => f() );
+	const seg = ( title, options, read, write ) => {
+
+		if ( title ) ui.append( el( 'h2', {}, title ) );
+		const box = el( 'div', { className: 'seg' } );
+		for ( const o of options ) {
+
+			const b = el( 'button', { textContent: String( o ), onclick: () => ( write( o ), refresh() ) } );
+			refreshers.push( () => b.classList.toggle( 'on', String( read() ) === String( o ) ) );
+			box.append( b );
+
+		}
+
+		ui.append( box );
+
+	};
+
+	const slider = ( text, min, max, step, read, write ) => {
+
+		const input = el( 'input', { type: 'range', min, max, step } );
+		const out = el( 'span' );
+		input.oninput = () => ( write( + input.value ), refresh() );
+		refreshers.push( () => {
+
+			const v = read();
+			if ( document.activeElement !== input ) input.value = v;
+			out.textContent = v === undefined || v === null ? '–' : ( + v ).toFixed( 2 );
+
+		} );
+		ui.append( el( 'div', { className: 'sl' }, el( 'span', {}, text ), input, out ) );
+
+	};
+
+	ui.append( el( 'h2', {}, 'Dataset' ) );
+	{
+
+		const sel = el( 'select' );
+		for ( const d of manifest.datasets ) sel.append( el( 'option', { value: d.id, textContent: `${d.id}  (${d.nodes})` } ) );
+		sel.onchange = () => load( sel.value, { settleMs: 0 } ).then( refresh );
+		refreshers.push( () => ( sel.value = dsId ) );
+		ui.append( sel );
+
+	}
+
+	seg( 'Tier', [ 'auto', ...TIER_ORDER ], () => gfx.setting, ( v ) => gfx.setQuality( v ) );
+	seg( 'Layout', LAYOUT_MODES.map( ( m ) => m.id ), () => layout.layoutMode, ( v ) => layout.setLayoutMode( v ) );
+	seg( 'Camera', [ 'far', 'overview', 'mid', 'close', 'node' ], () => viewName, ( v ) => view( v ) );
+
+	ui.append( el( 'h2', {}, 'Community field' ) );
+	seg( null, [ 'on', 'off' ], () => ( field.visible ? 'on' : 'off' ), ( v ) => ( field.visible = v === 'on' ) );
+	seg( null, [ 'adaptive', 'always' ], () => ( field.adaptive ? 'adaptive' : 'always' ), ( v ) => ( field.adaptive = v === 'adaptive' ) );
+	slider( 'strength', 0, 1, 0.01, () => field.strength, ( v ) => ( field.strength = v ) );
+	slider( 'radius', 0.5, 4, 0.05, () => field.radius, ( v ) => ( field.radius = v ) );
+	slider( 'core (bloom)', 0, 2, 0.01, () => field.core, ( v ) => ( field.core = v ) );
+	slider( 'absorb', 0, 1, 0.01, () => field.absorb, ( v ) => ( field.absorb = v ) );
+	slider( 'saturation', 0, 1.5, 0.01, () => field.saturation, ( v ) => ( field.saturation = v ) );
+	slider( 'overdraw', 0.5, 12, 0.5, () => field.maxOverdraw ?? field.stats.budget, ( v ) => ( field.maxOverdraw = v ) );
+	{
+
+		const box = el( 'div', { className: 'seg' } );
+		ui.append( box );
+		let built = null;
+		refreshers.push( () => {
+
+			if ( built === graph ) return box.querySelectorAll( 'button' ).forEach( ( b ) => b.classList.toggle( 'on', String( field.level ) === b.dataset.v ) );
+			built = graph;
+			box.replaceChildren();
+			for ( const v of [ 'auto', ...Array.from( { length: graph ? graph.D : 0 }, ( _, l ) => l + 1 ) ] ) {
+
+				const b = el( 'button', { textContent: v === 'auto' ? 'level auto' : String( v ), onclick: () => ( ( field.level = v ), ( labels.clusterLevel = v ), refresh() ) } );
+				b.dataset.v = String( v );
+				b.classList.toggle( 'on', String( field.level ) === String( v ) );
+				box.append( b );
+
+			}
+
+		} );
+
+	}
+
+	ui.append( el( 'h2', {}, 'Labels' ) );
+	seg( null, [ 'auto', 'all', 'off' ], () => labels.mode, ( v ) => ( labels.mode = v ) );
+	seg( 'Community labels', [ 'auto', 'on', 'off' ], () => labels.clusterLabels ?? 'off', ( v ) => ( labels.clusterLabels = v ) );
+
+	ui.append( el( 'h2', {}, 'Environment' ) );
+	seg( null, Object.keys( ENV_PRESETS ), () => env.preset, ( v ) => env.setPreset( v ) );
+	slider( 'dust', 0, 1, 0.01, () => env.dust, ( v ) => ( env.dust = v ) );
+	slider( 'fog', 0, 1, 0.01, () => env.fog, ( v ) => ( env.fog = v ) );
+	slider( 'bloom', 0, 2, 0.01, () => gfx.get( 'bloom' ), ( v ) => gfx.set( 'bloom', v ) );
+
+	ui.append( el( 'h2', {}, 'Nodes' ) );
+	slider( 'size', 0.3, 3, 0.01, () => nodes.size, ( v ) => ( nodes.size = v ) );
+	for ( const key of [ 'emissive', 'rim', 'roughness', 'point', 'pointGlow' ] ) if ( key in nodes.look ) slider( key, 0, key === 'emissive' ? 5 : 2, 0.01, () => nodes.look[ key ], ( v ) => nodes.setLook( { [ key ]: v } ) );
+
+	const stats = el( 'div', { id: 'stats' } );
+	ui.append( stats );
+	app.events.addEventListener( 'gfx', refresh );
+
+	// ── scripted checks ─────────────────────────────────────────────────────────────────────
+	const memory = () => {
+
+		const m = app.renderer.info.memory;
+		return { textures: m.textures, textureMB: + ( m.texturesSize / 1e6 ).toFixed( 3 ), renderTargets: m.renderTargets, programs: m.programs, geometries: m.geometries, attributes: m.attributes, storageAttributes: m.storageAttributes, uniformBuffers: m.uniformBuffers, totalMB: + ( m.total / 1e6 ).toFixed( 3 ) };
+
+	};
+
+	/** Meshes, distinct materials and geometries reachable from the scenes (what the modules hold alive). */
+	const census = () => {
+
+		const materials = new Set(), geometries = new Set();
+		let meshes = 0;
+		for ( const scene of [ app.scene, gfx.overlayScene ] ) scene.traverse( ( o ) => {
+
+			if ( ! o.isMesh ) return;
+			meshes ++;
+			materials.add( o.material );
+			geometries.add( o.geometry );
+
+		} );
+		return { meshes, sceneMaterials: materials.size, sceneGeometries: geometries.size }; // not `geometries`: memory() has that key
+
+	};
+
+	const shaderInfo = ( filter = /field|Field|mote|Mote|label|Label|nodePos/ ) => {
+
+		const count = ( code, re ) => ( code.match( re ) || [] ).length;
+		const out = {};
+		for ( const m of shaderModules ) {
+
+			if ( ! filter.test( m.code ) && ! filter.test( m.label || '' ) ) continue;
+			const storage = [ ...m.code.matchAll( /var<storage[^>]*>\s+(\w+)/g ) ].map( ( x ) => x[ 1 ] );
+			const stage = /@vertex/.test( m.code ) ? 'vertex' : /@fragment/.test( m.code ) ? 'fragment' : /@compute/.test( m.code ) ? 'compute' : '?';
+			const key = `${m.label || '?'} [${stage}] ${storage.join( ',' )}`;
+			out[ key ] = { stage, storage: storage.length, textureSamples: count( m.code, /textureSample\w*\(|textureLoad\(/g ), bytes: m.code.length };
+
+		}
+
+		return out;
+
+	};
+
+	async function leakCheck( { tiers = 10, graphs = 5, ids = [ 'imsv/lesmis', 'generated/hsbm-500', 'imsv/karate', 'generated/caveman-24', 'imsv/football' ], framesEach = 3 } = {} ) {
+
+		const rows = [];
+		const row = ( what ) => rows.push( { what, tier: gfx.tier, ...memory(), ...census() } );
+		const start = gfx.setting, startDs = dsId;
+		row( 'start' );
+		const order = [ 'low', 'medium', 'high', 'ultra' ];
+		// one warm-up round: every tier compiles its variants once
+		for ( const t of order ) {
+
+			gfx.setQuality( t );
+			await frames( framesEach );
+
+		}
+
+		row( 'warm' );
+		for ( let k = 0; k < tiers; k ++ ) {
+
+			gfx.setQuality( order[ k % order.length ] );
+			await frames( framesEach );
+			row( 'tier ' + ( k + 1 ) );
+
+		}
+
+		gfx.setQuality( start );
+		await frames( framesEach );
+		row( 'tiers done' );
+		for ( let k = 0; k < graphs; k ++ ) {
+
+			await load( ids[ k % ids.length ], { settleMs: 0 } );
+			await frames( framesEach );
+			await sleep( 50 ); // old GraphBuffers are disposed in a timeout
+			row( 'graph ' + ids[ k % ids.length ] );
+
+		}
+
+		await load( startDs, { settleMs: 0 } );
+		await frames( framesEach );
+		await sleep( 50 );
+		row( 'end' );
+		return rows;
+
+	}
+
+	const allStats = () => ( {
+		tier: gfx.tier, gfx: { ...gfxState }, pxScale: gfxUniforms.pxScale.value,
+		graph: graph ? { id: dsId, N: graph.N, E: graph.E, D: graph.D, levels: graph.stats.clustersPerLevel } : null,
+		field: field.stats, fieldLevel: field.height, fieldClusters: field.clusters ? field.clusters.length : 0,
+		labels: { ...labels.stats }, nodes: nodes.variant, env: { preset: env.preset, dust: env.dust, ...( env.stats || {} ) },
+		layout: { settled: layout.settled, mode: layout.layoutMode }, fps: app.fps, memory: memory(), census: census(),
+	} );
+
+	window.__atmo = { frames, view, select, community, stats: allStats, memory, census, leakCheck, shaderInfo, load, shaderModules };
+
+	setInterval( () => {
+
+		refresh();
+		if ( ! graph ) return;
+		const f = field.stats, l = labels.stats, c = gfx.config;
+		stats.textContent = [
+			`${graph.name || dsId}  N=${graph.N} E=${graph.E}  levels ${graph.stats.clustersPerLevel.join( '/' )}`,
+			`tier ${c.tier}  aa ${c.aa}  ${app.fps.toFixed( 1 )} fps`,
+			`field  level ${f.height}  ${f.quads}/${f.count} quads  overdraw ${f.overdraw.toFixed( 2 )}× of ${f.budget}`,
+			`       ${( f.coveredPixels / 1e6 ).toFixed( 2 )} MP blended${f.culled ? ', ' + f.culled + ' left out' : ''}${f.shrink < 0.995 ? ', radius ×' + f.shrink.toFixed( 2 ) : ''}`,
+			`       typical volume ${( 100 * f.typical ).toFixed( 0 )} % of the view → overview ${f.overview.toFixed( 2 )}, graph ×${f.graph.toFixed( 2 )}`,
+			`labels ${l.labels} nodes${l.zoomBudget ? ' (zoom budget ' + l.zoomBudget + ')' : ''}${l.clusters !== undefined ? ', ' + l.clusters + ' communities' : ''}  ${l.glyphs} glyphs`,
+			`motes  ${env.stats && env.stats.motes !== undefined ? env.stats.motes : '–'}`,
+		].join( '\n' );
+
+	}, 500 );
+
+	// ── setup from the URL ──────────────────────────────────────────────────────────────────
+	await load( P( 'ds', 'imsv/lesmis' ) );
+	if ( params.has( 'lens' ) ) await lens.setColor( P( 'lens' ) );
+	if ( params.has( 'sel' ) ) select( P( 'sel' ) );
+	if ( params.has( 'focus' ) ) field.focus( num( 'focus' ) );
+	if ( P( 'pause', '1' ) !== '0' ) layout.pause();
+	view( P( 'view', 'overview' ) );
+	field.snap?.();
+	const spin = num( 'spin', 0 );
+	if ( spin ) app.events.addEventListener( 'frame', () => {
+
+		const t = ( rig.controls || app.controls ).target;
+		app.camera.position.sub( t ).applyAxisAngle( new THREE.Vector3( 0, 1, 0 ), spin * Math.PI / 180 ).add( t );
+		app.camera.lookAt( t );
+
+	} );
+	refresh();
+	await frames( num( 'frames', 4 ) );
+	window.__ready = true;
+
+} catch ( e ) {
+
+	console.error( e );
+	document.getElementById( 'err' ).textContent = String( e && e.stack || e );
+	window.__error = String( e && e.message || e );
+
+}
+</script>
+</body>
+</html>

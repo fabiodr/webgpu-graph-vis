@@ -26,6 +26,18 @@
 //   picking.result                          { index, distance, depth, x, y, radius } of the last pick
 //   picking.project( positions, camera, width, height, i, out ) -> out {x, y, depth, radius} | null
 //       screen position of node i (null when behind the camera); used by tests and overlays.
+//   resolveClick( last | null, { x, y, index }, now, { doubleMs = 320, tolerance = 8 } ) -> { index, double }
+//       which node a click means, given the click before it ( { t, x, y, index } ). A second click
+//       close to the first in time and place is a double click on what the FIRST one hit: by then
+//       the view may have moved under the pointer (the node card opens, the camera makes room for
+//       it), so what lies under the pointer now is not what the person aimed at.
+
+export function resolveClick( last, click, now, { doubleMs = 320, tolerance = 8 } = {} ) {
+
+	const double = !! last && now - last.t < doubleMs && Math.hypot( click.x - last.x, click.y - last.y ) < tolerance;
+	return { index: double ? last.index : click.index, double };
+
+}
 
 export class Picking {
 

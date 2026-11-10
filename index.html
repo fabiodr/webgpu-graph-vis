@@ -15,6 +15,9 @@ html, body { margin: 0; height: 100%; background: #04060c; overflow: hidden; ove
 #boot .msg { max-width: 34rem; padding: 1.5rem; text-align: center; color: #9fb0c8; }
 #boot .msg h1 { font-size: 1.1rem; font-weight: 600; color: #e6eef8; margin: 0 0 .5rem; }
 #boot .msg a { color: #6ee7f0; }
+#boot.blocking { z-index: 200; pointer-events: auto; background: rgb(4 6 12 / 0.84); }
+#boot .msg button { margin-top: 1rem; padding: .55rem 1.4rem; border: 1px solid #6ee7f066; border-radius: 10px; background: #6ee7f01f; color: #e6eef8; font: inherit; font-weight: 600; cursor: pointer; }
+#boot .msg button:hover, #boot .msg button:focus-visible { background: #6ee7f033; outline: 0; border-color: #6ee7f0; }
 #boot .spinner { width: 28px; height: 28px; border-radius: 50%; border: 2px solid #ffffff20; border-top-color: #6ee7f0; animation: spin 1s linear infinite; margin: 0 auto .75rem; }
 @keyframes spin { to { transform: rotate(360deg); } }
 </style>

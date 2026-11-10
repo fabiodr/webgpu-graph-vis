@@ -4,35 +4,88 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>dev: edges</title>
-<style>html,body{margin:0;height:100%;background:#000;color:#ccc;font:12px system-ui}#app{position:fixed;inset:0}#hud{position:fixed;left:8px;top:8px;white-space:pre;pointer-events:none}</style>
+<style>html,body{margin:0;height:100%;background:#000;color:#ccc;font:12px system-ui}#app{position:fixed;inset:0}#hud{position:fixed;left:8px;top:8px;white-space:pre;pointer-events:none;text-shadow:0 0 3px #000}</style>
 </head>
 <body>
 <div id="app"></div><div id="hud"></div>
 <script type="module">
-// Dev page for src/render/EdgeRenderer.js. Static positions (no force layout).
-//   ?ds=imsv/lesmis           dataset (served at /data/<ds>.json)
+// Dev page for the edge renderer (src/render/EdgeRenderer.js, src/gpu/EdgeCurves.js).
+// Default: static positions (graph.initPos), debug node sprites, the app's plain scene pass.
+//
+// data
+//   ?ds=imsv/lesmis           dataset id of public/data/manifest.json (files and generated presets,
+//                             e.g. generated/hsbm-5k, generated/lfr-20k-dense = 384k edges)
 //   ?synth=20000&deg=20&br=10,10   synthetic clustered graph instead of a dataset
-//   ?mode=sphere              paper sphere layout (nodePos = sphereDir * sphereRadius, layoutBlend = 1)
-//   ?blend=0.5                sphere mode with a partial layoutBlend (positions mixed too)
-//   ?cam=inside               camera at the sphere center (immersive view)
-//   ?beta=0.85 ?seg=N ?width=1 ?opacity=1 ?minpx=0.75 ?additive ?source ?noedges ?nonodes
-//   ?hl=<node>                highlight node + neighbors (nodeState written directly), focus = 1
-//   ?hover=<node>             hover state for a node
-//   ?zoom=1 ?az=0             camera distance multiplier, azimuth (degrees)
-//   ?flat                     drop the hierarchy (D = 0)
 //   ?tiny=empty|pair|tri      tiny graphs: E = 0, single edge, coincident nodes (zero-length edge)
-//   ?swap                     setGraph(karate) then setGraph(graph) again (dispose/rebuild path)
-// window.__verify() runs the GPU curve (edgeCurveNode in a compute kernel) and compares it to
-// the CPU mirror (evalEdgeCurveCPU): endpoints, max deviation, beta = 1 centroid proximity.
+//   ?flat                     drop the hierarchy (D = 0)
+//   ?swap                     setGraph( karate ) then setGraph( graph ) again (dispose / rebuild path)
+// scene
+//   ?nodes=debug|real|mesh|off   debug sprites (default), NodeRenderer, lit instanced spheres (static), none
+//   ?layout=1                 live ForceLayout (default: static positions; the page then stamps moveFrame)
+//   ?post=1 ?bg=1             the 'high' chain of the render graph (bloom, tone mapping) and the Environment as in the app
+//   ?mode=sphere ?blend=0.5 ?cam=inside   paper sphere layout (static: nodePos = sphereDir · R), partial blend
+//   ?env=1                    the Environment module: key light with shadows + procedural environment (lit tubes)
+//   ?floor=1                  with env=1: a matte floor that receives shadows
+//   ?zoom=1 ?az=0 ?el=0       camera distance multiplier, azimuth / elevation in degrees
+//   ?look=<node>|max ?dist=0.5   aim at a node from dist · R (close-ups)
+//   ?spin=0.5                 orbit by this many degrees per frame (motion vectors)
+// pipeline variants (set gfxState and dispatch 'gfx', as the pipeline package will)
+//   ?samples=1|4              scene-pass MSAA samples (default 4)
+//   ?velocity=1               single-sample pass with an MRT { output, velocity } attachment
+//   ?view=velocity            show the velocity attachment (×gain, ?vgain=40) instead of the image
+//   ?lit=0                    gfxState.lit = false
+// edges
+//   ?beta=0.85 ?seg=N ?width=1 ?opacity=1 ?minpx=0.75 ?additive ?source ?noedges
+//   ?style=solid ?tubes=0 ?flow=selection|all ?flowspeed= ?flowspacing= ?strandvel=skip|true
+//   ?hl=<node>|max            select a node (nodeState written directly, focus = 1)
+//   ?hlv=0.5                  … with the eased state frozen at this value (stages of the hand-over)
+//   ?tubeverts=2e6            edges.tubeVertexLimit (1 = tubes as coarse as the strands, for A/B)
+//   ?defocuslimit=10          edges.defocusLimit in CSS px (default: auto from E)
+//   ?hover=<node>             hover state for a node
+//   ?path=1                   highlight a shortest path between two far nodes ('path' event)
+//   ?metric=1                 per-edge metric (edge length rank) through setEdgeMetric
+//   ?look.<key>=<v>           any LOOK_DEFAULTS key, e.g. look.sheen=0.5
+//   ?fog=1.2 ?fogstart=0.5    fog density in 1 / layout radii, start in camera distances
+//   ?dof=1 ?focus=1 ?range=0.25 ?maxblur=10   strand defocus: focus plane and range in camera distances
+//   ?epb=1 ?epbmethod=spanner|epb ?epbexact=1 ?epbhops=8 ?epbmix=free|straight ?epbload=1
+//                             edge-path bundling of the current positions through setPaths (main thread);
+//                             epbmix: hierarchical paths for the edges it left free; epbload: carrying
+//                             edges wider / denser by their load (setEdgeMetric)
+//   ?settle=1 ?ticks=40       with ?layout=1: finish the force layout quickly (ticks per frame), then
+//                             bundle its positions; window.__settled is set when done
+//   ?frames=N                 stop the render loop after N frames and set window.__frozen once the GPU
+//                             has finished them (screenshots of huge graphs on a software rasteriser)
+// window.__select( node )     select a node through the state targets only (the state kernel of the
+//                             live layout eases it: ?layout=1); −1 clears. window.__layout = the layout
+// window.__shadowRenders()    shadow map renders so far (with ?env=1)
+// window.__verify()           reads the curve cache back and compares it with the CPU mirror
+// window.__counters()         curve kernel runs / skips, frame number
+// window.__bindings()         storage buffers per shader stage of the strand / tube draws and the kernel
+// window.__checkVelocity()    velocity attachment against the CPU (with ?velocity=1)
+// window.__info()             stats
 import * as THREE from 'three/webgpu';
-import { Fn, instanceIndex, instancedArray, float, uint, vec4, uniform } from 'three/tsl';
+import { pass, mrt, output, velocity, vec4 } from 'three/tsl';
 import { createApp } from '../src/app/App.js';
-import { loadPrepared, fetchGraph } from '../src/data/load.js';
+import { loadPrepared, fetchGraph, fetchManifest } from '../src/data/load.js';
+import { DataClient } from '../src/data/client.js';
 import { normalizeGraph } from '../src/data/format.js';
 import { prepareGraph } from '../src/graph/prepare.js';
 import { DebugNodes } from '../src/debug/DebugNodes.js';
 import { synthGraph } from '../src/debug/synth.js';
-import { EdgeRenderer, edgeCurveNode, evalEdgeCurveCPU } from '../src/render/EdgeRenderer.js';
+import { EdgeRenderer, evalEdgeCurveCPU, LOOK_DEFAULTS } from '../src/render/EdgeRenderer.js';
+import { gfxUniforms, gfxState } from '../src/render/gfx/shared.js';
+import { edgePathBundling, mixedPaths, hierarchicalPaths, pathStats } from '../src/graph/bundling.js';
+import { shortestPath } from '../src/graph/analytics.js';
+
+// every shader module the device is given, for window.__bindings()
+const shaderModules = [];
+const createShaderModule = GPUDevice.prototype.createShaderModule;
+GPUDevice.prototype.createShaderModule = function ( descriptor ) {
+
+	shaderModules.push( { label: descriptor.label || '', code: descriptor.code } );
+	return createShaderModule.call( this, descriptor );
+
+};
 
 try {
 
@@ -40,11 +93,49 @@ try {
 	const num = ( k, d ) => ( params.has( k ) ? Number( params.get( k ) ) : d );
 	const app = await createApp( document.getElementById( 'app' ) );
 	window.__app = app;
-	if ( ! params.has( 'nonodes' ) ) app.use( new DebugNodes( { size: num( 'nodesize', 4 ) } ) );
+
+	// ── pipeline variant ──
+	const samples = num( 'samples', 4 );
+	const useVelocity = num( 'velocity', 0 ) === 1;
+	gfxState.samples = useVelocity ? 1 : samples;
+	gfxState.velocity = useVelocity;
+	gfxState.lit = num( 'lit', 1 ) !== 0;
+	let sceneMRT = null;
+	if ( useVelocity || samples !== 4 ) {
+
+		app.scenePass.options.samples = useVelocity || samples <= 1 ? 0 : samples;
+		if ( useVelocity ) {
+
+			sceneMRT = mrt( { output, velocity: vec4( velocity, 0, 1 ) } );
+			sceneMRT.setBlendMode( 'velocity', new THREE.BlendMode( THREE.NormalBlending ) );
+			sceneMRT.setClearColor?.( 'velocity', 0x000000, 0 );
+			app.scenePass.setMRT( sceneMRT );
+			app.scenePass.getTexture( 'velocity' ); // creates the attachment even when nothing samples it
+			if ( params.get( 'view' ) === 'velocity' ) app.pipeline.outputNode = vec4( app.scenePass.getTextureNode( 'velocity' ).rg.mul( num( 'vgain', 40 ) ).add( 0.5 ), 0.5, 1 );
+
+		}
+
+		app.pipeline.needsUpdate = true;
+
+	}
+
+	// ── modules ──
+	const nodesMode = params.get( 'nodes' ) || 'debug';
+	let layout = null;
+	if ( num( 'layout', 0 ) === 1 ) {
+
+		const { ForceLayout } = await import( '../src/gpu/ForceLayout.js' );
+		layout = app.use( new ForceLayout() );
+		window.__layout = layout;
+
+	}
+
+	if ( nodesMode === 'debug' ) app.use( new DebugNodes( { size: num( 'nodesize', 4 ) } ) );
 	let edges = null;
+	const old = false; // the first renderer is gone; kept as a constant so the checks below read the same
 	if ( ! params.has( 'noedges' ) ) {
 
-		edges = app.use( new EdgeRenderer( {
+		const options = {
 			beta: num( 'beta', 0.85 ),
 			segments: params.has( 'seg' ) ? num( 'seg' ) : null,
 			width: num( 'width', 1 ),
@@ -52,11 +143,52 @@ try {
 			minPixelWidth: num( 'minpx', 0.75 ),
 			blendMode: params.has( 'additive' ) ? 'additive' : 'normal',
 			colorMode: params.has( 'source' ) ? 'source' : 'gradient',
-		} ) );
+		};
+		{
+
+			const look = {};
+			for ( const key of Object.keys( LOOK_DEFAULTS ) ) if ( params.has( 'look.' + key ) ) look[ key ] = num( 'look.' + key );
+			edges = app.use( new EdgeRenderer( {
+				...options, look,
+				style: params.get( 'style' ) || 'luminous',
+				tubes: num( 'tubes', 1 ) !== 0,
+				flow: params.get( 'flow' ) || 'off',
+				flowSpeed: num( 'flowspeed', 0.3 ),
+				flowSpacing: num( 'flowspacing', 0.5 ),
+				strandVelocity: params.get( 'strandvel' ) || 'camera',
+				...( params.has( 'tubeverts' ) ? { tubeVertexLimit: num( 'tubeverts' ) } : {} ),
+				...( params.has( 'defocuslimit' ) ? { defocusLimit: num( 'defocuslimit' ) } : {} ),
+			} ) );
+
+		}
+
 		window.__edges = edges;
 
 	}
 
+	if ( nodesMode === 'real' ) {
+
+		const { NodeRenderer } = await import( '../src/render/NodeRenderer.js' );
+		app.use( new NodeRenderer() );
+
+	}
+
+	if ( num( 'bg', 0 ) === 1 ) {
+
+		const { Environment } = await import( '../src/render/gfx/Environment.js' );
+		app.use( new Environment() );
+
+	}
+
+	if ( num( 'post', 0 ) === 1 && ! useVelocity ) {
+
+		// the render graph owns the post chain: bloom strength and tier
+		app.gfx.set( 'bloom', num( 'bloom', 0.8 ) );
+		if ( app.gfx.setting !== 'high' ) app.gfx.setQuality( 'high' );
+
+	}
+
+	// ── data ──
 	let graph;
 	const t0 = performance.now();
 	const tinyGraphs = {
@@ -78,9 +210,23 @@ try {
 
 	} else {
 
-		const g = await fetchGraph( `/data/${params.get( 'ds' ) || 'imsv/lesmis'}.json` );
-		if ( params.has( 'flat' ) ) g.hierarchy = null; // D = 0: no bundling possible, straight B-splines
-		graph = prepareGraph( g );
+		const id = params.get( 'ds' ) || 'imsv/lesmis';
+		const manifest = await fetchManifest( '/data/manifest.json' );
+		const entry = manifest.datasets.find( ( d ) => d.id === id );
+		if ( entry && entry.generate ) {
+
+			const client = new DataClient( { baseUrl: new URL( '/', location.href ).href } );
+			const r = await client.load( entry );
+			graph = r.graph;
+			client.dispose();
+
+		} else {
+
+			const g = await fetchGraph( `/data/${id}.json` );
+			if ( params.has( 'flat' ) ) g.hierarchy = null; // D = 0: no bundling possible, straight B-splines
+			graph = prepareGraph( g );
+
+		}
 
 	}
 
@@ -88,40 +234,44 @@ try {
 	let buffers = app.setGraph( graph );
 	if ( params.has( 'swap' ) ) {
 
-		// graph replacement: load another dataset, then come back (exercises dispose/rebuild)
+		// graph replacement: load another dataset, then come back (exercises dispose / rebuild)
 		app.setGraph( await loadPrepared( '/data/imsv/karate.json' ) );
 		await new Promise( ( r ) => setTimeout( r, 300 ) );
 		buffers = app.setGraph( graph );
 
 	}
 
-	if ( params.get( 'tiny' ) === 'tri' ) {
+	// static positions: nothing maintains buffers.moveFrame, so the page stamps it after every write
+	const setPositions = ( p ) => {
 
-		const p = new Float32Array( [ - 60, 0, 0, 0, 60, 0, 0, 0, 60, 0, 0, 0, 0, 70, 0, 0 ] );
 		buffers.setPositions( p );
 		app.positions = p;
+		if ( ! layout ) buffers.moveFrame = app.frame;
 
-	}
+	};
+
 	const R = graph.layoutRadius;
 	const mode = params.get( 'mode' ) || 'force';
-	if ( mode === 'sphere' ) {
+	if ( params.get( 'tiny' ) === 'tri' ) setPositions( new Float32Array( [ - 60, 0, 0, 0, 60, 0, 0, 0, 60, 0, 0, 0, 0, 70, 0, 0 ] ) );
+	else if ( mode === 'sphere' ) {
 
-		const b = num( 'blend', 1 );
-		const p = new Float32Array( 4 * graph.N );
-		for ( let i = 0; i < graph.N; i ++ ) {
+		if ( layout ) layout.setLayoutMode( 'sphere' );
+		else {
 
-			for ( let q = 0; q < 3; q ++ ) p[ 4 * i + q ] = graph.initPos[ 4 * i + q ] * ( 1 - b ) + graph.sphereDir[ 4 * i + q ] * R * b;
+			const b = num( 'blend', 1 );
+			const p = new Float32Array( 4 * graph.N );
+			for ( let i = 0; i < graph.N; i ++ ) for ( let q = 0; q < 3; q ++ ) p[ 4 * i + q ] = graph.initPos[ 4 * i + q ] * ( 1 - b ) + graph.sphereDir[ 4 * i + q ] * R * b;
+			setPositions( p );
+			buffers.uniforms.layoutBlend.value = b;
 
 		}
 
-		buffers.setPositions( p );
-		app.positions = p;
-		buffers.uniforms.layoutBlend.value = b;
+	} else if ( ! layout ) buffers.moveFrame = app.frame;
 
-	}
+	const positions = () => buffers.nodePos.value.array; // CPU copy (static mode)
 
-	// highlight / hover: write eased state and its target directly
-	window.__highlight = ( node, hover = - 1 ) => {
+	// ── highlight / hover: write the eased state and its target directly ──
+	window.__highlight = ( node, hover = - 1, amount = 1 ) => {
 
 		const st = new Float32Array( 4 * graph.N );
 		if ( node >= 0 ) {
@@ -138,12 +288,38 @@ try {
 		}
 
 		if ( hover >= 0 ) st[ 4 * hover + 3 ] = 1;
+		buffers.setStateTargets( st );
+		// ?hlv: the eased state frozen part of the way (a stage of the strand → tube hand-over)
+		if ( amount < 1 ) for ( let i = 0; i < st.length; i ++ ) st[ i ] *= amount;
 		buffers.nodeState.value.array.set( st );
 		buffers.nodeState.value.needsUpdate = true;
+		buffers.uniforms.focus.value = node >= 0 ? amount : 0;
+		buffers.uniforms.selectedIndex.value = node;
+		buffers.uniforms.hoverIndex.value = hover;
+		return { node, degree: node >= 0 ? graph.degree[ node ] : 0 };
+
+	};
+
+	// an eased selection, as the Interaction module makes it: only the targets are written
+	window.__select = ( node ) => {
+
+		const st = new Float32Array( 4 * graph.N );
+		if ( node >= 0 ) {
+
+			for ( let i = 0; i < graph.N; i ++ ) st[ 4 * i + 2 ] = 1;
+			st[ 4 * node ] = 1; st[ 4 * node + 2 ] = 0;
+			for ( let k = graph.adjStart[ node ]; k < graph.adjStart[ node ] + graph.degree[ node ]; k ++ ) {
+
+				const j = graph.adjList[ k ];
+				st[ 4 * j + 1 ] = 1; st[ 4 * j + 2 ] = 0;
+
+			}
+
+		}
+
 		buffers.setStateTargets( st );
 		buffers.uniforms.focus.value = node >= 0 ? 1 : 0;
 		buffers.uniforms.selectedIndex.value = node;
-		buffers.uniforms.hoverIndex.value = hover;
 		return { node, degree: node >= 0 ? graph.degree[ node ] : 0 };
 
 	};
@@ -151,9 +327,116 @@ try {
 	// ?hl=max picks the highest-degree node, ?hl=<k> node k
 	const maxDegNode = graph.degree.indexOf( graph.maxDegree );
 	const pick = ( k ) => ( params.get( k ) === 'max' ? maxDegNode : num( k, - 1 ) );
-	if ( params.has( 'hl' ) || params.has( 'hover' ) ) window.__highlight( pick( 'hl' ), pick( 'hover' ) );
+	if ( params.has( 'hl' ) || params.has( 'hover' ) ) window.__highlight( pick( 'hl' ), pick( 'hover' ), num( 'hlv', 1 ) );
 
-	// camera
+	// ?path=1: a shortest path between the two nodes that are farthest apart along x
+	window.__path = () => {
+
+		const p = positions();
+		let a = 0, b = 0;
+		for ( let i = 0; i < graph.N; i ++ ) {
+
+			if ( graph.degree[ i ] === 0 ) continue;
+			if ( p[ 4 * i ] < p[ 4 * a ] || graph.degree[ a ] === 0 ) a = i;
+			if ( p[ 4 * i ] > p[ 4 * b ] || graph.degree[ b ] === 0 ) b = i;
+
+		}
+
+		const r = shortestPath( graph, a, b );
+		if ( ! r || r.edges.length === 0 ) return null;
+		const nodes = r.nodes, ids = Array.from( r.edges );
+		const detail = { nodes: Uint32Array.from( nodes ), edges: Uint32Array.from( ids ) };
+		app.events.dispatchEvent( new CustomEvent( 'path', { detail } ) );
+		return { from: a, to: b, hops: ids.length, edges: ids };
+
+	};
+
+	if ( num( 'path', 0 ) === 1 && edges && ! old ) window.__pathInfo = window.__path();
+
+	// ?metric=1: edge length rank as a per-edge metric
+	if ( num( 'metric', 0 ) === 1 && edges && ! old ) {
+
+		const p = positions();
+		const len = new Float32Array( graph.E );
+		for ( let e = 0; e < graph.E; e ++ ) {
+
+			const s = graph.edges[ 2 * e ], t = graph.edges[ 2 * e + 1 ];
+			len[ e ] = Math.hypot( p[ 4 * s ] - p[ 4 * t ], p[ 4 * s + 1 ] - p[ 4 * t + 1 ], p[ 4 * s + 2 ] - p[ 4 * t + 2 ] );
+
+		}
+
+		const order = Array.from( len.keys() ).sort( ( x, y ) => len[ x ] - len[ y ] );
+		const rank = new Float32Array( graph.E );
+		order.forEach( ( e, i ) => ( rank[ e ] = i / Math.max( 1, graph.E - 1 ) ) );
+		edges.setEdgeMetric( rank );
+
+	}
+
+	// ?epb=1: edge-path bundling of the current positions (SHOULD item; main thread)
+	window.__bundle = ( o = {} ) => {
+
+		const t = performance.now();
+		const result = edgePathBundling( graph, positions(), { method: o.method || 'spanner', exact: !! o.exact, maxInterior: o.hops ?? 8 } );
+		let paths = result;
+		if ( o.mix ) paths = mixedPaths( graph, result, hierarchicalPaths( graph ), { only: o.mix } );
+		edges.setPaths( paths );
+		if ( o.load ) {
+
+			// carrying edges: wider and denser by the number of bundled edges routed over them
+			// (per-edge attribute: metric = sqrt of the load)
+			const m = new Float32Array( graph.E );
+			for ( let e = 0; e < graph.E; e ++ ) m[ e ] = Math.sqrt( result.load[ e ] );
+			edges.setEdgeMetric( m, { opacity: [ 1, 1.6 ], width: [ 1, 1 + ( o.load === true ? 2.5 : o.load ) ] } );
+
+		} else edges.setEdgeMetric( null );
+
+		const st = pathStats( graph, paths, positions() );
+		return { ms: performance.now() - t, stats: result.stats, mixed: !! o.mix, pathStats: { bundledRatio: st.bundledRatio, inkRatio: st.inkRatio, meanDistortion: st.meanDistortion, maxInterior: st.maxInterior } };
+
+	};
+
+	const bundleFromParams = () => {
+
+		if ( num( 'epb', 0 ) === 1 && edges && ! old ) window.__epb = window.__bundle( { method: params.get( 'epbmethod' ), exact: num( 'epbexact', 0 ) === 1, hops: num( 'epbhops', 8 ), mix: params.get( 'epbmix' ), load: num( 'epbload', 0 ) } );
+
+	};
+
+	// ?settle=1 (with ?layout=1): run the force layout to its end quickly, copy the positions to
+	// the CPU (window.__verify, bundling), then bundle; window.__settled tells when that is done
+	if ( num( 'settle', 0 ) === 1 && layout ) {
+
+		layout.ticksPerFrame = num( 'ticks', 40 );
+		const onFrame = async () => {
+
+			if ( layout.running ) return;
+			app.events.removeEventListener( 'frame', onFrame );
+			const pos = new Float32Array( await app.renderer.getArrayBufferAsync( buffers.nodePos.value ) );
+			buffers.nodePos.value.array.set( pos );
+			buffers.computeClusterCentroidsCPU( pos );
+			bundleFromParams();
+			window.__settled = true;
+
+		};
+
+		app.events.addEventListener( 'frame', onFrame );
+
+	} else bundleFromParams();
+
+	// ── fog, depth of field ──
+	const camDist = () => app.camera.position.distanceTo( app.controls.target );
+	const applyFx = () => {
+
+		const d = camDist();
+		gfxUniforms.fogDensity.value = num( 'fog', 0 ) / R;
+		gfxUniforms.fogStart.value = num( 'fogstart', 0.5 ) * d;
+		gfxUniforms.dofAmount.value = num( 'dof', 0 );
+		gfxUniforms.dofFocus.value = num( 'focus', 1 ) * d;
+		gfxUniforms.dofRange.value = num( 'range', 0.25 ) * d;
+		gfxUniforms.dofMaxBlur.value = num( 'maxblur', 10 );
+
+	};
+
+	// ── camera ──
 	const zoom = num( 'zoom', 1 );
 	if ( mode === 'sphere' && params.get( 'cam' ) === 'inside' ) {
 
@@ -166,107 +449,276 @@ try {
 	} else {
 
 		const s = mode === 'sphere' ? { radius: R } : app.boundingSphere();
-		const dist = s.radius * ( mode === 'sphere' ? 3.2 : 2.6 ) * zoom;
-		const az = num( 'az', 0 ) * Math.PI / 180;
-		app.camera.position.set( Math.sin( az ) * dist, 0, Math.cos( az ) * dist );
-		app.controls.target.set( 0, 0, 0 );
-		app.camera.lookAt( 0, 0, 0 );
+		let dist = s.radius * ( mode === 'sphere' ? 3.2 : 2.6 ) * zoom;
+		const az = num( 'az', 0 ) * Math.PI / 180, el = num( 'el', 0 ) * Math.PI / 180;
+		const target = new THREE.Vector3();
+		if ( params.has( 'look' ) ) {
+
+			const i = pick( 'look' ), p = positions();
+			target.set( p[ 4 * i ], p[ 4 * i + 1 ], p[ 4 * i + 2 ] );
+			dist = R * num( 'dist', 0.5 );
+
+		}
+
+		app.camera.position.set( target.x + Math.sin( az ) * Math.cos( el ) * dist, target.y + Math.sin( el ) * dist, target.z + Math.cos( az ) * Math.cos( el ) * dist );
+		app.controls.target.copy( target );
+		app.camera.lookAt( target );
 
 	}
 
 	app.controls.update();
+	applyFx();
 
-	// GPU vs CPU curve check
-	window.__verify = async ( { edgesToCheck = 512, samples = 33, beta = edges ? edges.bundling : 0.85 } = {} ) => {
+	// ── lights (?env=1): the Environment module of the app (key light, shadows on demand, IBL) ──
+	if ( num( 'env', 0 ) === 1 ) {
 
-		const E = graph.E;
-		const M = Math.min( E, edgesToCheck ), K = samples;
-		if ( M === 0 ) return { edgesChecked: 0 };
-		const sel = instancedArray( Math.max( 1, M ), 'uint' );
-		for ( let i = 0; i < M; i ++ ) sel.value.array[ i ] = Math.floor( ( i * E ) / M );
-		const out = instancedArray( Math.max( 1, M * K ), 'vec4' );
-		const p = { beta: uniform( beta ), highlightLevel: uniform( 0.75 ), sphereAxis: uniform( new THREE.Vector3( 0, 0, 1 ) ) };
-		const kernel = Fn( () => {
+		const { Environment } = await import( '../src/render/gfx/Environment.js' );
+		const env = app.modules.find( ( m ) => m.isEnvironment ) || app.use( new Environment() );
+		window.__env = env;
+		window.__shadowRenders = () => env.stats.shadowRenders;
+		if ( num( 'floor', 0 ) === 1 ) {
 
-			const i = instanceIndex;
-			const e = sel.element( i.div( uint( K ) ) );
-			const t = float( i.mod( uint( K ) ) ).div( K - 1 );
-			const { position } = edgeCurveNode( buffers, graph, p, buffers.edgeInfo.element( e ), t );
-			out.element( i ).assign( vec4( position, 1 ) );
+			const sphere = mode === 'sphere' ? new THREE.Sphere( new THREE.Vector3(), R * 1.6 ) : app.boundingSphere();
+			const r = sphere.radius * 1.25;
+			const floor = new THREE.Mesh( new THREE.PlaneGeometry( 6 * r, 6 * r ), new THREE.MeshStandardNodeMaterial( { color: 0x1a1d26, roughness: 0.9, metalness: 0 } ) );
+			floor.rotation.x = - Math.PI / 2;
+			floor.position.copy( sphere.center ).y -= sphere.radius * num( 'floory', 0.75 );
+			floor.receiveShadow = true;
+			app.scene.add( floor );
 
-		} )().compute( M * K, [ 64 ] );
-		await app.renderer.computeAsync( kernel );
-		const gpu = new Float32Array( await app.renderer.getArrayBufferAsync( out.value ) );
+		}
+
+	}
+
+	if ( nodesMode === 'mesh' ) {
+
+		// lit, shadow-casting instanced spheres at the static positions (close-ups of the tubes)
+		const p = positions();
+		const geometry = new THREE.SphereGeometry( 1, 24, 16 );
+		const material = new THREE.MeshStandardNodeMaterial( { roughness: 0.3, metalness: 0 } );
+		const mesh = new THREE.InstancedMesh( geometry, material, graph.N );
+		const m = new THREE.Matrix4(), c = new THREE.Color();
+		const base = 0.065 * R / Math.cbrt( graph.N );
+		for ( let i = 0; i < graph.N; i ++ ) {
+
+			const s = base * graph.radii[ i ] * num( 'nodesize', 1 );
+			m.makeScale( s, s, s ).setPosition( p[ 4 * i ], p[ 4 * i + 1 ], p[ 4 * i + 2 ] );
+			mesh.setMatrixAt( i, m );
+			mesh.setColorAt( i, c.setRGB( graph.colors[ 4 * i ], graph.colors[ 4 * i + 1 ], graph.colors[ 4 * i + 2 ] ) );
+
+		}
+
+		mesh.castShadow = mesh.receiveShadow = true;
+		mesh.frustumCulled = false;
+		app.scene.add( mesh );
+
+	}
+
+	app.events.dispatchEvent( new CustomEvent( 'gfx', { detail: gfxState } ) );
+
+	// ?spin: orbit a little every frame (motion vectors, temporal behaviour)
+	const spin = num( 'spin', 0 ) * Math.PI / 180;
+	if ( spin ) app.events.addEventListener( 'frame', () => {
+
+		const o = app.camera.position.clone().sub( app.controls.target ).applyAxisAngle( new THREE.Vector3( 0, 1, 0 ), spin );
+		app.camera.position.copy( app.controls.target ).add( o );
+		app.camera.lookAt( app.controls.target );
+
+	} );
+
+	// ── checks ──
+	/** GPU cache against the CPU mirror: every sample of up to `maxEdges` edges. */
+	window.__verify = async ( { maxEdges = 20000 } = {} ) => {
+
+		if ( ! edges || old ) return null;
+		const curves = edges.curves, E = graph.E;
+		if ( E === 0 ) return { edgesChecked: 0 };
+		await app.renderer.computeAsync( curves.kernel ); // make sure the cache holds the current state
+		const gpu = await curves.readback( app.renderer );
+		const S = curves.segments, stride = S + 1;
 		const nodePos = buffers.nodePos.value.array, clusterPos = buffers.clusterPos.value.array;
-		const opts = { beta, layoutBlend: buffers.uniforms.layoutBlend.value, sphereRadius: buffers.uniforms.sphereRadius.value };
-		let maxErr = 0, maxEndErr = 0, nan = 0, scale = 0;
+		const U = buffers.uniforms;
+		const opts = {
+			paths: curves.paths, beta: curves.uniforms.beta.value, unhook: curves.uniforms.unhook.value, layoutBlend: U.layoutBlend.value, sphereRadius: U.sphereRadius.value,
+			levelOffset: U.levelOffset.value, levelScale: U.levelScale.value, levelExponent: U.levelExponent.value,
+			center: U.graphCenter.value.toArray(), sphereAxis: curves.uniforms.sphereAxis.value.toArray(), highlightLevel: curves.uniforms.highlightLevel.value,
+		};
+		const state = buffers.nodeState.value.array, attr = buffers.edgeAttr.value.array;
+		const M = Math.min( E, maxEdges );
+		let maxErr = 0, sumErr = 0, worst = null, maxEndErr = 0, maxArcErr = 0, nan = 0, scale = 0, maxLen = 0;
 		for ( let m = 0; m < M; m ++ ) {
 
-			const e = sel.value.array[ m ];
-			for ( let k = 0; k < K; k ++ ) {
+			const e = Math.floor( ( m * E ) / M );
+			const s = graph.edges[ 2 * e ], t = graph.edges[ 2 * e + 1 ];
+			const highlight = Math.min( 1, Math.max( state[ 4 * s ], state[ 4 * t ], attr[ 4 * e + 1 ] * curves.uniforms.highlightFade.value ) );
+			let arc = 0, prev = null;
+			for ( let i = 0; i <= S; i ++ ) {
 
-				const t = k / ( K - 1 );
-				const cpu = evalEdgeCurveCPU( graph, e, t, nodePos, clusterPos, opts ).position;
-				const g = gpu.subarray( 4 * ( m * K + k ), 4 * ( m * K + k ) + 3 );
-				if ( ! g.every( Number.isFinite ) ) nan ++;
+				const cpu = evalEdgeCurveCPU( graph, e, i / S, nodePos, clusterPos, { ...opts, highlight } ).position;
+				const o = 4 * ( e * stride + i );
+				const g = gpu.subarray( o, o + 4 );
+				if ( ! ( Number.isFinite( g[ 0 ] ) && Number.isFinite( g[ 1 ] ) && Number.isFinite( g[ 2 ] ) && Number.isFinite( g[ 3 ] ) ) ) nan ++;
 				const err = Math.hypot( g[ 0 ] - cpu[ 0 ], g[ 1 ] - cpu[ 1 ], g[ 2 ] - cpu[ 2 ] );
-				maxErr = Math.max( maxErr, err );
-				scale = Math.max( scale, Math.hypot( ...cpu ) );
-				if ( k === 0 || k === K - 1 ) {
+				sumErr += err;
+				if ( err > maxErr ) {
 
-					const n = k === 0 ? graph.edges[ 2 * e ] : graph.edges[ 2 * e + 1 ];
+					maxErr = err;
+					worst = { edge: e, sample: i, gpu: Array.from( g ), cpu };
+
+				}
+
+				scale = Math.max( scale, Math.hypot( ...cpu ) );
+				if ( prev ) arc += Math.hypot( cpu[ 0 ] - prev[ 0 ], cpu[ 1 ] - prev[ 1 ], cpu[ 2 ] - prev[ 2 ] );
+				prev = cpu;
+				maxArcErr = Math.max( maxArcErr, Math.abs( g[ 3 ] - arc ) );
+				if ( i === 0 || i === S ) {
+
+					const n = i === 0 ? s : t;
 					maxEndErr = Math.max( maxEndErr, Math.hypot( g[ 0 ] - nodePos[ 4 * n ], g[ 1 ] - nodePos[ 4 * n + 1 ], g[ 2 ] - nodePos[ 4 * n + 2 ] ) );
 
 				}
 
 			}
 
+			maxLen = Math.max( maxLen, arc );
+
 		}
 
-		// beta = 1 centroid proximity (CPU, dense sampling): distance from each interior control point
-		// to the curve, relative to that cluster's bounding radius
-		let worstRel = 0, meanRel = 0, cnt = 0;
-		for ( let m = 0; m < M; m ++ ) {
+		return {
+			edgesChecked: M, segments: S, samplesChecked: M * stride, maxGpuCpuErr: maxErr, relErr: maxErr / Math.max( scale, 1e-9 ), coordScale: scale,
+			meanGpuCpuErr: sumErr / ( M * stride ), worst,
+			maxEndpointErr: maxEndErr, maxArcLengthErr: maxArcErr, longestCurve: maxLen, nonFinite: nan,
+			layoutBlend: opts.layoutBlend, beta: opts.beta, pathRefs: curves.stats.pathRefs, maxInterior: curves.stats.maxInterior,
+		};
 
-			const e = sel.value.array[ m ];
-			const ref = evalEdgeCurveCPU( graph, e, 0, nodePos, clusterPos, { ...opts, beta: 1 } );
-			const pts = [];
-			for ( let k = 0; k <= 400; k ++ ) pts.push( evalEdgeCurveCPU( graph, e, k / 400, nodePos, clusterPos, { ...opts, beta: 1 } ).position );
-			for ( let c = 1; c < ref.L - 1; c ++ ) {
+	};
 
-				const cp = ref.controlPoints[ c ];
-				let best = Infinity;
-				for ( const q of pts ) best = Math.min( best, Math.hypot( q[ 0 ] - cp[ 0 ], q[ 1 ] - cp[ 1 ], q[ 2 ] - cp[ 2 ] ) );
-				// cluster radius: find the cluster id again (same rule as the shader)
-				const L = ref.L, s = graph.edges[ 2 * e ], tg = graph.edges[ 2 * e + 1 ];
-				const srcSide = 2 * c <= L - 1, lv = srcSide ? c - 1 : L - 2 - c;
-				const cl = graph.anc[ ( srcSide ? s : tg ) * graph.D + lv ];
-				const rel = best / Math.max( 1e-6, clusterPos[ 4 * cl + 3 ] );
-				worstRel = Math.max( worstRel, rel ); meanRel += rel; cnt ++;
+	window.__counters = () => ( edges && ! old ? { frame: app.frame, moveFrame: buffers.moveFrame, ...edges.curves.stats } : null );
+
+	/** Velocity attachment at curve points against NDC( now ) − NDC( previous ) on the CPU. */
+	// matrices of the last rendered frame and of the one before (App commits them after rendering)
+	const motion = { now: new THREE.Matrix4(), before: new THREE.Matrix4() };
+	app.events.addEventListener( 'frame', () => {
+
+		motion.before.copy( motion.now );
+		motion.now.copy( gfxUniforms.prevViewProj.value );
+
+	} );
+
+	window.__checkVelocity = async ( count = 12 ) => {
+
+		if ( ! useVelocity || ! edges || old ) return null;
+		// freeze the loop: the attachment, the cache and the matrices then belong to the same frame
+		app.renderer.setAnimationLoop( null );
+		try {
+
+			const rt = app.scenePass.renderTarget;
+			const index = rt.textures.findIndex( ( t ) => t.name === 'velocity' );
+			const gpu = await edges.curves.readback( app.renderer );
+			const S = edges.curves.segments, stride = S + 1;
+			const out = [];
+			let maxErr = 0, maxMotion = 0, uncovered = 0, exact = 0;
+			for ( let k = 0; k < count * 8 && out.length < count; k ++ ) {
+
+				const e = Math.floor( ( ( k + 0.5 ) * graph.E ) / ( count * 8 ) );
+				const o = 4 * ( e * stride + Math.floor( S / 2 ) );
+				const p = new THREE.Vector3( gpu[ o ], gpu[ o + 1 ], gpu[ o + 2 ] );
+				const a = p.clone().applyMatrix4( motion.now ), b = p.clone().applyMatrix4( motion.before );
+				const px = Math.floor( ( a.x * 0.5 + 0.5 ) * rt.width ), py = Math.floor( ( 0.5 - a.y * 0.5 ) * rt.height );
+				if ( px < 2 || py < 2 || px > rt.width - 3 || py > rt.height - 3 ) continue;
+				// a strand is about a pixel wide: take the covered pixel of the 3 × 3 block that fits best
+				const data = await app.renderer.readRenderTargetPixelsAsync( rt, px - 1, py - 1, 3, 3, index );
+				const dec = ( v ) => ( data instanceof Uint16Array ? THREE.DataUtils.fromHalfFloat( v ) : v );
+				const want = [ a.x - b.x, a.y - b.y ];
+				let best = null;
+				for ( let q = 0; q < 9; q ++ ) {
+
+					if ( dec( data[ 4 * q + 3 ] ) < 0.5 ) continue;
+					const read = [ dec( data[ 4 * q ] ), dec( data[ 4 * q + 1 ] ) ];
+					const err = Math.hypot( read[ 0 ] - want[ 0 ], read[ 1 ] - want[ 1 ] );
+					if ( ! best || err < best.err ) best = { read, err };
+
+				}
+
+				if ( ! best ) {
+
+					uncovered ++;
+					continue;
+
+				}
+
+				if ( best.err < 2e-5 ) exact ++; // otherwise another strand at a different depth covers the pixel
+				maxErr = Math.max( maxErr, best.err );
+				maxMotion = Math.max( maxMotion, Math.hypot( ...want ) );
+				out.push( { edge: e, err: best.err, expected: want.map( ( v ) => + v.toFixed( 5 ) ), read: best.read.map( ( v ) => + v.toFixed( 5 ) ) } );
 
 			}
 
-		}
+			return { attachment: index, format: rt.textures[ index ]?.type, checked: out.length, exact, uncovered, maxErrNdc: maxErr, maxMotionNdc: maxMotion, worst: out.sort( ( x, y ) => y.err - x.err ).slice( 0, 4 ) };
 
-		out.value.dispose?.(); sel.value.dispose?.();
-		return { edgesChecked: M, samples: K, maxGpuCpuErr: maxErr, coordScale: scale, maxEndpointErr: maxEndErr, nonFinite: nan, beta1CentroidDistOverClusterRadius: { mean: cnt ? meanRel / cnt : 0, worst: worstRel, controlPoints: cnt } };
+		} finally {
+
+			app.renderer.setAnimationLoop( () => app._tick() );
+
+		}
 
 	};
 
 	const hud = document.getElementById( 'hud' );
+	if ( params.has( 'nohud' ) ) hud.style.display = 'none';
 	app.events.addEventListener( 'frame', () => {
 
-		if ( app.frame % 20 === 0 ) {
+		if ( app.frame % 10 === 0 ) {
 
 			const st = edges ? edges.stats : null;
-			hud.textContent = `${graph.name}  N=${graph.N} E=${graph.E} D=${graph.D}  mode=${mode}  fps=${app.fps.toFixed( 1 )} (${app.frameMs.toFixed( 1 )} ms)` +
-				( st ? `\nedges: S=${st.segments} vertices=${st.vertices} tris=${st.triangles} opacity=${st.autoOpacity.toFixed( 3 )} beta=${edges.bundling}` : '\nedges: off' ) +
+			hud.textContent = `${graph.name}  N=${graph.N} E=${graph.E} D=${graph.D}  mode=${mode}${old ? '  OLD renderer' : ''}  fps=${app.fps.toFixed( 1 )} (${app.frameMs.toFixed( 1 )} ms)` +
+				( st ? `\nedges: S=${st.segments} vertices=${st.vertices} opacity=${st.autoOpacity.toFixed( 3 )} beta=${edges.bundling}` : '\nedges: off' ) +
+				( st && ! old ? `\ntubes=${st.tubes}${st.tubeShadows ? ' (shadows)' : ''} style=${st.style}  curve kernel: ${st.curveUpdates} runs, ${st.curveSkipped} skipped, ${( st.curveBytes / 1048576 ).toFixed( 1 )} MB\n${st.variant}` : '' ) +
 				`\nprepare ${prepMs.toFixed( 0 )} ms`;
 
 		}
 
 	} );
-	window.__info = () => ( { N: graph.N, E: graph.E, D: graph.D, stats: edges && edges.stats, fps: app.fps, frameMs: app.frameMs, drawCalls: app.renderer.info.render.drawCalls, triangles: app.renderer.info.render.triangles } );
+	window.__info = () => ( {
+		N: graph.N, E: graph.E, D: graph.D, stats: edges && edges.stats, curves: edges && ! old ? edges.curves.stats : null, fps: app.fps, frameMs: app.frameMs,
+		drawCalls: app.renderer.info.render.drawCalls, triangles: app.renderer.info.render.triangles, gfx: { ...gfxState },
+		path: window.__pathInfo || null, epb: window.__epb || null, shadowRenders: window.__shadowRenders ? window.__shadowRenders() : null,
+	} );
+	// storage buffers (and textures) declared by the WGSL of every shader module the device was
+	// given for the edge materials (main pass, shadow pass) and the curve kernel
+	window.__bindings = () => {
+
+		const out = {};
+		for ( const m of shaderModules ) {
+
+			if ( ! /EdgeRenderer|edges\.curves/.test( m.label ) ) continue;
+			const storage = [ ...m.code.matchAll( /var<storage[^>]*>\s+(\w+)/g ) ].map( ( x ) => x[ 1 ] );
+			const key = m.label + ' · ' + storage.length + ' storage · ' + ( m.code.match( /:\s*texture_\w+/g ) || [] ).length + ' textures';
+			out[ key ] = storage.join( ' ' );
+
+		}
+
+		return out;
+
+	};
+
+	// ?frames=N: a fixed number of frames, then wait for the GPU queue to drain
+	const frameLimit = num( 'frames', 0 );
+	if ( frameLimit > 0 ) {
+
+		let left = frameLimit;
+		app.events.addEventListener( 'frame', async () => {
+
+			if ( num( 'settle', 0 ) === 1 && layout && ! window.__settled ) return; // count from the settled layout
+			if ( -- left !== 0 ) return;
+			app.renderer.setAnimationLoop( null );
+			await app.renderer.backend.device.queue.onSubmittedWorkDone();
+			window.__frozen = true;
+
+		} );
+
+	}
+
 	window.__ready = true;
 
 } catch ( e ) {

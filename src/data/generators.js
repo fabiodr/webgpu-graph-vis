@@ -18,6 +18,14 @@
 //   rgg3d      random geometric graph in the unit cube (or 3-torus), grid hashing. Layout sanity.
 //   lattice3d  3D grid / torus. Layout sanity check (should unfold into a box).
 //   caveman    ring of cliques (connected caveman), optional relaxed rewiring.
+//   galaxy     hubs and satellites in two planted levels: systems (a hub, its satellites, moons
+//              around some satellites) in groups; hubs of a group linked in a ring with chords,
+//              groups joined at their largest hubs. Tree-like, strong hubs, clear hierarchy.
+//   geosf      geometric inhomogeneous random graph (Bringmann, Keusch & Lengler 2019, threshold
+//              case): points in the unit square or cube with Pareto weights, an edge when
+//              distance^d <= c · w_i · w_j. Power-law degrees with geometric locality. Sampled
+//              per pair of weight layers with a grid of the layer pair's reach.
+//   mesh       triangle / quad mesh of a sheet, a tube or a torus (wrap flags).
 //
 // API
 //   MODELS                     model descriptions (id, name, label, description, params[])
@@ -29,7 +37,8 @@
 //                              labels: 'auto' (pseudo-word names up to 2,000 nodes; coordinates
 //                              for lattices), 'words', 'none'
 //   hsbm(p, seed), lfr(p, seed), barabasiAlbert(p, seed), wattsStrogatz(p, seed),
-//   randomGeometric3D(p, seed), lattice3D(p), caveman(p, seed)     raw generators (resolved params)
+//   randomGeometric3D(p, seed), lattice3D(p), caveman(p, seed), galaxy(p, seed),
+//   geometricScaleFree(p, seed), surfaceMesh(p)                     raw generators (resolved params)
 //   pseudoWords( n, seed )     unique pronounceable labels
 
 import { rng } from '../graph/prepare.js';
@@ -110,6 +119,41 @@ export const MODELS = [
 			{ key: 'rewire', label: 'Rewiring', type: 'float', min: 0, max: 0.5, step: 0.01, value: 0 },
 		],
 	},
+	{
+		id: 'galaxy', name: 'Hubs and satellites', label: 'Galaxy (hubs)',
+		description: 'Groups of systems: a hub with satellites, some satellites with moons of their own; hubs of a group are linked, groups meet at their largest hubs. A tree-like hierarchy with strong hubs.',
+		params: [
+			{ key: 'n', label: 'Nodes', type: 'int', min: 100, max: 30000, step: 10, log: true, value: 3000 },
+			{ key: 'groups', label: 'Groups', type: 'int', min: 2, max: 16, value: 6 },
+			{ key: 'systems', label: 'Systems per group', type: 'int', min: 2, max: 40, value: 8 },
+			{ key: 'sizeSpread', label: 'Size spread', type: 'float', min: 0, max: 1.5, step: 0.05, value: 0.7 },
+			{ key: 'moons', label: 'Moons', type: 'float', min: 0, max: 0.8, step: 0.01, value: 0.3 },
+			{ key: 'mesh', label: 'Links between satellites', type: 'float', min: 0, max: 2, step: 0.05, value: 0.15 },
+			{ key: 'bridges', label: 'Links per hub', type: 'int', min: 1, max: 6, value: 2 },
+		],
+	},
+	{
+		id: 'geosf', name: 'Geometric scale-free', label: 'Geometric scale-free',
+		description: 'Points in space with power-law weights, linked when close relative to their weights (a geometric inhomogeneous random graph): hubs and locality at once.',
+		params: [
+			{ key: 'n', label: 'Nodes', type: 'int', min: 100, max: 30000, step: 10, log: true, value: 3000 },
+			{ key: 'avgDegree', label: 'Avg degree', type: 'float', min: 2, max: 40, step: 0.5, value: 8 },
+			{ key: 'exponent', label: 'Degree exponent', type: 'float', min: 2.1, max: 4, step: 0.05, value: 2.6 },
+			{ key: 'dimension', label: 'Dimension', type: 'int', min: 2, max: 3, value: 2 },
+			{ key: 'periodic', label: 'Periodic (torus)', type: 'bool', value: false },
+		],
+	},
+	{
+		id: 'mesh', name: 'Surface mesh', label: 'Mesh / torus',
+		description: 'A triangle or quad mesh of a sheet, a tube (wrapped one way) or a torus (wrapped both ways). A layout sanity check: should unfold into that surface.',
+		params: [
+			{ key: 'nu', label: 'Size U', type: 'int', min: 3, max: 300, value: 60 },
+			{ key: 'nv', label: 'Size V', type: 'int', min: 3, max: 300, value: 30 },
+			{ key: 'wrapU', label: 'Wrap U', type: 'bool', value: true },
+			{ key: 'wrapV', label: 'Wrap V', type: 'bool', value: true },
+			{ key: 'triangles', label: 'Triangles', type: 'bool', value: true },
+		],
+	},
 ];
 
 for ( const m of MODELS ) m.params.push( { ...SEED_PARAM } );
@@ -122,6 +166,9 @@ const GENERATORS = {
 	rgg3d: ( p, seed ) => randomGeometric3D( p, seed ),
 	lattice3d: ( p ) => lattice3D( p ),
 	caveman: ( p, seed ) => caveman( p, seed ),
+	galaxy: ( p, seed ) => galaxy( p, seed ),
+	geosf: ( p, seed ) => geometricScaleFree( p, seed ),
+	mesh: ( p ) => surfaceMesh( p ),
 };
 
 export function listModels() {
@@ -1029,6 +1076,282 @@ export function caveman( p, seed = 1 ) {
 		nodeCount: n,
 		edges: finishEdges( n, Uint32Array.from( pairs ) ),
 		planted: { levels: [ comm ] },
+	};
+
+}
+
+// ── hubs and satellites ──────────────────────────────────────────────────────────────────────
+
+export function galaxy( p, seed = 1 ) {
+
+	const rand = rng( seed );
+	const G = p.groups, perGroup = p.systems, S = G * perGroup;
+	const n = Math.max( p.n, 2 * S ); // a hub and one satellite per system at least
+	// system sizes: lognormal shares of the nodes, each at least a hub and a satellite
+	const share = lognormalWeights( S, p.sizeSpread, rand );
+	const size = new Int32Array( S );
+	let used = 0;
+	for ( let k = 0; k < S; k ++ ) {
+
+		size[ k ] = 2 + Math.floor( ( ( n - 2 * S ) * share[ k ] ) / S );
+		used += size[ k ];
+
+	}
+
+	for ( let k = 0; used < n; k = ( k + 1 ) % S, used ++ ) size[ k ] ++;
+	const start = new Int32Array( S + 1 );
+	for ( let k = 0; k < S; k ++ ) start[ k + 1 ] = start[ k ] + size[ k ];
+
+	const buf = new PairBuffer( 2 * n );
+	const system = new Int32Array( n ), group = new Int32Array( n );
+	let moons = 0;
+	for ( let k = 0; k < S; k ++ ) {
+
+		const hub = start[ k ], m = size[ k ] - 1;
+		system.fill( k, hub, hub + size[ k ] );
+		group.fill( Math.floor( k / perGroup ), hub, hub + size[ k ] );
+		// a satellite orbits the hub; a moon orbits an earlier satellite of the system
+		for ( let q = 1; q <= m; q ++ ) {
+
+			if ( q > 1 && rand() < p.moons ) {
+
+				buf.push( hub + q, hub + 1 + Math.floor( rand() * ( q - 1 ) ) );
+				moons ++;
+
+			} else buf.push( hub + q, hub );
+
+		}
+
+		for ( let e = Math.round( p.mesh * m ); e > 0 && m > 1; e -- ) {
+
+			const a = hub + 1 + Math.floor( rand() * m ), b = hub + 1 + Math.floor( rand() * m );
+			if ( a !== b ) buf.push( a, b );
+
+		}
+
+	}
+
+	// hubs of a group: a ring, and chords up to `bridges` links per hub
+	const core = new Int32Array( G );
+	for ( let g = 0; g < G; g ++ ) {
+
+		const first = g * perGroup;
+		let largest = first;
+		for ( let j = 0; j < perGroup; j ++ ) {
+
+			const k = first + j;
+			if ( size[ k ] > size[ largest ] ) largest = k;
+			if ( perGroup > 2 || j === 0 ) buf.push( start[ k ], start[ first + ( ( j + 1 ) % perGroup ) ] );
+			for ( let b = 1; b < p.bridges && perGroup > 3; b ++ ) {
+
+				const other = first + Math.floor( rand() * perGroup );
+				if ( other !== k ) buf.push( start[ k ], start[ other ] );
+
+			}
+
+		}
+
+		core[ g ] = start[ largest ];
+
+	}
+
+	// the groups meet at their largest hubs: a ring, and a few chords across it
+	for ( let g = 0; g < G; g ++ ) if ( G > 2 || g === 0 ) buf.push( core[ g ], core[ ( g + 1 ) % G ] );
+	for ( let e = Math.floor( G / 3 ); e > 0; e -- ) {
+
+		const a = Math.floor( rand() * G ), b = Math.floor( rand() * G );
+		if ( a !== b ) buf.push( core[ a ], core[ b ] );
+
+	}
+
+	return {
+		name: `Hubs and satellites · ${fmt( n )} nodes`,
+		description: `${G} groups of ${perGroup} systems (a hub with satellites, ${Math.round( ( 100 * moons ) / Math.max( 1, n - S ) )}% of them moons of another satellite); hubs of a group are linked, the groups meet at their largest hubs.`,
+		nodeCount: n,
+		edges: finishEdges( n, buf.view() ),
+		planted: { levels: [ system, group ] },
+		stats: { systems: S, moons },
+	};
+
+}
+
+// ── geometric scale-free (geometric inhomogeneous random graph) ──────────────────────────────
+
+/**
+ * Threshold GIRG: node i has a position x_i in [0,1)^d and a weight w_i >= 1 with density
+ * ∝ w^-exponent; i ~ j when |x_i − x_j|^d <= c · w_i · w_j. The expected degree of a node is
+ * proportional to its weight, so the degrees follow the same power law, and neighbours are close
+ * unless one of them is a hub. Sampling: the nodes are put in layers of weight [ 2^a, 2^(a+1) );
+ * for a pair of layers the reach is bounded by ( c · 2^(a+1) · 2^(b+1) )^(1/d), and a grid of
+ * that cell size over the heavier layer finds the candidates. Linear in nodes + edges, up to
+ * the logarithmic number of layer pairs. c is set from the expected degree and corrected once
+ * from the measured one (the border of the square or cube costs edges).
+ */
+export function geometricScaleFree( p, seed = 1 ) {
+
+	const n = p.n, d = p.dimension === 3 ? 3 : 2, periodic = !! p.periodic;
+	const rand = rng( seed );
+	const pos = new Float64Array( d * n );
+	for ( let k = 0; k < d * n; k ++ ) pos[ k ] = rand();
+	// Pareto weights, capped so that no node expects more than n − 1 neighbours by a wide margin
+	const w = new Float64Array( n );
+	const cap = Math.pow( n, 1 / ( p.exponent - 1 ) );
+	let mean = 0;
+	for ( let i = 0; i < n; i ++ ) {
+
+		w[ i ] = Math.min( cap, Math.pow( 1 - rand(), - 1 / ( p.exponent - 1 ) ) );
+		mean += w[ i ] / n;
+
+	}
+
+	// layers by weight
+	const layerOf = new Int32Array( n );
+	let layers = 0;
+	for ( let i = 0; i < n; i ++ ) {
+
+		layerOf[ i ] = Math.floor( Math.log2( w[ i ] ) );
+		if ( layerOf[ i ] + 1 > layers ) layers = layerOf[ i ] + 1;
+
+	}
+
+	const members = Array.from( { length: layers }, () => [] );
+	for ( let i = 0; i < n; i ++ ) members[ layerOf[ i ] ].push( i );
+	const ballVolume = d === 3 ? ( 4 * Math.PI ) / 3 : Math.PI;
+	const want = Math.min( p.avgDegree, n - 1 );
+
+	const sample = ( c ) => {
+
+		const buf = new PairBuffer( Math.ceil( ( n * want ) / 2 ) + 16 );
+		for ( let a = 0; a < layers; a ++ ) {
+
+			if ( ! members[ a ].length ) continue;
+			for ( let b = a; b < layers; b ++ ) {
+
+				const heavy = members[ b ];
+				if ( ! heavy.length ) continue;
+				const reach = Math.min( 0.5, Math.pow( c * Math.pow( 2, a + b + 2 ), 1 / d ) );
+				const cells = Math.max( 1, Math.min( 256, Math.floor( 1 / reach ) ) );
+				const cellCount = Math.pow( cells, d );
+				const cellOf = ( i ) => {
+
+					let cell = 0;
+					for ( let k = d - 1; k >= 0; k -- ) cell = cell * cells + Math.min( cells - 1, Math.floor( pos[ d * i + k ] * cells ) );
+					return cell;
+
+				};
+
+				// the heavier layer in a grid
+				const head = new Int32Array( cellCount + 1 );
+				for ( const j of heavy ) head[ cellOf( j ) + 1 ] ++;
+				for ( let q = 0; q < cellCount; q ++ ) head[ q + 1 ] += head[ q ];
+				const items = new Int32Array( heavy.length ), fill = head.slice( 0, cellCount );
+				for ( const j of heavy ) items[ fill[ cellOf( j ) ] ++ ] = j;
+				const span = cells >= 3 ? 1 : 0; // fewer than 3 cells per axis: every cell is a neighbour
+				for ( const i of members[ a ] ) {
+
+					const ci = [ 0, 0, 0 ];
+					for ( let k = 0; k < d; k ++ ) ci[ k ] = Math.min( cells - 1, Math.floor( pos[ d * i + k ] * cells ) );
+					const visit = ( cell ) => {
+
+						for ( let q = head[ cell ]; q < head[ cell + 1 ]; q ++ ) {
+
+							const j = items[ q ];
+							if ( a === b && j <= i ) continue;
+							let dist2 = 0;
+							for ( let k = 0; k < d; k ++ ) {
+
+								let dx = Math.abs( pos[ d * i + k ] - pos[ d * j + k ] );
+								if ( periodic && dx > 0.5 ) dx = 1 - dx;
+								dist2 += dx * dx;
+
+							}
+
+							const r = Math.sqrt( dist2 );
+							if ( ( d === 3 ? r * r * r : dist2 ) <= c * w[ i ] * w[ j ] ) buf.push( i, j );
+
+						}
+
+					};
+
+					if ( span === 0 ) {
+
+						for ( let cell = 0; cell < cellCount; cell ++ ) visit( cell );
+						continue;
+
+					}
+
+					for ( let dz = d === 3 ? - 1 : 0; dz <= ( d === 3 ? 1 : 0 ); dz ++ ) for ( let dy = - 1; dy <= 1; dy ++ ) for ( let dx = - 1; dx <= 1; dx ++ ) {
+
+						let gx = ci[ 0 ] + dx, gy = ci[ 1 ] + dy, gz = ci[ 2 ] + dz;
+						if ( periodic ) {
+
+							gx = ( gx + cells ) % cells; gy = ( gy + cells ) % cells; gz = ( gz + cells ) % cells;
+
+						} else if ( gx < 0 || gy < 0 || gz < 0 || gx >= cells || gy >= cells || gz >= cells ) continue;
+
+						visit( gx + cells * ( gy + ( d === 3 ? cells * gz : 0 ) ) );
+
+					}
+
+				}
+
+			}
+
+		}
+
+		return finishEdges( n, buf.view() );
+
+	};
+
+	let c = want / ( n * ballVolume * mean * mean );
+	let edges = sample( c );
+	for ( let pass = 0; pass < 2; pass ++ ) {
+
+		const got = edges.length / n; // 2E / n
+		if ( got <= 0 || Math.abs( got / want - 1 ) < 0.03 ) break;
+		c *= want / got;
+		edges = sample( c );
+
+	}
+
+	return {
+		name: `Geometric scale-free · ${fmt( n )} nodes`,
+		description: `Random points in the unit ${d === 3 ? ( periodic ? '3-torus' : 'cube' ) : ( periodic ? 'torus' : 'square' )} with power-law weights (exponent ${p.exponent}), linked when close relative to their weights: hubs with long links over a geometric background (target average degree ${p.avgDegree}).`,
+		nodeCount: n,
+		edges,
+		stats: { maxWeight: round3( w.reduce( ( m, x ) => Math.max( m, x ), 0 ) ), threshold: c },
+	};
+
+}
+
+// ── surface mesh: sheet, tube, torus ─────────────────────────────────────────────────────────
+
+export function surfaceMesh( p ) {
+
+	const nu = p.nu, nv = p.nv, wrapU = !! p.wrapU, wrapV = !! p.wrapV, triangles = !! p.triangles;
+	const n = nu * nv;
+	const id = ( u, v ) => u + nu * v;
+	const buf = new PairBuffer( 3 * n );
+	const labels = n <= 20000 ? new Array( n ) : null;
+	for ( let v = 0; v < nv; v ++ ) for ( let u = 0; u < nu; u ++ ) {
+
+		const i = id( u, v );
+		if ( labels ) labels[ i ] = `${u},${v}`;
+		const u1 = u + 1 < nu ? u + 1 : wrapU ? 0 : - 1;
+		const v1 = v + 1 < nv ? v + 1 : wrapV ? 0 : - 1;
+		if ( u1 >= 0 ) buf.push( i, id( u1, v ) );
+		if ( v1 >= 0 ) buf.push( i, id( u, v1 ) );
+		if ( triangles && u1 >= 0 && v1 >= 0 ) buf.push( i, id( u1, v1 ) );
+
+	}
+
+	const shape = wrapU && wrapV ? 'torus' : wrapU || wrapV ? 'tube' : 'sheet';
+	return {
+		name: `${triangles ? 'Triangle' : 'Quad'} mesh · ${shape} ${nu}×${nv}`,
+		description: `A ${triangles ? 'triangle' : 'quad'} mesh of ${fmt( n )} nodes on a ${shape}${shape === 'tube' ? ` (wrapped along ${wrapU ? 'U' : 'V'})` : ''}. Layout sanity check: should unfold into that surface.`,
+		nodeCount: n,
+		labels,
+		edges: finishEdges( n, buf.view() ),
 	};
 
 }

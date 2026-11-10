@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PerspectiveCamera } from 'three/webgpu';
-import { Picking } from '../src/interact/Picking.js';
+import { Picking, resolveClick } from '../src/interact/Picking.js';
 
 const W = 1000, H = 800;
 
@@ -127,5 +127,25 @@ test( 'pick on 20k nodes takes a few ms at most', () => {
 	console.log( `  pick 20k nodes: ${ms.toFixed( 3 )} ms/pick, ${hits}/${runs} hits` );
 	assert.ok( ms < 4, `pick took ${ms} ms` );
 	assert.ok( hits > 0 );
+
+} );
+
+test( 'resolveClick: a double click means the node of the first click', () => {
+
+	const first = { t: 1000, x: 200, y: 300, index: 7 };
+	// no click before, or one too long ago, or too far away: a single click on what is under it
+	assert.deepEqual( resolveClick( null, { x: 200, y: 300, index: 7 }, 1000 ), { index: 7, double: false } );
+	assert.deepEqual( resolveClick( first, { x: 201, y: 301, index: 7 }, 1400 ), { index: 7, double: false } );
+	assert.deepEqual( resolveClick( first, { x: 220, y: 300, index: 9 }, 1100 ), { index: 9, double: false } );
+	// the same node again
+	assert.deepEqual( resolveClick( first, { x: 202, y: 299, index: 7 }, 1150 ), { index: 7, double: true } );
+	// the view moved under the pointer: another node, or nothing, lies there now
+	assert.deepEqual( resolveClick( first, { x: 202, y: 299, index: 12 }, 1150 ), { index: 7, double: true } );
+	assert.deepEqual( resolveClick( first, { x: 202, y: 299, index: - 1 }, 1150 ), { index: 7, double: true } );
+	// two clicks on empty space stay a double click on empty space (fit), whatever slid under the second
+	assert.deepEqual( resolveClick( { t: 1000, x: 50, y: 50, index: - 1 }, { x: 52, y: 51, index: 3 }, 1200 ), { index: - 1, double: true } );
+	// a finger is less exact than a mouse
+	assert.equal( resolveClick( first, { x: 220, y: 310, index: 7 }, 1150, { tolerance: 32 } ).double, true );
+	assert.equal( resolveClick( first, { x: 220, y: 310, index: 7 }, 1150, { doubleMs: 100, tolerance: 32 } ).double, false );
 
 } );

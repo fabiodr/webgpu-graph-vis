@@ -1,23 +1,28 @@
 // Text edge-list parsing into a canonical graph (see format.js).
 //
-// Accepted input: one edge per line, "a b", "a,b", "a;b" or "a<TAB>b"; extra columns (weights,
-// timestamps) are ignored; a line with a single id declares an isolated node. Ids are arbitrary
-// strings; quoted CSV fields ("Jean Valjean","Fantine") are supported. Comment lines start with
-// '#', '%' or '//'. A header line such as "source,target" / "from to" / "Source;Target;Weight"
-// is skipped. Matrix Market coordinate files (%%MatrixMarket … then "rows cols nnz") work too.
+// Accepted input: one edge per line, "a b", "a,b", "a;b" or "a<TAB>b"; a line with a single id
+// declares an isolated node. Ids are arbitrary strings; quoted CSV fields ("Jean Valjean",
+// "Fantine") are supported. Comment lines start with '#', '%' or '//'. A header line such as
+// "source,target" / "from to" / "Source;Target;Weight" is skipped.
+//
+// Weights: with a header, the column named weight / value / count / strength / w / freq. Without
+// one, the third column when it is a number in every one of the first 50 rows, unless those are
+// all integers of at least 10^8 (time stamps). Other columns are ignored.
 //
 // The delimiter is detected from the first data lines: tab, then comma, then semicolon, else
 // runs of whitespace. With an explicit delimiter, spaces inside fields are kept (names).
 // Node order: when every id is a non-negative integer, nodes are sorted numerically (so node
 // index order follows the file's numbering); otherwise by first appearance. Labels are the ids.
-// Duplicate edges, reversed duplicates and self loops are dropped (undirected graph).
+// Duplicate edges and reversed duplicates are merged (weights summed) and self loops dropped
+// (undirected graph); the counts are in meta.report (builder.js).
 //
 // API
-//   parseEdgeList( text, { name = 'Edge list', delimiter = 'auto' } ) -> canonical graph
-//       meta: { format: 'edgelist', delimiter, lines, edgeLines, skipped, header, matrixMarket }
-//   looksLikeEdgeList( text ) -> boolean   quick sniff used by the worker
+//   parseEdgeList( text, { name = 'Edge list', delimiter = 'auto', limits, onProgress } ) -> canonical graph
+//       meta: { format: 'edgelist', delimiter, lines, edgeLines, skipped, header, weightColumn,
+//               matrixMarket, report }
+//   looksLikeEdgeList( text ) -> boolean   quick sniff: not JSON
 
-import { normalizeGraph } from './format.js';
+import { GraphBuilder, GraphError } from './builder.js';
 
 const HEADER_WORDS = new Set( [ 'source', 'target', 'from', 'to', 'src', 'dst', 'dest', 'destination', 'node1', 'node2', 'node_1', 'node_2', 'id1', 'id2', 'head', 'tail', 'nodea', 'nodeb', 'weight', 'value', 'source_id', 'target_id', 'from_id', 'to_id', 'sourceid', 'targetid' ] );
 
@@ -69,10 +74,14 @@ function detectDelimiter( text ) {
 
 }
 
+const MAX_LINE = 65536; // characters of a line that are looked at
+
 /** Splits a line into fields; handles double-quoted fields with "" escapes. */
 function split( line, delimiter, out ) {
 
 	out.length = 0;
+	// an edge is in the first few fields: a file that is one line of 20 MB must not cost seconds
+	if ( line.length > MAX_LINE ) line = line.slice( 0, MAX_LINE );
 	if ( delimiter === 'whitespace' && line.indexOf( '"' ) < 0 ) {
 
 		const parts = line.split( /\s+/ );
@@ -143,7 +152,8 @@ const INT_RE = /^\d+$/;
 
 /**
  * The first data line is a header when both of its first fields are column names (source,
- * target, from, to, …), or when they are not integers while the next line's ids are.
+ * target, from, to, …), when they are not integers while the next line's ids are, or when a
+ * later field is named like a weight column and the line below has a number there.
  */
 function detectHeader( text, delimiter, matrixMarket ) {
 
@@ -169,50 +179,88 @@ function detectHeader( text, delimiter, matrixMarket ) {
 	const word = ( s ) => HEADER_WORDS.has( ( s || '' ).toLowerCase().replace( /\s+/g, '_' ) );
 	if ( word( a ) && ( b === undefined || word( b ) ) ) return 0;
 	if ( rows.length === 2 && b !== undefined && ! INT_RE.test( a ) && ! INT_RE.test( b ) && INT_RE.test( rows[ 1 ][ 0 ] || '' ) && INT_RE.test( rows[ 1 ][ 1 ] || '' ) ) return 0;
+	// "a,b,weight" over "x,y,2": a later column is named like a weight and holds numbers below
+	if ( rows.length === 2 ) for ( let k = 2; k < rows[ 0 ].length; k ++ ) if ( WEIGHT_NAMES.test( rows[ 0 ][ k ].trim() ) && NUMBER_RE.test( rows[ 1 ][ k ] || '' ) ) return 0;
 	return - 1;
+
+}
+
+const WEIGHT_NAMES = /^(weights?|w|value|count|strength|freq|frequency)$/i;
+const NUMBER_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/;
+
+/**
+ * Which column holds the edge weight (-1 = none): a header names it; without a header the third
+ * column when it is a number in every one of the first rows and does not look like a timestamp.
+ */
+function detectWeightColumn( text, delimiter, matrixMarket, headerAt ) {
+
+	const rows = [];
+	let header = null, skipSize = matrixMarket, dataLine = - 1;
+	for ( const line of lines( text ) ) {
+
+		if ( isComment( line ) ) continue;
+		if ( skipSize ) {
+
+			skipSize = false;
+			continue;
+
+		}
+
+		const fields = split( line, delimiter, [] );
+		if ( ++ dataLine === headerAt ) header = fields;
+		else rows.push( fields );
+		if ( rows.length === 50 ) break;
+
+	}
+
+	if ( header ) {
+
+		for ( let k = 2; k < header.length; k ++ ) if ( WEIGHT_NAMES.test( header[ k ].trim() ) ) return k;
+		return - 1;
+
+	}
+
+	const edgeRows = rows.filter( ( r ) => r.length >= 2 && r[ 1 ] !== '' );
+	if ( ! edgeRows.length ) return - 1;
+	let stamps = true;
+	for ( const r of edgeRows ) {
+
+		if ( r.length < 3 || ! NUMBER_RE.test( r[ 2 ] ) ) return - 1;
+		if ( stamps && ! ( /^\d+$/.test( r[ 2 ] ) && Number( r[ 2 ] ) >= 1e8 ) ) stamps = false;
+
+	}
+
+	return stamps ? - 1 : 2;
 
 }
 
 /**
  * @param {string} text
- * @param {{ name?: string, delimiter?: 'auto'|'whitespace'|','|';'|'\t' }} [options]
+ * @param {{ name?: string, delimiter?: 'auto'|'whitespace'|','|';'|'\t', limits?: object, onProgress?: Function }} [options]
  */
 export function parseEdgeList( text, options = {} ) {
 
 	const name = options.name || 'Edge list';
-	if ( typeof text !== 'string' ) throw new Error( 'Edge list: expected text' );
+	if ( typeof text !== 'string' ) throw new GraphError( 'Edge list: expected text', 'format' );
 	if ( text.charCodeAt( 0 ) === 0xfeff ) text = text.slice( 1 );
 	const matrixMarket = /^%%MatrixMarket/i.test( text );
 	const delimiter = ! options.delimiter || options.delimiter === 'auto' ? detectDelimiter( text ) : options.delimiter;
 
-	const ids = new Map(); // id string -> provisional index (first appearance)
-	const names = [];
-	const raw = []; // provisional index pairs
-	let allInt = true;
-	let lineCount = 0, edgeLines = 0, skipped = 0, header = null;
+	const b = new GraphBuilder( { name, limits: options.limits, onProgress: options.onProgress } );
+	let lineCount = 0, edgeLines = 0, skipped = 0, header = null, badWeights = 0;
 	let mmSizeLine = matrixMarket;
 	const fields = [];
 	const headerAt = detectHeader( text, delimiter, matrixMarket ); // index of the header among data lines, or -1
+	const weightAt = detectWeightColumn( text, delimiter, matrixMarket, headerAt );
 	let dataLine = - 1;
-	const idOf = ( s ) => {
-
-		let k = ids.get( s );
-		if ( k === undefined ) {
-
-			k = names.length;
-			ids.set( s, k );
-			names.push( s );
-			if ( allInt && ! INT_RE.test( s ) ) allInt = false;
-
-		}
-
-		return k;
-
-	};
+	const total = Math.max( 1, text.length );
+	let chars = 0;
 
 	for ( const line of lines( text ) ) {
 
 		lineCount ++;
+		chars += line.length + 1;
+		if ( ( lineCount & 8191 ) === 0 ) b.progress( Math.min( 1, chars / total ) );
 		if ( isComment( line ) ) continue;
 		if ( mmSizeLine ) {
 
@@ -222,7 +270,7 @@ export function parseEdgeList( text, options = {} ) {
 		}
 
 		split( line, delimiter, fields );
-		const a = fields[ 0 ], b = fields[ 1 ];
+		const a = fields[ 0 ], c = fields[ 1 ];
 		if ( ++ dataLine === headerAt ) {
 
 			header = fields.slice();
@@ -237,53 +285,45 @@ export function parseEdgeList( text, options = {} ) {
 
 		}
 
-		if ( b === undefined || b === '' ) {
+		if ( c === undefined || c === '' ) {
 
-			idOf( a );
+			b.node( a );
 			continue;
 
 		}
 
-		raw.push( idOf( a ), idOf( b ) );
+		let w = 1;
+		if ( weightAt >= 0 ) {
+
+			const f = fields[ weightAt ];
+			w = f === undefined || f === '' ? NaN : Number( f );
+			if ( ! Number.isFinite( w ) ) {
+
+				if ( badWeights ++ === 0 ) b.warn( `line ${lineCount}: "${f === undefined ? '' : f}" is not a weight (counted as 1)` );
+				w = 1;
+
+			}
+
+		}
+
+		b.edge( b.node( a ), b.node( c ), w );
 		edgeLines ++;
 
 	}
 
-	const n = names.length;
-	if ( n === 0 ) throw new Error( 'Edge list: no edges found' );
+	if ( b.nodeCount === 0 ) throw new GraphError( 'Edge list: no edges found', 'empty' );
+	if ( badWeights > 1 ) b.warn( `${badWeights} weights are not numbers (counted as 1)` );
 
-	// final node order
-	let order = null; // provisional index -> final index
-	let labels = names;
-	if ( allInt ) {
-
-		const perm = Array.from( names.keys() ).sort( ( x, y ) => Number( names[ x ] ) - Number( names[ y ] ) || ( names[ x ] < names[ y ] ? - 1 : 1 ) );
-		order = new Int32Array( n );
-		labels = new Array( n );
-		perm.forEach( ( p, k ) => {
-
-			order[ p ] = k;
-			labels[ k ] = names[ p ];
-
-		} );
-
-	}
-
-	const edges = new Uint32Array( raw.length );
-	for ( let k = 0; k < raw.length; k ++ ) edges[ k ] = order ? order[ raw[ k ] ] : raw[ k ];
-
-	return normalizeGraph( {
-		name,
-		nodeCount: n,
-		labels,
-		edges,
+	return b.finish( {
+		format: 'edgelist',
+		numericOrder: true,
 		meta: {
-			format: 'edgelist',
 			delimiter: delimiter === '\t' ? 'tab' : delimiter,
 			lines: lineCount,
 			edgeLines,
 			skipped,
 			header: header || undefined,
+			weightColumn: weightAt >= 0 ? ( header ? header[ weightAt ] : weightAt + 1 ) : undefined,
 			matrixMarket: matrixMarket || undefined,
 		},
 	} );

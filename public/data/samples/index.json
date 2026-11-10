@@ -1,0 +1,21 @@
+{
+	"format": "wgv-samples",
+	"version": 1,
+	"nodes": 77,
+	"edges": 254,
+	"weightSum": 1655,
+	"files": [
+		"lesmis.graphml",
+		"lesmis.csv",
+		"lesmis.tsv",
+		"lesmis.gexf",
+		"lesmis.gml",
+		"lesmis.dot",
+		"lesmis.net",
+		"lesmis.mtx",
+		"lesmis.node-link.json",
+		"lesmis.cytoscape.json",
+		"lesmis.graphology.json",
+		"lesmis.adjacency.json"
+	]
+}

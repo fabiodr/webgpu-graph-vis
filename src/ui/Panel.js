@@ -1,84 +1,172 @@
-// Settings panel: a calm glass panel built from a declarative schema bound to the shared settings
-// object. Desktop: top-left, collapsible. Phones (≤ 640 px wide): a bottom sheet with a grab handle,
-// collapsed to a slim bar by default, draggable/tappable, safe-area aware, ≥ 40 px touch targets.
-// Also owns the app-level overlays: loading indicator, toasts, keyboard help and the file-drop hint.
-// Styles: src/ui/ui.css (import it once, e.g. `import './ui/ui.css'`).
+// Settings panel: a calm glass panel built from a declarative layout over the settings schema
+// (src/ui/settings.js) and bound to the shared settings object. Desktop: top-left, collapsible.
+// Phones (≤ 640 px wide): a bottom sheet with a grab handle, collapsed to a slim bar by default,
+// draggable / tappable, safe-area aware, ≥ 40 px touch targets. Also owns the loading indicator
+// and the toasts. Styles: src/ui/ui.css (import it once, e.g. `import './ui/ui.css'`).
 //
-// Schema (SETTINGS_SCHEMA): sections { id, title, collapsed?, items[] }; item types
-//   slider    { key, label, min, max, step, format? }          double-click label resets to default
-//   segmented { key, label?, options: [{ value, label }] }
-//   toggle    { key, label, hint? }
-//   palette   { key, label, options: [palette names] }        gradient swatches from util/color.js
-//   actions   { items: [{ action, label, icon } | { key, labels: [off, on], icons: [off, on] }] }
-//   dataset   (dataset picker + Open file… + Generate… sub-form + drop hint)
-//   any item may carry visible( settings ) -> bool
+// Progressive disclosure: only Dataset and Layout are open at first; every other section is one
+// line with a summary of its state ("Edges · hierarchy"), and the rarely needed parameters sit
+// behind an "Advanced" row inside their section. Which sections and groups are open is remembered
+// (options.ui). Controls whose feature is missing (options.features / setFeatures) are not shown.
+//
+// Layout (PANEL_LAYOUT): sections { id, open?, summary( settings, info ), items[] }; an item is
+//   'key'                       a setting of the schema: number → slider, enum → segmented,
+//                               bool → toggle (label, range, options, format, hint, visibility
+//                               come from the schema)
+//   { key, …overrides }         the same with overrides ( full: true = control on its own row )
+//   { type: 'choice', key, icons, labels?, describe( value, settings, info ) }   icon tiles (with
+//                               short labels where the schema's are long) + one line
+//   { type: 'palette', key }    gradient swatches from util/color.js
+//   { type: 'actions', items: [ { action, label, icon } | { key, labels: [off, on], icons } ] }
+//   { type: 'preset' }          structure preset of the layout (LAYOUT_PRESETS)
+//   { type: 'look' }            whole look (LOOKS of the settings model) with one line that says
+//                               what the current one is: reported as the action 'look' with the
+//                               id, because it changes several settings at once
+//   { type: 'note', id, text( settings, info ) }   one or two quiet lines, hidden when empty
+//   { type: 'status', id }      live state from info[ id ]: { busy, text, action: { name, label } }
+//   { type: 'group', id, title, items }           "Advanced" disclosure
+//   { type: 'dataset' }         dataset picker + Open file… + Generate… sub-form + drop hint
+//   any object item may carry visible( settings, features, info ) -> bool
 // Generators (setGenerators / options.generators):
 //   [{ id, name, description?, params: [{ key, label, type: 'int'|'float'|'select'|'bool',
 //      min?, max?, step?, log?, value, options?: [{ value, label }] }] }]
 //
 // API
-//   const panel = new Panel( { settings, onChange( key, value, settings ), onAction( name, payload ),
-//                              onOpenFile( file ), manifest, generators, container, title, credit } )
-//   panel.set( key, value )             update settings[key] + its control (no onChange)
+//   const panel = new Panel( { settings, write( key, value ), onChange( key, value, settings ),
+//                              onAction( name, payload ), onOpenFile( file ), onInsets( insets ),
+//                              manifest, generators, features, ui: { get( name ), set( name, value ) },
+//                              help, container, title, credit } )
+//     write     who writes a setting when a control changes. Without it the panel writes into
+//               `settings` itself. An app whose settings live in a store passes the store's setter:
+//               the store stays the only writer (it validates, remembers the choice and tells its
+//               listeners), and the panel shows what the store holds afterwards.
+//     onChange  after the value is written and the controls are in step: apply it.
+//   panel.set( key, value )             show a value that changed elsewhere (no onChange); without
+//                                       `write` it is also stored in settings[key]
 //   panel.refresh()                     re-sync every control from settings
+//   panel.setFeatures( { name: bool, formats: [ { name, extensions } ] } )   feature flags of the
+//                                       schema (`needs`) and the file formats of the drop hint
+//   panel.setInfo( { id: value } )      live state for notes, summaries and status rows: layout
+//                                       { mode, settled, pending, running }, quality { text },
+//                                       render { text }, clustering { text, count }, bundle /
+//                                       recluster { busy, text, action }, edgeStyle (resolved)
+//   panel.openSection( id, open = true )
 //   panel.setManifest( { groups, datasets } )
 //   panel.setGenerators( list )
-//   panel.setDatasetInfo( { id, name, nodes, edges, levels } )   for files/generated graphs
-//   panel.update( stats )               { nodes, edges, clusters, levels, fps, alpha, running }
+//   panel.setDatasetInfo( { id, name, nodes, edges, levels } )   for files / generated graphs
+//   panel.update( stats )               { nodes, edges, communities, levels } for the footer
 //                                       (throttled to ~2×/s; pass { force: true } to bypass)
 //   panel.setLoading( message, fraction? )   fraction 0..1 or null (indeterminate); falsy hides
-//   panel.toast( message, { type: 'error'|'info', duration } )
-//   panel.showHelp( on ) / toggleHelp() / helpVisible
+//   panel.toast( message, { type: 'error'|'info', duration, action: { label, run() } } )
+//   panel.showHelp( on ) / toggleHelp() / helpVisible     forwarded to options.help (ui/Help.js)
 //   panel.setCollapsed( on ) / collapsed / isSheet
 //   panel.setAccent( paletteName )      accent CSS variables (also on palette change)
 //   panel.insets()                      { left, right, top, bottom } CSS px of canvas the panel
 //                                       covers at rest; also sent to options.onInsets( insets )
 //                                       on every change (wire to rig.setInsets)
 //   panel.dispose()
-// Actions sent to onAction: 'fit', 'reset', 'reheat', 'generate' ({ model, params }), 'open-file' (File).
-// Toggling Pause/Resume goes through onChange( 'running', bool ). Sets --wgv-sheet-h on <html>
-// (visible sheet height, 0 on desktop) so the node card can sit above the sheet.
+// Actions sent to onAction: 'fit', 'reset', 'reheat', 'generate' ( { model, params } ),
+// 'open-file' ( File ), 'look' ( id ), 'reset-setting' ( key ) (a double click on the label of a
+// slider, a segmented control or the palette), 'reset-all', and the names of status actions.
+// Toggling Pause / Resume goes through onChange( 'running', bool ). Sets --wgv-sheet-h on <html>
+// (visible sheet height, 0 on desktop) so other surfaces can sit above the sheet.
+//
+// Slider drags are cheap: the thumb and the number are painted at once, the change is applied
+// once per animation frame, and only the controls that depend on the changed key are re-synced
+// (no layout is read while dragging).
 
 import { paletteColor, linearToSrgb, PALETTES } from '../util/color.js';
+import { SECTIONS, LOOKS, settingSpec, settingDefaults, isVisible, lookOf } from './settings.js';
 
-export const DEFAULT_SETTINGS = {
-	dataset: 'imsv/lesmis', layoutMode: 'force', running: true, autoRotate: true, immersive: false,
-	bundling: 0.85, edgeOpacity: 1, edgeWidth: 1, edgeBlend: 'normal', nodeSize: 1, bloom: 0.8,
-	palette: 'paper', labels: 'auto',
-	charge: 1, linkDistance: 30, gravity: 1, theta: 0.8, damping: 0.4, quality: 'auto',
+export const DEFAULT_SETTINGS = settingDefaults();
+
+/** Layout presets of the force model (LAYOUT_PRESETS of ForceLayout.js; kept here so the panel has no GPU imports). */
+export const STRUCTURE_PRESETS = [
+	{ value: 'default', label: 'Balanced', clusterSeparation: 0.7, cohesion: 0.5 },
+	{ value: 'graph-only', label: 'Graph only', clusterSeparation: 1, cohesion: 0 },
+	{ value: 'communities', label: 'Communities', clusterSeparation: 0.4, cohesion: 1.5 },
+];
+
+const LAYOUT_TEXT = {
+	force: 'Hierarchy-aware force layout in space',
+	flat: 'The same force layout in a plane',
+	sphere: 'Clusters on a sphere; the selection moves inward',
+	radial: 'Shells by distance from the selected node',
+	stress: 'Distances match graph distances (meshes, rings, trees)',
 };
 
-export const SETTINGS_SCHEMA = [
-	{ id: 'dataset', title: 'Dataset', items: [ { type: 'dataset' } ] },
-	{ id: 'layout', title: 'Layout', items: [
-		{ type: 'segmented', key: 'layoutMode', big: true, options: [ { value: 'force', label: 'Force 3D' }, { value: 'sphere', label: 'Sphere (paper)' } ] },
-		{ type: 'actions', items: [
-			{ key: 'running', labels: [ 'Resume', 'Pause' ], icons: [ 'play', 'pause' ] },
-			{ action: 'reheat', label: 'Reheat', icon: 'flame' },
-			{ action: 'fit', label: 'Fit', icon: 'fit' },
-			{ action: 'reset', label: 'Reset', icon: 'reset' },
+const cap = ( s ) => ( s ? s[ 0 ].toUpperCase() + s.slice( 1 ) : '' );
+/** The schema's name of a palette, with what the colour module says about it in brackets. */
+const paletteLabel = ( p ) => {
+
+	const about = /\(.*\)/.exec( PALETTES[ p ]?.label || '' );
+	return optionLabel( 'palette', p ) + ( about ? ' ' + about[ 0 ] : '' );
+
+};
+
+const optionLabel = ( key, value ) => settingSpec( key )?.options?.find( ( o ) => o.value === value )?.label || cap( String( value ) );
+
+export const PANEL_LAYOUT = [
+	{ id: 'dataset', open: true, items: [ { type: 'dataset' } ] },
+	{ id: 'layout', open: true,
+		summary: ( s ) => optionLabel( 'layoutMode', s.layoutMode ) + ( s.running ? '' : ' · paused' ),
+		items: [
+			{ type: 'choice', key: 'layoutMode', icons: { force: 'modeForce', flat: 'modeFlat', sphere: 'modeSphere', radial: 'modeRadial', stress: 'modeStress' },
+				labels: { force: 'Force', flat: 'Flat' }, // one word per tile: five of them share the width of the panel
+				describe: ( v, s, info ) => {
+
+					if ( info.layout?.pending ) return { text: 'Computing the stress layout…', busy: true };
+					if ( v === 'radial' ) return { text: LAYOUT_TEXT.radial + ( info.selection ? '' : '. Select a node to choose the centre' ) };
+					return { text: LAYOUT_TEXT[ v ] || '' };
+
+				} },
+			{ type: 'actions', items: [
+				{ key: 'running', labels: [ 'Resume', 'Pause' ], icons: [ 'play', 'pause' ] },
+				{ action: 'reheat', label: 'Reheat', icon: 'flame' },
+				{ action: 'fit', label: 'Fit', icon: 'fit' },
+				{ action: 'reset', label: 'Reset', icon: 'reset' },
+			] },
+			'immersive',
+			{ type: 'preset', visible: ( s ) => s.layoutMode === 'force' || s.layoutMode === 'flat' },
+			{ type: 'group', id: 'layout-advanced', title: 'Advanced', items: [ 'clusterSeparation', 'cohesion', 'hubSpacing', 'layoutSize', 'repulsion', 'damping' ] },
 		] },
-		{ type: 'toggle', key: 'autoRotate', label: 'Auto-rotate' },
-		{ type: 'toggle', key: 'immersive', label: 'Immersive view', hint: 'from the centre', visible: ( s ) => s.layoutMode === 'sphere' },
-	] },
-	{ id: 'look', title: 'Look', items: [
-		{ type: 'slider', key: 'bundling', label: 'Bundling', min: 0, max: 1, step: 0.01 },
-		{ type: 'slider', key: 'edgeOpacity', label: 'Edge opacity', min: 0, max: 1, step: 0.01 },
-		{ type: 'slider', key: 'edgeWidth', label: 'Edge width', min: 0.25, max: 4, step: 0.05 },
-		{ type: 'slider', key: 'nodeSize', label: 'Node size', min: 0.25, max: 4, step: 0.05 },
-		{ type: 'slider', key: 'bloom', label: 'Bloom', min: 0, max: 2, step: 0.01 },
-		{ type: 'palette', key: 'palette', label: 'Palette', options: [ 'paper', 'rainbow', 'aurora', 'ember' ] },
-		{ type: 'segmented', key: 'labels', label: 'Labels', options: [ { value: 'auto', label: 'Auto' }, { value: 'all', label: 'All' }, { value: 'off', label: 'Off' } ] },
-		{ type: 'segmented', key: 'edgeBlend', label: 'Edge blend', options: [ { value: 'normal', label: 'Normal' }, { value: 'additive', label: 'Additive' } ] },
-		{ type: 'segmented', key: 'quality', label: 'Quality', options: [ { value: 'auto', label: 'Auto' }, { value: 'high', label: 'High' }, { value: 'low', label: 'Low' } ] },
-	] },
-	{ id: 'forces', title: 'Forces', collapsed: true, items: [
-		{ type: 'slider', key: 'charge', label: 'Charge', min: 0, max: 4, step: 0.05 },
-		{ type: 'slider', key: 'linkDistance', label: 'Link distance', min: 5, max: 150, step: 1 },
-		{ type: 'slider', key: 'gravity', label: 'Gravity', min: 0, max: 4, step: 0.05 },
-		{ type: 'slider', key: 'theta', label: 'Theta (BH)', min: 0.2, max: 1.6, step: 0.05 },
-		{ type: 'slider', key: 'damping', label: 'Damping', min: 0.05, max: 0.95, step: 0.01 },
-	] },
+	{ id: 'communities',
+		summary: ( s, info ) => ( info.clustering?.count ? `${info.clustering.count.toLocaleString( 'en-US' )} found` : '' ),
+		items: [
+			{ type: 'note', id: 'clustering', text: ( s, info ) => info.clustering?.text || '' },
+			'clusterMethod', 'clusterResolution',
+			{ type: 'status', id: 'recluster' },
+			'fieldStrength', 'clusterLabels',
+		] },
+	{ id: 'edges',
+		summary: ( s, info ) => [ optionLabel( 'bundleMode', s.bundleMode ), info.features?.edgeStyle ? optionLabel( 'edgeStyle', info.edgeStyle || s.edgeStyle ) : null ].filter( Boolean ).join( ' · ' ),
+		items: [
+			{ key: 'bundleMode', full: true },
+			{ type: 'status', id: 'bundle' },
+			'bundling', 'edgeStyle', 'edgeFlow',
+			{ type: 'group', id: 'edges-advanced', title: 'Advanced', items: [ 'edgeOpacity', 'edgeWidth', 'edgeBlend' ] },
+		] },
+	{ id: 'nodes',
+		// "Aurora palette", not "Aurora": a look and a theme carry the same name two rows further down
+		summary: ( s ) => ( s.palette ? optionLabel( 'palette', s.palette ) + ' palette' : '' ),
+		items: [ 'nodeSize', 'labels', 'nodeGloss', 'nodeGlow', { type: 'palette', key: 'palette' } ] },
+	{ id: 'scene',
+		summary: ( s, info ) => ( info.features?.env ? optionLabel( 'theme', s.theme ) : '' ),
+		items: [ { type: 'look' }, { key: 'theme', full: true, caption: 'Theme' }, 'keyLight', 'envLight', 'fog', 'dust' ] },
+	{ id: 'camera',
+		summary: ( s ) => ( s.dof === 'auto' ? '' : `Focus ${s.dof}` ),
+		items: [
+			'autoRotate', 'dof', 'dofStrength', 'bloom', 'exposure',
+			{ type: 'group', id: 'camera-advanced', title: 'Advanced', items: [ 'aoStrength', 'grain', 'vignette' ] },
+		] },
+	{ id: 'quality',
+		summary: ( s, info ) => ( info.quality?.tier ? ( s.quality === 'auto' ? `Auto · ${cap( info.quality.tier )}` : cap( info.quality.tier ) ) : optionLabel( 'quality', s.quality ) ),
+		items: [
+			{ key: 'quality', full: true },
+			{ type: 'note', id: 'quality', text: ( s, info ) => info.quality?.text || '' },
+			'dynamicResolution', 'showStatus',
+			{ type: 'note', id: 'render', mono: true, text: ( s, info ) => info.render?.text || '' },
+		] },
 ];
 
 const PALETTE_ACCENT_T = { paper: 0.85, rainbow: 0.5, aurora: 0.25, ember: 0.75 };
@@ -101,6 +189,20 @@ const ICONS = {
 	file: '<path d="M4 2.5h5l3 3V13.5H4z"/><path d="M9 2.5v3h3"/>',
 	spark: '<path d="M8 2.5l1.2 3.3 3.3 1.2-3.3 1.2L8 11.5 6.8 8.2 3.5 7l3.3-1.2zM12.5 11l.5 1.3 1.3.5-1.3.5-.5 1.3-.5-1.3-1.3-.5 1.3-.5z"/>',
 	drop: '<path d="M8 2.5v8M4.8 7.5L8 10.7l3.2-3.2"/><path d="M3 12.5v1h10v-1"/>',
+	camera: '<path d="M2.5 5.5h2.4l1-1.6h4.2l1 1.6h2.4v7h-11z"/><circle cx="8" cy="8.8" r="2.3"/>',
+	link: '<path d="M6.8 9.2a2.6 2.6 0 0 0 3.7 0l2-2a2.6 2.6 0 0 0-3.7-3.7l-.7.7"/><path d="M9.2 6.8a2.6 2.6 0 0 0-3.7 0l-2 2a2.6 2.6 0 0 0 3.7 3.7l.7-.7"/>',
+	expand: '<path d="M2.8 6V2.8H6M10 2.8h3.2V6M13.2 10v3.2H10M6 13.2H2.8V10"/>',
+	shrink: '<path d="M6 2.8V6H2.8M13.2 6H10V2.8M10 13.2V10h3.2M2.8 10H6v3.2"/>',
+	check: '<path d="M3.5 8.4l3 3 6-6.6"/>',
+	focus: '<circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2.4M8 11.8v2.4M1.8 8h2.4M11.8 8h2.4"/>',
+	download: '<path d="M8 2.5v8M4.8 7.5L8 10.7l3.2-3.2"/><path d="M3 13.2h10"/>',
+	gauge: '<path d="M2.6 11.5a5.6 5.6 0 1 1 10.8 0"/><path d="M8 9.6l2.6-3.4"/><circle cx="8" cy="9.8" r=".9" fill="currentColor" stroke="none"/>',
+	// layout modes
+	modeForce: '<circle cx="8" cy="3.1" r="1.25"/><circle cx="3" cy="11.6" r="1.25"/><circle cx="13" cy="11.6" r="1.25"/><circle cx="8.3" cy="8.5" r=".95" fill="currentColor" stroke="none"/><path d="M7.4 4.2L3.7 10.5M8.6 4.2l3.7 6.3M4.3 11.6h7.4"/>',
+	modeFlat: '<path d="M1.8 11.8l3.2-6.6h9.2L11 11.8z"/><circle cx="6.2" cy="9.6" r=".9" fill="currentColor" stroke="none"/><circle cx="9.8" cy="7.4" r=".9" fill="currentColor" stroke="none"/><path d="M6.9 9.2l2.2-1.4"/>',
+	modeSphere: '<circle cx="8" cy="8" r="5.6"/><ellipse cx="8" cy="8" rx="5.6" ry="2.1"/><ellipse cx="8" cy="8" rx="2.1" ry="5.6"/>',
+	modeRadial: '<circle cx="8" cy="8" r="1.1" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r="3.3"/><circle cx="8" cy="8" r="5.8" stroke-dasharray="2.2 1.7"/>',
+	modeStress: '<path d="M2.8 4.6c3.4-1 7-1 10.4 0M2.8 8c3.4-1 7-1 10.4 0M2.8 11.4c3.4-1 7-1 10.4 0M4.4 3.6c-.8 3-.8 6 0 9M8 3v9.6M11.6 3.6c.8 3 .8 6 0 9"/>',
 };
 
 export function icon( name, size = 16 ) {
@@ -176,8 +278,57 @@ export function accentFor( name ) {
 
 }
 
+/** The structure preset that the two parameters match, or 'custom'. */
+export function structurePreset( s ) {
+
+	const p = STRUCTURE_PRESETS.find( ( q ) => Math.abs( q.clusterSeparation - s.clusterSeparation ) < 1e-6 && Math.abs( q.cohesion - s.cohesion ) < 1e-6 );
+	return p ? p.value : 'custom';
+
+}
+
+/** One line about a look ( an id of LOOKS, or 'custom' ): what it sets together. */
+export function lookText( id ) {
+
+	const look = LOOKS.find( ( l ) => l.value === id );
+	return look ? look.hint : 'Your own mix of theme, palette and effects';
+
+}
+
+/** Keys of the panel layout, per section (the schema's `section` must agree; see the tests). */
+export function layoutKeys( layout = PANEL_LAYOUT ) {
+
+	const out = {};
+	const walk = ( items, list ) => {
+
+		for ( const it of items ) {
+
+			if ( typeof it === 'string' ) list.push( it );
+			else if ( it.type === 'group' ) walk( it.items, list );
+			else if ( it.type === 'actions' ) {
+
+				for ( const a of it.items ) if ( a.key ) list.push( a.key );
+
+			} else if ( it.key ) list.push( it.key );
+			else if ( it.type === 'dataset' ) list.push( 'dataset' );
+
+		}
+
+	};
+
+	for ( const sec of layout ) walk( sec.items, ( out[ sec.id ] = [] ) );
+	return out;
+
+}
+
 const fmtInt = ( n ) => ( n === undefined || n === null || Number.isNaN( n ) ? '–' : Math.round( n ).toLocaleString( 'en-US' ) );
 const decimals = ( step ) => ( step >= 1 ? 0 : Math.min( 3, Math.ceil( - Math.log10( step ) - 1e-9 ) ) );
+const listFormats = ( formats ) => {
+
+	const ext = [];
+	for ( const f of formats || [] ) for ( const e of f.extensions || [] ) if ( ! ext.includes( e ) ) ext.push( e );
+	return ext;
+
+};
 
 let uid = 0;
 
@@ -185,23 +336,30 @@ export class Panel {
 
 	constructor( options = {} ) {
 
-		this.options = { container: document.body, title: 'Graph · WebGPU', credit: CREDIT, generators: [], schema: SETTINGS_SCHEMA, ...options };
+		this.options = { container: typeof document !== 'undefined' ? document.body : null, title: 'Graph · WebGPU', credit: CREDIT, generators: [], layout: PANEL_LAYOUT, ...options };
 		this.settings = options.settings || { ...DEFAULT_SETTINGS };
 		this.onChange = options.onChange || null;
+		this._write = options.write || null;
 		this.onAction = options.onAction || null;
 		this.onOpenFile = options.onOpenFile || null;
 		this.onInsets = options.onInsets || null;
 		this.manifest = options.manifest || null;
 		this.generators = options.generators || [];
+		this.features = { ...( options.features || {} ) };
+		this.info = { features: this.features };
+		this.help = options.help || null;
+		this.ui = options.ui || null;
 		this.collapsed = false;
 		this.isSheet = false;
-		this.helpVisible = false;
 		this._bindings = [];
+		this._byKey = new Map();
 		this._sections = {};
 		this._lastStats = 0;
 		this._customDataset = null;
 		this._genState = {};
 		this._genModel = null;
+		this._pending = new Map(); // slider changes waiting for the next frame
+		this._raf = 0;
 		this._build();
 		this.setAccent( this.settings.palette );
 		this.refresh();
@@ -210,27 +368,59 @@ export class Panel {
 
 	// ── public API ────────────────────────────────────────────────────────────────────────
 
+	get helpVisible() {
+
+		return !! this.help?.visible;
+
+	}
+
 	set( key, value ) {
 
-		this.settings[ key ] = value;
-		this.refresh();
+		if ( ! this._write ) this.settings[ key ] = value; // with a writer the settings are its to change
+		this._pending.delete( key );
+		if ( key === 'palette' ) this.setAccent( this.settings[ key ] );
+		this._sync( key );
 
 	}
 
 	refresh() {
 
-		for ( const b of this._bindings ) {
+		for ( const b of this._bindings ) this._syncBinding( b );
+		this._syncSummaries();
 
-			b.sync?.( this.settings );
-			if ( b.visible && b.row ) {
+	}
 
-				const show = !! b.visible( this.settings );
-				b.row.classList.toggle( 'is-hidden', ! show );
-				b.row.toggleAttribute( 'inert', ! show );
+	setFeatures( features = {} ) {
 
-			}
+		Object.assign( this.features, features );
+		if ( features.formats ) this._syncFormats();
+		this.refresh();
+
+	}
+
+	setInfo( info = {} ) {
+
+		let changed = false;
+		for ( const [ k, v ] of Object.entries( info ) ) {
+
+			if ( k === 'features' ) continue;
+			const a = this.info[ k ];
+			if ( a === v || ( a && v && typeof a === 'object' && JSON.stringify( a ) === JSON.stringify( v ) ) ) continue;
+			this.info[ k ] = v;
+			changed = true;
 
 		}
+
+		if ( ! changed ) return;
+		// live rows show the info; for every other control only its visibility can depend on it
+		for ( const b of this._bindings ) if ( b.live || b.visible ) this._syncBinding( b, ! b.live );
+		this._syncSummaries();
+
+	}
+
+	openSection( id, open = true ) {
+
+		this._sections[ id ]?.setOpen( open, true );
 
 	}
 
@@ -251,9 +441,10 @@ export class Panel {
 
 	setDatasetInfo( info ) {
 
-		this._customDataset = info || null;
+		this._customDataset = info && ! this.manifest?.datasets?.some( ( d ) => d.id === info.id ) ? info : null;
 		this._fillDatasets();
-		if ( info && info.id ) this.settings.dataset = info.id;
+		if ( info && info.id && ! this._write ) this.settings.dataset = info.id;
+		this._liveDataset = info || null;
 		this.refresh();
 
 	}
@@ -264,18 +455,17 @@ export class Panel {
 		if ( ! force && now - this._lastStats < 480 ) return;
 		this._lastStats = now;
 		const s = this._stats;
-		s.nodes.textContent = fmtInt( stats.nodes );
-		s.edges.textContent = fmtInt( stats.edges );
-		s.clusters.textContent = stats.clusters !== undefined ? `${fmtInt( stats.clusters )}` : '–';
-		s.levels.textContent = stats.levels !== undefined ? `${stats.levels}` : '–';
-		s.fps.textContent = stats.fps ? Math.round( stats.fps ) : '–';
-		const running = stats.running ?? this.settings.running;
-		const alpha = Math.max( 0, Math.min( 1, stats.alpha ?? 0 ) );
-		this._state.classList.toggle( 'is-running', !! running && alpha > 0.002 );
-		s.status.textContent = running ? ( alpha > 0.002 ? 'Layout running' : 'Layout settled' ) : 'Layout paused';
-		s.alpha.textContent = stats.alpha !== undefined ? `α ${alpha.toFixed( 3 )}` : '';
-		s.alphaBar.style.transform = `scaleX(${Math.sqrt( alpha ).toFixed( 3 )})`;
-		this._barCounts.textContent = stats.nodes !== undefined ? `${fmtInt( stats.nodes )} · ${fmtInt( stats.edges )}` : '';
+		const text = ( el, t ) => {
+
+			if ( el.textContent !== t ) el.textContent = t;
+
+		};
+
+		text( s.nodes, fmtInt( stats.nodes ) );
+		text( s.edges, fmtInt( stats.edges ) );
+		text( s.communities, stats.communities !== undefined ? fmtInt( stats.communities ) : '–' );
+		text( s.levels, stats.levels !== undefined ? `${stats.levels}` : '–' );
+		text( this._barCounts, stats.nodes !== undefined ? `${fmtInt( stats.nodes )} · ${fmtInt( stats.edges )}` : '' );
 
 	}
 
@@ -299,11 +489,12 @@ export class Panel {
 
 	}
 
-	toast( message, { type = 'error', duration = 5200 } = {} ) {
+	toast( message, { type = 'error', duration = 5200, action = null } = {} ) {
 
+		const act = action && typeof action.run === 'function' ? h( 'button.wgv-link.wgv-toast-act', { type: 'button' }, action.label || 'Undo' ) : null;
+		const close = h( 'button.wgv-icon.wgv-toast-x', { type: 'button', 'aria-label': 'Dismiss', html: icon( 'close', 14 ) } );
 		const el = h( 'div.wgv-toast.wgv-glass', { role: type === 'error' ? 'alert' : 'status', 'data-type': type },
-			h( 'i.wgv-toast-dot' ), h( 'span', null, String( message ) ),
-			h( 'button.wgv-icon.wgv-toast-x', { 'aria-label': 'Dismiss', html: icon( 'close', 14 ) } ) );
+			h( 'i.wgv-toast-dot' ), h( 'span', null, String( message ) ), act, close );
 		const remove = () => {
 
 			el.classList.remove( 'is-in' );
@@ -311,7 +502,13 @@ export class Panel {
 
 		};
 
-		el.querySelector( 'button' ).addEventListener( 'click', remove );
+		close.addEventListener( 'click', remove );
+		act?.addEventListener( 'click', () => {
+
+			remove();
+			action.run();
+
+		} );
 		this._toasts.append( el );
 		while ( this._toasts.children.length > 4 ) this._toasts.firstChild.remove();
 		requestAnimationFrame( () => el.classList.add( 'is-in' ) );
@@ -322,16 +519,13 @@ export class Panel {
 
 	showHelp( on = true ) {
 
-		this.helpVisible = !! on;
-		this._help.classList.toggle( 'is-visible', this.helpVisible );
-		this._help.toggleAttribute( 'inert', ! this.helpVisible );
-		if ( this.helpVisible ) this._help.querySelector( 'button' )?.focus( { preventScroll: true } );
+		this.help?.show( on );
 
 	}
 
 	toggleHelp() {
 
-		this.showHelp( ! this.helpVisible );
+		this.help?.toggle();
 
 	}
 
@@ -340,7 +534,7 @@ export class Panel {
 		this.collapsed = !! on;
 		this.panel.classList.toggle( 'is-collapsed', this.collapsed );
 		this._collapseBtn.setAttribute( 'aria-expanded', String( ! this.collapsed ) );
-		this._collapseBtn.setAttribute( 'aria-label', this.collapsed ? 'Expand panel' : 'Collapse panel' );
+		this._collapseBtn.setAttribute( 'aria-label', this.collapsed ? 'Expand settings' : 'Collapse settings' );
 		this._body.toggleAttribute( 'inert', this.collapsed );
 		// phones: an open sheet owns the screen (the node card steps aside, see ui.css)
 		document.documentElement.classList.toggle( 'wgv-sheet-open', this.isSheet && ! this.collapsed );
@@ -390,22 +584,42 @@ export class Panel {
 	dispose() {
 
 		this._mq?.removeEventListener?.( 'change', this._onMq );
-		window.removeEventListener( 'keydown', this._onKey, true );
 		window.removeEventListener( 'resize', this._onResize );
+		cancelAnimationFrame( this._raf );
 		this.root.remove();
 		document.documentElement.style.removeProperty( '--wgv-sheet-h' );
-		document.documentElement.classList.remove( 'wgv-sheet-open', 'wgv-drop-active' );
+		document.documentElement.classList.remove( 'wgv-sheet-open' );
 
 	}
 
-	// ── building ──────────────────────────────────────────────────────────────────────────
+	// ── change plumbing ───────────────────────────────────────────────────────────────────
 
 	_change( key, value ) {
 
-		this.settings[ key ] = value;
-		if ( key === 'palette' ) this.setAccent( value );
-		this.refresh();
-		this.onChange?.( key, value, this.settings );
+		// the owner of the settings writes them (a store validates the value, remembers the choice
+		// and tells its listeners); a panel over a plain object writes it itself
+		if ( this._write ) this._write( key, value );
+		else this.settings[ key ] = value;
+		const v = this.settings[ key ];
+		if ( key === 'palette' ) this.setAccent( v );
+		this._sync( key );
+		this.onChange?.( key, v, this.settings );
+
+	}
+
+	/** Slider drags: paint now, apply once per frame. */
+	_queue( key, value ) {
+
+		this._pending.set( key, value );
+		if ( this._raf ) return;
+		this._raf = requestAnimationFrame( () => {
+
+			this._raf = 0;
+			const pending = [ ...this._pending ];
+			this._pending.clear();
+			for ( const [ k, v ] of pending ) this._change( k, v );
+
+		} );
 
 	}
 
@@ -415,13 +629,76 @@ export class Panel {
 
 	}
 
+	/** Re-syncs what depends on one key: its own controls, visibility rules, summaries. */
+	_sync( key ) {
+
+		for ( const b of this._byKey.get( key ) || [] ) this._syncBinding( b );
+		for ( const b of this._bindings ) if ( b.key !== key && ( b.visible || b.live ) ) this._syncBinding( b, ! b.live );
+		this._syncSummaries();
+
+	}
+
+	_syncBinding( b, visibilityOnly = false ) {
+
+		if ( b.visible && b.row ) {
+
+			const show = !! b.visible( this.settings, this.features, this.info );
+			if ( show !== b._shown ) {
+
+				b._shown = show;
+				b.row.classList.toggle( 'is-hidden', ! show );
+				b.row.toggleAttribute( 'inert', ! show );
+
+			}
+
+		}
+
+		if ( ! visibilityOnly ) b.sync?.( this.settings );
+
+	}
+
+	_syncSummaries() {
+
+		for ( const id in this._sections ) {
+
+			const sec = this._sections[ id ];
+			if ( ! sec.summary ) continue;
+			let text = '';
+			try {
+
+				text = sec.summary( this.settings, this.info ) || '';
+
+			} catch ( _ ) { /* a summary must never break the panel */ }
+
+			if ( text !== sec._text ) {
+
+				sec._text = text;
+				sec.summaryEl.textContent = text;
+
+			}
+
+			// a section whose controls are all hidden disappears
+			const any = sec.rows.some( ( b ) => ! b.visible || b._shown !== false );
+			if ( any !== sec._any ) {
+
+				sec._any = any;
+				sec.el.classList.toggle( 'is-empty', ! any );
+
+			}
+
+		}
+
+	}
+
+	// ── building ──────────────────────────────────────────────────────────────────────────
+
 	_build() {
 
 		const o = this.options;
 		this.root = h( 'div.wgv-ui' );
 
 		// header
-		this._collapseBtn = h( 'button.wgv-icon.wgv-collapse', { 'aria-label': 'Collapse panel', 'aria-expanded': 'true', html: icon( 'chevron' ), onclick: ( e ) => {
+		this._collapseBtn = h( 'button.wgv-icon.wgv-collapse', { 'aria-label': 'Collapse settings', 'aria-expanded': 'true', html: icon( 'chevron' ), onclick: ( e ) => {
 
 			e.stopPropagation();
 			this.setCollapsed( ! this.collapsed );
@@ -437,19 +714,13 @@ export class Panel {
 				h( 'div.wgv-brand-text',
 					h( 'div.wgv-title', null, t1, t2 ? h( 'span.wgv-title-sep', null, '·' ) : null, t2 ? h( 'span.wgv-title-2', null, t2 ) : null ),
 					h( 'div.wgv-sub', null, this._dsName, this._barCounts ) ) ),
-			h( 'div.wgv-head-btns',
-				h( 'button.wgv-icon', { 'aria-label': 'Keyboard and gestures', title: 'Help (?)', html: icon( 'help' ), onclick: ( e ) => {
-
-					e.stopPropagation();
-					this.toggleHelp();
-
-				} } ),
-				this._collapseBtn ) );
+			h( 'div.wgv-head-btns', null, this._collapseBtn ) );
 
 		// body
 		this._body = h( 'div.wgv-body' );
 		const scroller = h( 'div.wgv-scroll' );
-		for ( const sec of o.schema ) scroller.append( this._buildSection( sec ) );
+		const titles = Object.fromEntries( SECTIONS.map( ( s ) => [ s.id, s.title ] ) );
+		for ( const sec of o.layout ) scroller.append( this._buildSection( { title: titles[ sec.id ] || cap( sec.id ), ...sec } ) );
 		scroller.append( this._buildFooter() );
 		this._body.append( h( 'div.wgv-body-inner', null, scroller ) );
 
@@ -460,19 +731,6 @@ export class Panel {
 		this._setupResponsive();
 		this._setupSheetDrag();
 
-		this._onKey = ( e ) => {
-
-			if ( e.key === 'Escape' && this.helpVisible ) {
-
-				this.showHelp( false );
-				e.preventDefault();
-
-			}
-
-		};
-
-		window.addEventListener( 'keydown', this._onKey, true );
-
 	}
 
 	_buildSection( sec ) {
@@ -481,40 +739,80 @@ export class Panel {
 		const content = h( 'div.wgv-sec-c', { id } );
 		const inner = h( 'div.wgv-sec-inner' );
 		content.append( inner );
-		const btn = h( 'button.wgv-sec-h', { 'aria-expanded': String( ! sec.collapsed ), 'aria-controls': id },
-			h( 'span', null, sec.title ), h( 'span.wgv-sec-chev', { html: icon( 'chevron', 14 ) } ) );
+		const summaryEl = h( 'span.wgv-sec-sum' );
+		const btn = h( 'button.wgv-sec-h', { 'aria-expanded': 'true', 'aria-controls': id },
+			h( 'span.wgv-sec-t', null, sec.title ), summaryEl, h( 'span.wgv-sec-chev', { html: icon( 'chevron', 14 ) } ) );
 		const el = h( 'section.wgv-sec', { 'data-section': sec.id }, btn, content );
-		const setOpen = ( open ) => {
+		const setOpen = ( open, remember = false ) => {
 
 			el.classList.toggle( 'is-closed', ! open );
 			btn.setAttribute( 'aria-expanded', String( open ) );
 			content.toggleAttribute( 'inert', ! open );
+			if ( remember ) this._remember( 'sec:' + sec.id, open );
 
 		};
 
-		btn.addEventListener( 'click', () => setOpen( el.classList.contains( 'is-closed' ) ) );
-		setOpen( ! sec.collapsed );
-		this._sections[ sec.id ] = { el, setOpen };
-		for ( const item of sec.items ) {
+		btn.addEventListener( 'click', () => setOpen( el.classList.contains( 'is-closed' ), true ) );
+		setOpen( this._recall( 'sec:' + sec.id, !! sec.open ) );
+		const first = this._bindings.length;
+		this._buildItems( sec.items, inner );
+		this._sections[ sec.id ] = { el, setOpen, summary: sec.summary || null, summaryEl, rows: this._bindings.slice( first ).filter( ( b ) => b.row && b.top ) };
+		return el;
 
+	}
+
+	_recall( name, fallback ) {
+
+		const all = this.ui?.get( 'open' );
+		return all && typeof all[ name ] === 'boolean' ? all[ name ] : fallback;
+
+	}
+
+	_remember( name, open ) {
+
+		if ( ! this.ui ) return;
+		this.ui.set( 'open', { ...( this.ui.get( 'open' ) || {} ), [ name ]: open } );
+
+	}
+
+	_buildItems( items, parent, top = true ) {
+
+		for ( const raw of items ) {
+
+			const item = typeof raw === 'string' ? { key: raw } : raw;
+			const before = this._bindings.length;
 			const row = this._buildItem( item );
-			if ( row ) inner.append( row );
+			if ( ! row ) continue;
+			for ( const b of this._bindings.slice( before ) ) if ( b.row === row ) b.top = top;
+			parent.append( row );
 
 		}
-
-		return el;
 
 	}
 
 	_buildItem( item ) {
 
-		switch ( item.type ) {
+		const spec = item.key ? settingSpec( item.key ) : null;
+		let type = item.type;
+		if ( ! type && spec ) type = spec.type === 'number' ? 'slider' : spec.type === 'enum' ? 'segmented' : spec.type === 'bool' ? 'toggle' : null;
+		// the schema's visibility (feature flag + rule) and the item's own rule
+		const visible = spec && ( spec.needs || spec.visible ) || item.visible
+			? ( s, f, info ) => ( ! spec || isVisible( spec, s, f ) ) && ( ! item.visible || item.visible( s, f, info ) )
+			: null;
+		const merged = spec ? { label: spec.label, hint: spec.hint, min: spec.min, max: spec.max, step: spec.step, log: spec.log, format: spec.format, options: spec.options, ...item, visible } : { ...item, visible };
+		switch ( type ) {
 
-			case 'slider': return this._slider( item );
-			case 'segmented': return this._segmented( item );
-			case 'toggle': return this._toggle( item );
-			case 'palette': return this._palette( item );
-			case 'actions': return this._actions( item );
+			case 'slider': return this._slider( merged );
+			case 'segmented': return this._segmented( merged );
+			case 'toggle': return this._toggle( merged );
+			case 'palette': return this._palette( { ...merged, options: ( merged.options || [] ).map( ( o ) => o.value ?? o ) } );
+			case 'choice': return this._choice( merged );
+			case 'actions': return this._actions( merged );
+			case 'preset': return this._preset( merged );
+			case 'look': return this._look( merged );
+			case 'note': return this._note( merged );
+			case 'status': return this._status( merged );
+			case 'group': return this._group( merged );
 			case 'dataset': return this._dataset();
 
 		}
@@ -526,6 +824,13 @@ export class Panel {
 	_bind( binding ) {
 
 		this._bindings.push( binding );
+		if ( binding.key ) {
+
+			if ( ! this._byKey.has( binding.key ) ) this._byKey.set( binding.key, [] );
+			this._byKey.get( binding.key ).push( binding );
+
+		}
+
 		return binding.row;
 
 	}
@@ -541,24 +846,26 @@ export class Panel {
 			let v = log ? item.min * Math.pow( item.max / item.min, s / 1000 ) : s;
 			const step = item.step ?? 0.01;
 			v = Math.round( v / step ) * step;
-			return + v.toFixed( dec );
+			return Math.min( item.max, Math.max( item.min, + v.toFixed( Math.max( dec, 3 ) ) ) );
 
 		};
 
-		const input = h( 'input.wgv-range', { id, type: 'range', min: log ? 0 : item.min, max: log ? 1000 : item.max, step: log ? 1 : ( item.step ?? 0.01 ) } );
+		const lo = log ? 0 : item.min, hi = log ? 1000 : item.max;
+		const input = h( 'input.wgv-range', { id, type: 'range', min: lo, max: hi, step: log ? 1 : ( item.step ?? 0.01 ) } );
 		const out = h( 'output.wgv-val', { for: id } );
-		const label = h( 'label.wgv-l', { for: id, title: 'Double-click to reset' }, item.label );
+		const label = h( 'label.wgv-l', { for: id, title: [ item.hint, 'Double-click to reset' ].filter( Boolean ).join( ' · ' ) }, item.label );
 		const row = h( 'div.wgv-row.wgv-slider', null, label, input, out );
 		const getV = get || ( () => this.settings[ item.key ] );
-		const setV = set || ( ( v ) => this._change( item.key, v ) );
-		const def = defaultValue ?? DEFAULT_SETTINGS[ item.key ];
 		const fmt = item.format || ( ( v ) => ( dec === 0 ? fmtInt( v ) : Number( v ).toFixed( dec ) ) );
+		let shown;
 		const paint = ( v ) => {
 
-			const s = toSlider( v );
-			const lo = + input.min, hi = + input.max;
-			input.style.setProperty( '--p', `${( ( 100 * ( s - lo ) ) / ( hi - lo || 1 ) ).toFixed( 2 )}%` );
-			out.textContent = fmt( v );
+			if ( v === shown ) return;
+			shown = v;
+			input.style.setProperty( '--p', `${( ( 100 * ( toSlider( v ) - lo ) ) / ( hi - lo || 1 ) ).toFixed( 2 )}%` );
+			const text = fmt( v );
+			out.textContent = text;
+			input.setAttribute( 'aria-valuetext', text );
 
 		};
 
@@ -566,24 +873,52 @@ export class Panel {
 
 			const v = fromSlider( + input.value );
 			paint( v );
-			setV( v );
+			if ( set ) set( v );
+			else this._queue( item.key, v );
 
 		} );
+		if ( log ) {
+
+			// a log slider runs over 0…1000 while its value is rounded to `step`: one native arrow
+			// step would change nothing. The keys move by an even share of the range instead (about
+			// 60 presses end to end), and by at least one value step
+			const step = item.step ?? 0.01;
+			const presses = Math.max( 8, Math.min( 60, Math.round( Math.log( item.max / item.min ) / Math.log( 1 + step / Math.sqrt( item.min * item.max ) ) ) ) );
+			input.addEventListener( 'keydown', ( e ) => {
+
+				const d = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: - 1, ArrowDown: - 1, PageUp: 5, PageDown: - 5 }[ e.key ];
+				if ( ! d || e.ctrlKey || e.metaKey || e.altKey ) return;
+				e.preventDefault();
+				const cur = fromSlider( + input.value );
+				let next = fromSlider( Math.min( 1000, Math.max( 0, toSlider( cur ) + ( d * 1000 ) / presses ) ) );
+				if ( Math.sign( next - cur ) !== Math.sign( d ) ) next = Math.min( item.max, Math.max( item.min, + ( cur + Math.sign( d ) * step ).toFixed( Math.max( dec, 3 ) ) ) );
+				if ( next === cur ) return;
+				input.value = toSlider( next );
+				input.dispatchEvent( new Event( 'input', { bubbles: true } ) );
+
+			} );
+
+		}
+
 		label.addEventListener( 'dblclick', () => {
 
-			if ( def === undefined ) return;
-			input.value = toSlider( def );
-			paint( def );
-			setV( def );
+			if ( set ) {
+
+				if ( defaultValue === undefined ) return;
+				input.value = toSlider( defaultValue );
+				paint( defaultValue );
+				set( defaultValue );
+
+			} else this._action( 'reset-setting', item.key );
 
 		} );
 		return this._bind( {
-			row, visible: item.visible,
+			row, key: item.key, visible: item.visible,
 			sync: () => {
 
-				const v = getV();
-				if ( v === undefined ) return;
-				if ( document.activeElement !== input ) input.value = toSlider( v );
+				const v = this._pending.has( item.key ) ? this._pending.get( item.key ) : getV();
+				if ( v === undefined || v === null ) return;
+				if ( document.activeElement !== input || ! this._pending.size ) input.value = toSlider( v );
 				paint( v );
 
 			},
@@ -595,43 +930,64 @@ export class Panel {
 
 		const n = item.options.length;
 		const seg = h( 'div.wgv-seg', { role: 'radiogroup', 'aria-label': item.label || item.key, style: { '--n': n } } );
+		const choose = ( value ) => ( set ? set( value ) : this._change( item.key, value ) );
 		const buttons = item.options.map( ( opt, i ) => {
 
-			const b = h( 'button', { role: 'radio', 'aria-checked': 'false', 'data-value': String( opt.value ) }, opt.label );
-			b.addEventListener( 'click', () => ( set ? set( opt.value ) : this._change( item.key, opt.value ) ) );
+			const b = h( 'button', { role: 'radio', 'aria-checked': 'false', 'data-value': String( opt.value ), title: opt.hint || null }, opt.label );
+			b.addEventListener( 'click', () => choose( opt.value ) );
 			b.addEventListener( 'keydown', ( e ) => {
 
-				const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? - 1 : 0;
+				const d = e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? - 1 : 0;
 				if ( ! d ) return;
 				e.preventDefault();
-				const next = item.options[ ( i + d + n ) % n ];
-				set ? set( next.value ) : this._change( item.key, next.value );
-				buttons[ ( i + d + n ) % n ].focus();
+				let j = i;
+				do j = ( j + d + n ) % n; while ( buttons[ j ].hidden && j !== i );
+				choose( item.options[ j ].value );
+				buttons[ j ].focus();
 
 			} );
 			seg.append( b );
 			return b;
 
 		} );
-		const row = item.label
-			? h( 'div.wgv-row.wgv-segrow', null, h( 'span.wgv-l', null, item.label ), seg )
-			: h( 'div.wgv-row.wgv-segrow.is-full' + ( item.big ? '.is-big' : '' ), null, seg );
+		const full = item.full || ! item.label;
+		// a setting of the schema goes back to its default (and to its automatic choice) by a double click on its name
+		const resettable = !! item.key && ! set;
+		const name = full
+			? ( item.caption ? h( 'span.wgv-caption', { title: resettable ? 'Double-click to reset' : null }, item.caption ) : null )
+			: h( 'span.wgv-l', { title: [ item.hint, resettable ? 'Double-click to reset' : null ].filter( Boolean ).join( ' · ' ) || null }, item.label );
+		if ( name && resettable ) name.addEventListener( 'dblclick', () => this._action( 'reset-setting', item.key ) );
+		const row = full
+			? h( 'div.wgv-row.wgv-segrow.is-full' + ( item.big ? '.is-big' : '' ) + ( item.caption ? '.has-caption' : '' ), null, name, seg )
+			: h( 'div.wgv-row.wgv-segrow', null, name, seg );
 		const getV = get || ( () => this.settings[ item.key ] );
 		return this._bind( {
-			row, visible: item.visible,
+			row, key: item.key, visible: item.visible, live: item.live,
 			sync: () => {
 
 				const v = getV();
-				let idx = 0;
+				// options whose feature is missing are not offered (the thumb counts the shown ones)
+				let idx = - 1, first = - 1, shown = 0;
 				buttons.forEach( ( b, i ) => {
 
-					const on = item.options[ i ].value === v;
+					const opt = item.options[ i ];
+					const hide = !! opt.needs && ! this.features[ opt.needs ];
+					if ( b.hidden !== hide ) b.hidden = hide;
+					const on = opt.value === v;
 					b.setAttribute( 'aria-checked', String( on ) );
-					b.tabIndex = on ? 0 : - 1;
-					if ( on ) idx = i;
+					if ( hide ) return;
+					if ( first < 0 ) first = i;
+					if ( on ) idx = shown;
+					b._on = on;
+					shown ++;
 
 				} );
-				seg.style.setProperty( '--i', idx );
+				// roving tabindex: the checked option, or the first when none matches ("custom")
+				buttons.forEach( ( b, i ) => ( b.tabIndex = ! b.hidden && ( idx >= 0 ? b._on : i === first ) ? 0 : - 1 ) );
+				seg.classList.toggle( 'is-none', idx < 0 );
+				seg.classList.toggle( 'is-dense', shown >= 5 );
+				seg.style.setProperty( '--n', Math.max( 1, shown ) );
+				seg.style.setProperty( '--i', Math.max( 0, idx ) );
 
 			},
 		} );
@@ -641,8 +997,8 @@ export class Panel {
 	_toggle( item, { get, set } = {} ) {
 
 		const sw = h( 'i.wgv-switch', { 'aria-hidden': 'true' } );
-		const row = h( 'button.wgv-row.wgv-toggle', { role: 'switch', 'aria-checked': 'false' },
-			h( 'span.wgv-l', null, item.label, item.hint ? h( 'small.wgv-hint-inline', null, item.hint ) : null ), sw );
+		const row = h( 'button.wgv-row.wgv-toggle', { role: 'switch', 'aria-checked': 'false', title: item.hint || null },
+			h( 'span.wgv-l', null, item.label ), sw );
 		const getV = get || ( () => this.settings[ item.key ] );
 		row.addEventListener( 'click', () => {
 
@@ -651,7 +1007,7 @@ export class Panel {
 
 		} );
 		return this._bind( {
-			row, visible: item.visible,
+			row, key: item.key, visible: item.visible,
 			sync: () => row.setAttribute( 'aria-checked', String( !! getV() ) ),
 		} );
 
@@ -660,24 +1016,74 @@ export class Panel {
 	_palette( item ) {
 
 		const wrap = h( 'div.wgv-swatches', { role: 'radiogroup', 'aria-label': item.label } );
-		const name = h( 'span.wgv-swatch-name' );
 		const buttons = item.options.map( ( p ) => {
 
 			const stops = [];
 			for ( let k = 0; k <= 6; k ++ ) stops.push( paletteCss( p, k / 6 ) );
-			const b = h( 'button.wgv-swatch', { role: 'radio', title: PALETTES[ p ]?.label || p, 'aria-label': PALETTES[ p ]?.label || p, style: { '--g': `linear-gradient(90deg, ${stops.join( ', ' )})` } } );
+			const b = h( 'button.wgv-swatch', { role: 'radio', title: paletteLabel( p ), 'aria-label': paletteLabel( p ), style: { '--g': `linear-gradient(90deg, ${stops.join( ', ' )})` } } );
 			b.addEventListener( 'click', () => this._change( item.key, p ) );
 			wrap.append( b );
 			return b;
 
 		} );
-		const row = h( 'div.wgv-row.wgv-palette', null, h( 'span.wgv-l', null, item.label, name ), wrap );
+		const name = h( 'span.wgv-l', { title: 'Double-click to reset' }, item.label );
+		name.addEventListener( 'dblclick', () => this._action( 'reset-setting', item.key ) );
+		const row = h( 'div.wgv-row.wgv-palette', null, name, wrap );
 		return this._bind( {
-			row, visible: item.visible,
+			row, key: item.key, visible: item.visible,
+			sync: ( s ) => buttons.forEach( ( b, i ) => b.setAttribute( 'aria-checked', String( item.options[ i ] === s[ item.key ] ) ) ),
+		} );
+
+	}
+
+	/** Icon tiles for a handful of exclusive modes, with one line that describes the current one. */
+	_choice( item ) {
+
+		const n = item.options.length;
+		const tiles = h( 'div.wgv-tiles', { role: 'radiogroup', 'aria-label': item.label, style: { '--n': n } } );
+		const desc = h( 'span.wgv-choice-t' );
+		const spin = h( 'i.wgv-spinner.wgv-spinner-sm', { hidden: true } );
+		const describe = ( value ) => {
+
+			const d = item.describe ? item.describe( value, this.settings, this.info ) : null;
+			const text = d ? d.text || '' : '';
+			if ( desc.textContent !== text ) desc.textContent = text;
+			spin.hidden = ! ( d && d.busy );
+
+		};
+
+		const buttons = item.options.map( ( opt, i ) => {
+
+			const b = h( 'button.wgv-tile', { role: 'radio', 'aria-checked': 'false', 'data-value': String( opt.value ), title: LAYOUT_TEXT[ opt.value ] || null },
+				h( 'span.wgv-tile-i', { html: icon( item.icons?.[ opt.value ] || 'spark', 18 ) } ), h( 'span.wgv-tile-l', null, item.labels?.[ opt.value ] || opt.label ) );
+			b.addEventListener( 'click', () => this._change( item.key, opt.value ) );
+			b.addEventListener( 'keydown', ( e ) => {
+
+				const d = e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? - 1 : 0;
+				if ( ! d ) return;
+				e.preventDefault();
+				const j = ( i + d + n ) % n;
+				this._change( item.key, item.options[ j ].value );
+				buttons[ j ].focus();
+
+			} );
+			tiles.append( b );
+			return b;
+
+		} );
+		const row = h( 'div.wgv-row.wgv-choice', null, tiles, h( 'div.wgv-choice-d', { 'aria-live': 'polite' }, spin, desc ) );
+		return this._bind( {
+			row, key: item.key, visible: item.visible, live: true,
 			sync: ( s ) => {
 
-				buttons.forEach( ( b, i ) => b.setAttribute( 'aria-checked', String( item.options[ i ] === s[ item.key ] ) ) );
-				name.textContent = ( PALETTES[ s[ item.key ] ]?.label || s[ item.key ] || '' ).split( ' (' )[ 0 ];
+				buttons.forEach( ( b, i ) => {
+
+					const on = item.options[ i ].value === s[ item.key ];
+					b.setAttribute( 'aria-checked', String( on ) );
+					b.tabIndex = on ? 0 : - 1;
+
+				} );
+				describe( s[ item.key ] );
 
 			},
 		} );
@@ -696,7 +1102,7 @@ export class Panel {
 
 				b.addEventListener( 'click', () => this._change( a.key, ! this.settings[ a.key ] ) );
 				this._bind( {
-					row: null,
+					row: null, key: a.key,
 					sync: ( s ) => {
 
 						const on = s[ a.key ] ? 1 : 0;
@@ -725,6 +1131,122 @@ export class Panel {
 
 	}
 
+	/** Structure preset: two layout parameters behind one clear choice. */
+	_preset( item ) {
+
+		const row = this._segmented( { label: 'Structure', caption: 'Structure', full: true, options: STRUCTURE_PRESETS, visible: item.visible, live: true }, {
+			get: () => structurePreset( this.settings ),
+			set: ( value ) => {
+
+				const p = STRUCTURE_PRESETS.find( ( q ) => q.value === value );
+				if ( ! p ) return;
+				this._change( 'clusterSeparation', p.clusterSeparation );
+				this._change( 'cohesion', p.cohesion );
+
+			},
+		} );
+		return row;
+
+	}
+
+	/** Whole look: theme, palette, edge style and camera effects behind one choice. Nothing is lit when the settings match no look. */
+	_look( item ) {
+
+		const row = this._segmented( { label: 'Look', caption: 'Look', full: true, options: LOOKS, visible: item.visible, live: true }, {
+			get: () => lookOf( this.settings ),
+			set: ( value ) => this._action( 'look', value ),
+		} );
+		// what the look is, so that it is not mistaken for the theme below it (which it sets, among others)
+		const text = h( 'span.wgv-choice-t' );
+		row.append( h( 'div.wgv-choice-d', { 'aria-live': 'polite' }, text ) );
+		const binding = this._bindings[ this._bindings.length - 1 ];
+		const sync = binding.sync;
+		binding.sync = ( s ) => {
+
+			sync( s );
+			const t = lookText( lookOf( this.settings ) );
+			if ( text.textContent !== t ) text.textContent = t;
+
+		};
+
+		return row;
+
+	}
+
+	_note( item ) {
+
+		const row = h( 'p.wgv-row.wgv-note' + ( item.mono ? '.is-mono' : '' ) );
+		return this._bind( {
+			row, live: true, visible: item.visible,
+			sync: ( s ) => {
+
+				let text = '';
+				try {
+
+					text = item.text( s, this.info ) || '';
+
+				} catch ( _ ) { /* a note must never break the panel */ }
+
+				if ( row.textContent !== text ) row.textContent = text;
+				row.classList.toggle( 'is-blank', ! text );
+
+			},
+		} );
+
+	}
+
+	/** A live state line: spinner while busy, a sentence, optionally one button (cancel, go back). */
+	_status( item ) {
+
+		const text = h( 'span.wgv-status-text' );
+		const spin = h( 'i.wgv-spinner.wgv-spinner-sm' );
+		let action = null;
+		const btn = h( 'button.wgv-btn.wgv-btn-sm', { onclick: () => action && this._action( action.name ) } );
+		const row = h( 'div.wgv-row.wgv-statusrow', { role: 'status' }, spin, text, btn );
+		return this._bind( {
+			row, live: true, visible: () => !! this.info[ item.id ],
+			sync: () => {
+
+				const st = this.info[ item.id ];
+				if ( ! st ) return;
+				if ( text.textContent !== ( st.text || '' ) ) text.textContent = st.text || '';
+				spin.hidden = ! st.busy;
+				row.classList.toggle( 'is-warn', st.tone === 'warn' );
+				action = st.action || null;
+				btn.hidden = ! action;
+				if ( action && btn.textContent !== action.label ) btn.textContent = action.label;
+
+			},
+		} );
+
+	}
+
+	_group( item ) {
+
+		const id = `wgv-grp-${++ uid}`;
+		const inner = h( 'div.wgv-group-inner' );
+		const content = h( 'div.wgv-group-c', { id }, inner );
+		const btn = h( 'button.wgv-group-h', { 'aria-expanded': 'false', 'aria-controls': id }, h( 'span.wgv-group-chev', { html: icon( 'chevron', 12 ) } ), h( 'span', null, item.title ) );
+		const row = h( 'div.wgv-group.is-closed', null, btn, content );
+		const setOpen = ( open, remember = false ) => {
+
+			row.classList.toggle( 'is-closed', ! open );
+			btn.setAttribute( 'aria-expanded', String( open ) );
+			content.toggleAttribute( 'inert', ! open );
+			if ( remember ) this._remember( 'grp:' + item.id, open );
+
+		};
+
+		btn.addEventListener( 'click', () => setOpen( row.classList.contains( 'is-closed' ), true ) );
+		setOpen( this._recall( 'grp:' + item.id, false ) );
+		const first = this._bindings.length;
+		this._buildItems( item.items, inner, false );
+		const kids = this._bindings.slice( first ).filter( ( b ) => b.row );
+		// the group disappears when none of its controls is available
+		return this._bind( { row, visible: () => ( ! item.visible || item.visible( this.settings, this.features, this.info ) ) && kids.some( ( b ) => ! b.visible || b.visible( this.settings, this.features, this.info ) ) } );
+
+	}
+
 	_dataset() {
 
 		const select = h( 'select.wgv-select-el', { 'aria-label': 'Dataset' } );
@@ -732,7 +1254,8 @@ export class Panel {
 		this._dsSelect = select;
 		this._dsMeta = h( 'div.wgv-meta' );
 		this._dsDesc = h( 'div.wgv-desc' );
-		const fileInput = h( 'input', { type: 'file', accept: '.json,.txt,.csv', hidden: true } );
+		const fileInput = h( 'input', { type: 'file', accept: '.json,.txt,.csv', hidden: true, 'aria-hidden': 'true', tabindex: '-1' } );
+		this._fileInput = fileInput;
 		fileInput.addEventListener( 'change', () => {
 
 			const f = fileInput.files && fileInput.files[ 0 ];
@@ -757,6 +1280,7 @@ export class Panel {
 
 		} );
 		this._gen.toggleAttribute( 'inert', true );
+		this._dropHint = h( 'span' );
 		const row = h( 'div.wgv-dataset', null,
 			h( 'div.wgv-select', null, select, h( 'span.wgv-select-chev', { html: icon( 'chevron', 14 ) } ) ),
 			this._dsMeta, this._dsDesc,
@@ -764,11 +1288,25 @@ export class Panel {
 				h( 'button.wgv-btn.wgv-btn-row', { html: `${icon( 'file' )}<span>Open file…</span>`, onclick: () => fileInput.click() } ),
 				this._genBtn ),
 			this._gen,
-			h( 'div.wgv-drop-hint', null, h( 'span', { html: icon( 'drop', 14 ) } ), 'or drop a .json, .txt or .csv file anywhere' ),
+			h( 'div.wgv-drop-hint', null, h( 'span', { html: icon( 'drop', 14 ) } ), this._dropHint ),
 			fileInput );
 		this._fillDatasets();
 		this._buildGenerator();
-		return this._bind( { row, sync: ( s ) => this._syncDataset( s ) } );
+		this._syncFormats();
+		return this._bind( { row, key: 'dataset', sync: ( s ) => this._syncDataset( s ) } );
+
+	}
+
+	/** Drop hint and the file dialog's filter follow the formats the data layer reads. */
+	_syncFormats() {
+
+		if ( ! this._dropHint ) return;
+		const ext = listFormats( this.features.formats );
+		const list = ext.length ? ext : [ '.json', '.txt', '.csv' ];
+		this._fileInput.setAttribute( 'accept', list.join( ',' ) );
+		const shown = list.slice( 0, 6 ).join( ' ' ) + ( list.length > 6 ? ' …' : '' );
+		this._dropHint.textContent = `or drop a file anywhere: ${shown}`;
+		this._dropHint.title = ( this.features.formats || [] ).map( ( f ) => `${f.name} (${( f.extensions || [] ).join( ', ' )})` ).join( '\n' );
 
 	}
 
@@ -806,14 +1344,16 @@ export class Panel {
 
 		}
 
-		if ( ! select.options.length ) add( '_none', 'Datasets', '', 'Loading…' );
+		if ( ! select.options.length ) add( '_none', 'Datasets', '', m ? 'No built-in datasets' : 'Loading…' );
 
 	}
 
 	_datasetInfo( id ) {
 
 		if ( this._customDataset && this._customDataset.id === id ) return this._customDataset;
-		return this.manifest?.datasets?.find( ( d ) => d.id === id ) || null;
+		const entry = this.manifest?.datasets?.find( ( d ) => d.id === id ) || null;
+		// counts of the graph on screen win over the manifest's (re-clustering changes the levels)
+		return entry && this._liveDataset && this._liveDataset.id === id ? { ...entry, ...this._liveDataset, name: entry.name } : entry;
 
 	}
 
@@ -872,6 +1412,15 @@ export class Panel {
 		if ( model.description ) box.append( h( 'div.wgv-desc', null, model.description ) );
 		const state = this._genState[ model.id ];
 		const rows = [];
+		// generator controls are private to the form: built with the same widgets, never bound to settings
+		const local = ( build ) => {
+
+			const n = this._bindings.length;
+			build();
+			return this._bindings.splice( n )[ 0 ];
+
+		};
+
 		for ( const p of model.params || [] ) {
 
 			const get = () => state[ p.key ];
@@ -883,21 +1432,12 @@ export class Panel {
 			};
 
 			let b;
-			if ( p.type === 'select' ) {
-
-				this._segmented( { label: p.label, options: p.options }, { get, set } );
-				b = this._bindings.pop();
-
-			} else if ( p.type === 'bool' ) {
-
-				this._toggle( { label: p.label }, { get, set } );
-				b = this._bindings.pop();
-
-			} else {
+			if ( p.type === 'select' ) b = local( () => this._segmented( { label: p.label, options: p.options }, { get, set } ) );
+			else if ( p.type === 'bool' ) b = local( () => this._toggle( { label: p.label }, { get, set } ) );
+			else {
 
 				const step = p.step ?? ( p.type === 'int' ? 1 : 0.01 );
-				this._slider( { label: p.label, min: p.min, max: p.max, step, log: p.log, format: p.format }, { get, set, defaultValue: p.value } );
-				b = this._bindings.pop();
+				b = local( () => this._slider( { label: p.label, min: p.min, max: p.max, step, log: p.log, format: p.format }, { get, set, defaultValue: p.value } ) );
 
 			}
 
@@ -917,25 +1457,21 @@ export class Panel {
 
 		const cell = ( label ) => {
 
-			const b = h( 'b' );
+			const b = h( 'b', null, '–' );
 			return [ h( 'div.wgv-stat', null, b, h( 'span', null, label ) ), b ];
 
 		};
 
 		const [ cN, nodes ] = cell( 'nodes' );
 		const [ cE, edges ] = cell( 'edges' );
-		const [ cC, clusters ] = cell( 'clusters' );
+		const [ cC, communities ] = cell( 'communities' );
 		const [ cL, levels ] = cell( 'levels' );
-		const [ cF, fps ] = cell( 'fps' );
-		const status = h( 'span.wgv-status-t', null, 'Layout' );
-		const alpha = h( 'span.wgv-alpha' );
-		const alphaBar = h( 'i' );
-		this._stats = { nodes, edges, clusters, levels, fps, status, alpha, alphaBar };
-		this._state = h( 'div.wgv-state', null, h( 'i.wgv-pulse' ), status, alpha, h( 'div.wgv-alpha-bar', null, alphaBar ) );
+		this._stats = { nodes, edges, communities, levels };
 		const c = this.options.credit;
 		return h( 'footer.wgv-foot', null,
-			h( 'div.wgv-stats', null, cN, cE, cC, cL, cF ),
-			this._state,
+			h( 'div.wgv-stats', null, cN, cE, cC, cL ),
+			h( 'div.wgv-foot-row', null,
+				h( 'button.wgv-link', { onclick: () => this._action( 'reset-all' ), title: 'Back to the defaults; the graph stays' }, 'Reset all settings' ) ),
 			c ? h( 'div.wgv-credit', null, `${c.text} — `, h( 'a', { href: c.url, target: '_blank', rel: 'noopener' }, c.cite ) ) : null );
 
 	}
@@ -948,41 +1484,8 @@ export class Panel {
 		const lroot = h( 'div.wgv-loading.wgv-glass', { role: 'status', 'aria-live': 'polite' },
 			h( 'div.wgv-loading-row', null, h( 'i.wgv-spinner' ), text ), h( 'div.wgv-progress', null, bar ) );
 		this._loading = { root: lroot, text, bar };
-
 		this._toasts = h( 'div.wgv-toasts', { 'aria-live': 'polite' } );
-
-		// help
-		const k = ( ...keys ) => h( 'span.wgv-keys', null, keys.map( ( x ) => h( 'kbd', null, x ) ) );
-		const row = ( keys, text ) => h( 'li', null, keys, h( 'span', null, text ) );
-		const col = ( title, items ) => h( 'div.wgv-help-col', null, h( 'h4', null, title ), h( 'ul', null, items ) );
-		const card = h( 'div.wgv-help-card.wgv-glass', { role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Controls' },
-			h( 'div.wgv-help-head', null, h( 'h3', null, 'Controls' ),
-				h( 'button.wgv-icon', { 'aria-label': 'Close help', html: icon( 'close' ), onclick: () => this.showHelp( false ) } ) ),
-			h( 'div.wgv-help-cols', null,
-				col( 'Mouse', [
-					row( k( 'drag' ), 'Rotate' ), row( k( 'right-drag' ), 'Pan' ), row( k( 'wheel' ), 'Zoom to cursor' ),
-					row( k( 'click' ), 'Select node · empty clears' ), row( k( 'drag node' ), 'Move node' ),
-					row( k( '⇧', 'drag node' ), 'Move and pin / unpin' ), row( k( 'double-click' ), 'Focus node · empty fits' ),
-				] ),
-				col( 'Touch', [
-					row( k( '1 finger' ), 'Rotate · look around' ), row( k( 'pinch' ), 'Zoom and pan' ), row( k( 'tap' ), 'Select node' ),
-					row( k( 'drag node' ), 'Move node' ), row( k( 'long-press' ), 'Pin / unpin node' ), row( k( 'double-tap' ), 'Focus · fit' ),
-				] ),
-				col( 'Keys', [
-					row( k( 'Esc' ), 'Clear selection' ), row( k( 'F' ), 'Fit graph' ), row( k( 'Space' ), 'Pause / resume layout' ),
-					row( k( 'R' ), 'Reheat layout' ), row( k( 'L' ), 'Cycle labels' ), row( k( '?' ), 'This help' ),
-				] ) ),
-			h( 'p.wgv-help-foot', null, 'Files: drop a graph (.json, .txt edge list, .csv) anywhere on the page.' ) );
-		this._help = h( 'div.wgv-help', { inert: true }, card );
-		this._help.addEventListener( 'pointerdown', ( e ) => {
-
-			if ( e.target === this._help ) this.showHelp( false );
-
-		} );
-
-		const drop = h( 'div.wgv-dropzone', { 'aria-hidden': 'true' },
-			h( 'div.wgv-dropzone-card.wgv-glass', null, h( 'span', { html: icon( 'drop', 22 ) } ), h( 'b', null, 'Drop to open graph' ), h( 'small', null, '.json · .txt · .csv' ) ) );
-		this.root.append( lroot, this._toasts, this._help, drop );
+		this.root.append( lroot, this._toasts );
 
 	}
 
@@ -1115,3 +1618,4 @@ export class Panel {
 	}
 
 }
+
