@@ -4,7 +4,7 @@
 // main.js installs it once with the application context:
 //
 //   installExplore( { app, settings, set, data, layout, nodes, edges, labels, env, rig, interaction,
-//                     card, lens, tools, panel } ) -> explore API (kept at window.__ui.explore)
+//                     card, lens, tools, panel, slots, gfx } ) -> explore API (window.__ui.explore)
 //
 // The layer builds its own DOM surfaces and listens to app.events; it does not own the settings
 // panel, the camera rig or main.js.

@@ -25,6 +25,7 @@ import { CameraRig } from './interact/CameraRig.js';
 import { Interaction } from './interact/Interaction.js';
 import { Panel, DEFAULT_SETTINGS } from './ui/Panel.js';
 import { NodeCard } from './ui/NodeCard.js';
+import { uiSlots } from './ui/slots.js';
 import { Lens } from './analysis/Lens.js';
 import { Tools } from './analysis/Tools.js';
 import { installExplore } from './explore/index.js';
@@ -97,6 +98,7 @@ async function main() {
 	}
 
 	let panel = null;
+	const slots = uiSlots(); // screen layout of the floating surfaces (search, lens bar, card, status)
 	const cycle = ( list, v ) => list[ ( list.indexOf( v ) + 1 ) % list.length ];
 	const interaction = new Interaction( {
 		layout, rig,
@@ -258,10 +260,16 @@ async function main() {
 
 		},
 		onOpenFile: ( file ) => openFile( file ),
-		onInsets: ( insets ) => rig.setInsets( insets ),
+		onInsets: ( insets ) => {
+
+			rig.setInsets( insets );
+			slots.setInsets( insets );
+
+		},
 	} );
 	rig.setInsets( panel.insets(), { animate: false } );
-	const explore = installExplore( { app, settings, set, data, layout, nodes, edges, labels, env, rig, interaction, card, lens, tools, panel } );
+	slots.setInsets( panel.insets() );
+	const explore = installExplore( { app, settings, set, data, layout, nodes, edges, labels, env, rig, interaction, card, lens, tools, panel, slots, gfx } );
 	app.events.addEventListener( 'immersive', ( e ) => {
 
 		if ( settings.immersive !== e.detail.immersive ) panel.set( 'immersive', e.detail.immersive );
@@ -287,7 +295,7 @@ async function main() {
 
 	await loadDataset( settings.dataset );
 	if ( settings.layoutMode === 'sphere' ) panel.set( 'layoutMode', 'sphere' );
-	window.__ui = { app, settings, layout, rig, interaction, panel, card, nodes, edges, labels, gfx, data, env, lens, tools, explore, set };
+	window.__ui = { app, settings, layout, rig, interaction, panel, card, nodes, edges, labels, gfx, data, env, lens, tools, explore, slots, set };
 	window.__ready = true;
 
 }

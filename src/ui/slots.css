@@ -1,0 +1,87 @@
+/* Screen layout of the floating UI (see slots.js). The slots are flex containers around the
+   canvas; surfaces are appended to a slot instead of positioning themselves, so they never
+   overlap each other. The "free area" is the viewport minus what the settings panel covers
+   (--wgv-inset-*; on phones the panel is a bottom sheet of height --wgv-sheet-h). */
+
+.wgv-slots {
+	position: fixed;
+	inset: 0;
+	z-index: 15;
+	pointer-events: none;
+	--wgv-pad-t: max(12px, env(safe-area-inset-top));
+	--wgv-pad-r: max(12px, env(safe-area-inset-right));
+	--wgv-pad-b: max(12px, env(safe-area-inset-bottom));
+	--wgv-pad-l: max(12px, env(safe-area-inset-left));
+	--wgv-top-row: 44px; /* height reserved for the top row (search, tool buttons) */
+}
+
+.wgv-slot {
+	position: absolute;
+	display: flex;
+	gap: 8px;
+	min-width: 0;
+	min-height: 0;
+	pointer-events: none;
+}
+
+.wgv-slot > * { pointer-events: auto; }
+.wgv-slot > .wgv-slot-end { margin-top: auto; } /* in a column: push to the far end */
+
+/* top centre of the free area: search */
+.wgv-slot-top {
+	top: var(--wgv-pad-t);
+	left: calc(var(--wgv-inset-left, 0px) + var(--wgv-pad-l));
+	right: calc(var(--wgv-inset-right, 0px) + var(--wgv-pad-r));
+	justify-content: center;
+	align-items: flex-start;
+}
+
+/* top right corner: small tool buttons, right aligned (use CSS `order` to arrange) */
+.wgv-slot-top-right {
+	top: var(--wgv-pad-t);
+	right: var(--wgv-pad-r);
+	z-index: 1;
+	align-items: center;
+	justify-content: flex-end;
+}
+
+/* right column under the top row: drawers at the top, the node card at the end */
+.wgv-slot-right {
+	top: calc(var(--wgv-pad-t) + var(--wgv-top-row));
+	right: var(--wgv-pad-r);
+	bottom: var(--wgv-pad-b);
+	width: min(340px, calc(100vw - 24px));
+	flex-direction: column;
+	align-items: stretch;
+}
+
+/* bottom centre of the free area, first child lowest: lens bar, path strip, captions */
+.wgv-slot-bottom {
+	bottom: var(--wgv-pad-b);
+	left: calc(var(--wgv-inset-left, 0px) + var(--wgv-pad-l));
+	right: calc(var(--wgv-inset-right, 0px) + var(--wgv-pad-r));
+	flex-direction: column-reverse;
+	align-items: center;
+}
+
+/* bottom left of the free area: status chips (frame rate, quality tier, layout state) */
+.wgv-slot-status {
+	bottom: var(--wgv-pad-b);
+	left: calc(var(--wgv-inset-left, 0px) + var(--wgv-pad-l));
+	align-items: flex-end;
+}
+
+/* phones: the panel is a bottom sheet; everything at the bottom sits above it, the right column
+   becomes a full-width stack above the bottom slot */
+@media (max-width: 640px) {
+
+	.wgv-slot-top { left: var(--wgv-pad-l); right: var(--wgv-pad-r); }
+	.wgv-slot-bottom { left: var(--wgv-pad-l); right: var(--wgv-pad-r); bottom: calc(var(--wgv-sheet-h, 0px) + 8px); }
+	.wgv-slot-status { left: var(--wgv-pad-l); bottom: auto; top: var(--wgv-pad-t); align-items: flex-start; }
+	.wgv-slot-right {
+		left: var(--wgv-pad-l);
+		width: auto;
+		bottom: calc(var(--wgv-sheet-h, 0px) + var(--wgv-bottom-h, 0px) + 16px);
+	}
+
+}
