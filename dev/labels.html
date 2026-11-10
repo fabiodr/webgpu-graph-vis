@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>dev: GPU text labels</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui;overflow:hidden}
+#app{position:fixed;inset:0}
+#hud{position:fixed;left:10px;bottom:8px;white-space:pre;opacity:.75;z-index:3;pointer-events:none;text-shadow:0 0 3px #000}
+#atlas{position:fixed;right:8px;top:8px;z-index:3;border:1px solid #334;image-rendering:pixelated;max-width:60vw;max-height:80vh;display:none;background:#000}
+</style>
+</head>
+<body>
+<div id="app"></div><canvas id="atlas"></canvas><div id="hud"></div>
+<script type="module">
+// Dev page for src/render/TextLabels.js (GPU SDF labels) on the real modules: ForceLayout,
+// EdgeRenderer, NodeRenderer, Background, PostFX, Interaction, CameraRig.
+//
+// Query:
+//   ds=imsv/lesmis            any id of public/data/manifest.json (files and generate specs)
+//   labels=auto|all|off       max=300  neighbors=40  fs=<CSS px>  weight=500  family=<css font-family>
+//   html=1                    the HTML labels of src/render/Labels.js instead (legibility reference)
+//   comp=scene|overlay|direct scene: labels.mesh inside app.scene (HDR pass, depth test, tone mapped
+//                             and bloomed with the rest); overlay: own pass after tone mapping,
+//                             display-referred sRGB, soft occlusion from the scene depth texture
+//   post=0                    no PostFX (plain tone mapped output)
+//   sel=<index|label>  hover=<index|label>
+//   zoom=1  yaw=0  pitch=0  target=<index|label>   camera relative to the fitted view (target: look at a node)
+//   settle=6000               ms to let the layout run before fitting the camera
+//   live=1                    keep the layout hot (reheat) while the screenshot is taken
+//   stale=1                   zero-lag check: stop the position readback, then rotate/scale all node
+//                             positions on the GPU. Labels must still sit on their nodes although
+//                             the CPU never sees the new positions (only visibility may be stale).
+//   snap=0 hint=0 shadow=0 outline=<px> emph=class depth=0   switches for A/B screenshots
+//   atlas=1                   show the SDF atlas;  tiny=1  start with a 128x128 atlas (growth test)
+//   unicode=1                 replace the labels of the highest-degree nodes by typography test strings
+//   fade=<s> interval=<s>     label fade time / decision interval
+//   cap=<n> maxglyphs=<n>     initial / maximum glyph buffer capacity (growth and compaction tests)
+//   trim=<n>                  glyph count above which the glyphs of gone labels are dropped
+import * as THREE from 'three/webgpu';
+import { Fn, pass, vec4 } from 'three/tsl';
+import { createApp } from '../src/app/App.js';
+import { fetchManifest } from '../src/data/load.js';
+import { DataClient } from '../src/data/client.js';
+import { ForceLayout } from '../src/gpu/ForceLayout.js';
+import { NodeRenderer } from '../src/render/NodeRenderer.js';
+import { EdgeRenderer } from '../src/render/EdgeRenderer.js';
+import { Background } from '../src/render/Background.js';
+import { PostFX } from '../src/render/PostFX.js';
+import { Labels } from '../src/render/Labels.js';
+import { TextLabels } from '../src/render/TextLabels.js';
+import { CameraRig } from '../src/interact/CameraRig.js';
+import { Interaction } from '../src/interact/Interaction.js';
+
+const params = new URLSearchParams( location.search );
+const P = ( k, d ) => ( params.has( k ) ? params.get( k ) : d );
+const sleep = ( ms ) => new Promise( ( r ) => setTimeout( r, ms ) );
+const frames = ( app, n ) => new Promise( ( resolve ) => {
+
+	const f0 = app.frame;
+	const check = () => ( app.frame - f0 >= n ? resolve() : requestAnimationFrame( check ) );
+	check();
+
+} );
+
+try {
+
+	const app = await createApp( document.getElementById( 'app' ) );
+	window.__app = app;
+
+	const rig = new CameraRig( { autoRotate: false } );
+	const layout = app.use( new ForceLayout() );
+	const edges = app.use( new EdgeRenderer() );
+	const nodes = app.use( new NodeRenderer( { size: + P( 'size', 1 ) } ) );
+	app.use( new Background() );
+	const post = + P( 'post', 1 ) ? app.use( new PostFX( { bloom: + P( 'bloom', 0.8 ), quality: 'high' } ) ) : null;
+	const interaction = new Interaction( { layout, rig } );
+	interaction.picking.setRadiusFunction( ( i ) => nodes.worldRadius( i ) );
+	app.use( interaction );
+	app.use( rig );
+
+	const html = + P( 'html', 0 ) === 1;
+	const comp = P( 'comp', 'scene' );
+	let labels;
+	if ( html ) {
+
+		labels = app.use( new Labels( { mode: P( 'labels', 'auto' ), maxLabels: + P( 'max', 160 ) } ) );
+
+	} else {
+
+		labels = app.use( new TextLabels( {
+			mode: P( 'labels', 'auto' ),
+			maxLabels: + P( 'max', 300 ),
+			maxNeighbors: + P( 'neighbors', 40 ),
+			fontSize: params.has( 'fs' ) ? + P( 'fs' ) : null,
+			fontWeight: + P( 'weight', 500 ),
+			...( params.has( 'family' ) ? { fontFamily: P( 'family' ) } : {} ),
+			shadow: + P( 'shadow', 1 ) === 1,
+			emphasis: P( 'emph', 'state' ),
+			fadeTime: + P( 'fade', 0.2 ),
+			interval: + P( 'interval', 0.12 ),
+			sdf: + P( 'tiny', 0 ) ? { width: 128, height: 128 } : {},
+			...( params.has( 'cap' ) ? { glyphCapacity: + P( 'cap' ) } : {} ),
+			...( params.has( 'maxglyphs' ) ? { maxGlyphs: + P( 'maxglyphs' ) } : {} ),
+			...( params.has( 'trim' ) ? { trimGlyphs: + P( 'trim' ) } : {} ),
+		} ) );
+		for ( const k of [ 'snap', 'hint', 'outline', 'outlineOpacity', 'shadowBlur', 'shadowOpacity', 'weight', 'weightPx', 'tint', 'opacity', 'depthFade', 'onTop', 'gain' ] ) if ( params.has( k ) ) labels.uniforms[ k ].value = + P( k );
+
+		if ( comp === 'overlay' ) {
+
+			// (b) overlay pass after tone mapping: 8-bit display-referred target, no depth buffer,
+			// soft occlusion from the scene pass depth texture, composited over the PostFX output
+			const overlayScene = new THREE.Scene();
+			overlayScene.add( labels.mesh );
+			const overlayPass = pass( overlayScene, app.camera, { type: THREE.UnsignedByteType, samples: 0, depthBuffer: false } );
+			app.renderer.setClearColor( 0x000000, 0 ); // the overlay scene has no background: clear to transparent
+			labels.depthTest = false;
+			labels.output = 'srgb';
+			if ( + P( 'depth', 1 ) ) labels.setSceneDepth( app.scenePass.getTextureNode( 'depth' ) );
+			if ( ! post ) throw new Error( 'comp=overlay needs PostFX (post=1) in this dev page' );
+			const base = app.pipeline.outputNode; // PostFX output: tone mapped, sRGB encoded
+			const over = overlayPass.getTextureNode( 'output' );
+			app.pipeline.outputNode = Fn( () => vec4( base.rgb.mul( over.a.oneMinus() ).add( over.rgb ), 1 ) )();
+			app.pipeline.needsUpdate = true;
+			window.__overlayPass = overlayPass;
+
+		} else if ( comp === 'direct' ) {
+
+			// (c) experiment: draw the overlay scene straight onto the canvas after the pipeline's
+			// output quad (no extra target, no composite tap). Only sound without canvas MSAA.
+			const overlayScene = new THREE.Scene();
+			overlayScene.add( labels.mesh );
+			labels.depthTest = false;
+			labels.output = 'srgb';
+			if ( + P( 'depth', 1 ) ) labels.setSceneDepth( app.scenePass.getTextureNode( 'depth' ) );
+			app.use( {
+				order: 99,
+				afterRender( app ) {
+
+					const r = app.renderer;
+					const tm = r.toneMapping, cs = r.outputColorSpace, ac = r.autoClear;
+					r.toneMapping = THREE.NoToneMapping;
+					r.outputColorSpace = THREE.ColorManagement.workingColorSpace;
+					r.autoClear = false;
+					r.render( overlayScene, app.camera );
+					r.toneMapping = tm; r.outputColorSpace = cs; r.autoClear = ac;
+
+				},
+			} );
+
+		} else {
+
+			// (a) inside the HDR scene pass: ordinary depth test, linear output, tone mapped later
+			app.scene.add( labels.mesh );
+			labels.depthTest = + P( 'depth', 1 ) === 1;
+
+		}
+
+		if ( params.has( 'blendGamma' ) ) labels.uniforms.blendGamma.value = + P( 'blendGamma' );
+
+	}
+
+	Object.assign( window, { __labels: labels, __layout: layout, __nodes: nodes, __edges: edges, __post: post, __rig: rig, __interaction: interaction } );
+
+	// dataset
+	const ds = P( 'ds', 'imsv/lesmis' );
+	const manifest = await fetchManifest( '/data/manifest.json' );
+	const entry = manifest.datasets.find( ( d ) => d.id === ds );
+	if ( ! entry ) throw new Error( `dataset ${ds} not in manifest` );
+	const client = new DataClient( { baseUrl: '/' } );
+	const r = await client.load( entry );
+	const graph = r.graph;
+	if ( + P( 'unicode', 0 ) ) {
+
+		// typography test strings on the highest-degree nodes
+		const samples = [ 'Éponine Thénardier', 'Ångström ñandú façade', 'Zażółć gęślą jaźń', 'Füße – “quoted” ‘x’', 'Tōkyō 東京 図書館', 'Ελληνικά κείμενο', 'Кириллица Ёжик', 'emoji 😀 skipped 👨‍👩‍👧 ok', 'مرحبا بالعالم', 'नमस्ते दुनिया', 'Cafe\u0301 decomposed', 'AVATAR Wave To. Ty', 'office fi fl ffi', '∑ ∫ ≠ ≤ → © ™ ♥', 'jpgqy_|[]{}()', '0123456789 +−×÷=%' ];
+		const order = Array.from( { length: graph.N }, ( _, i ) => i ).sort( ( a, b ) => graph.degree[ b ] - graph.degree[ a ] || a - b );
+		graph.labels = graph.labels ? graph.labels.slice() : order.map( String );
+		samples.forEach( ( t, k ) => {
+
+			if ( k < order.length ) graph.labels[ order[ k ] ] = t;
+
+		} );
+
+	}
+
+	app.setGraph( graph );
+	const buffers = app.buffers;
+	window.__graph = graph;
+
+	const indexOf = ( v ) => {
+
+		if ( v === null || v === undefined || v === '' ) return - 1;
+		if ( /^-?\d+$/.test( v ) ) return + v;
+		return graph.labels ? graph.labels.indexOf( v ) : - 1;
+
+	};
+
+	// let the layout settle, then frame the graph
+	const tEnd = performance.now() + + P( 'settle', 6000 );
+	while ( performance.now() < tEnd && layout.running ) await sleep( 100 );
+	await frames( app, 2 );
+	rig.fitToGraph( { animate: false } );
+	rig.keepFramed( 0 );
+	await frames( app, 2 );
+	{
+
+		const zoom = + P( 'zoom', 1 ), yaw = THREE.MathUtils.degToRad( + P( 'yaw', 0 ) ), pitch = THREE.MathUtils.degToRad( + P( 'pitch', 0 ) );
+		const c = rig.controls, cam = app.camera;
+		const t = indexOf( P( 'target', '' ) );
+		if ( t >= 0 && app.positions ) c.target.set( app.positions[ 4 * t ], app.positions[ 4 * t + 1 ], app.positions[ 4 * t + 2 ] );
+		const off = cam.position.clone().sub( c.target );
+		const sph = new THREE.Spherical().setFromVector3( off );
+		sph.radius /= zoom;
+		sph.theta += yaw;
+		sph.phi = THREE.MathUtils.clamp( sph.phi - pitch, 0.05, Math.PI - 0.05 );
+		cam.position.copy( c.target ).add( new THREE.Vector3().setFromSpherical( sph ) );
+		cam.lookAt( c.target );
+		c.update();
+
+	}
+
+	const h = indexOf( P( 'hover', '' ) );
+	if ( h >= 0 ) interaction.setHover( h );
+	const s = indexOf( P( 'sel', '' ) );
+	if ( s >= 0 ) interaction.select( s );
+
+	if ( + P( 'live', 0 ) ) {
+
+		layout.reheat( 1 );
+		layout.alphaTarget = 0.3;
+
+	}
+
+	if ( + P( 'stale', 0 ) ) {
+
+		// the CPU keeps the old positions; the GPU gets a rotated + shrunk layout
+		await frames( app, 4 );
+		layout.pause();
+		app.options.readback = false;
+		await sleep( 300 );
+		const src = new Float32Array( app.positions ), out = new Float32Array( src.length );
+		const a = THREE.MathUtils.degToRad( + P( 'staleDeg', 35 ) ), ca = Math.cos( a ), sa = Math.sin( a ), k = + P( 'staleScale', 0.8 );
+		const tg = rig.controls.target;
+		for ( let i = 0; i < graph.N; i ++ ) {
+
+			const x = src[ 4 * i ] - tg.x, y = src[ 4 * i + 1 ] - tg.y, z = src[ 4 * i + 2 ] - tg.z;
+			out[ 4 * i ] = tg.x + ( x * ca - y * sa ) * k;
+			out[ 4 * i + 1 ] = tg.y + ( x * sa + y * ca ) * k;
+			out[ 4 * i + 2 ] = tg.z + z * k;
+			out[ 4 * i + 3 ] = src[ 4 * i + 3 ];
+
+		}
+
+		buffers.setPositions( out );
+		window.__stalePositionsVersion = app.positionsVersion;
+
+	}
+
+	// SDF atlas viewer
+	const atlasCanvas = document.getElementById( 'atlas' );
+	const drawAtlas = () => {
+
+		const a = labels.atlas;
+		if ( ! a ) return;
+		atlasCanvas.style.display = 'block';
+		atlasCanvas.width = a.width; atlasCanvas.height = a.height;
+		const ctx = atlasCanvas.getContext( '2d' );
+		const img = ctx.createImageData( a.width, a.height );
+		for ( let i = 0; i < a.data.length; i ++ ) {
+
+			const v = a.data[ i ];
+			img.data[ 4 * i ] = img.data[ 4 * i + 1 ] = img.data[ 4 * i + 2 ] = v;
+			img.data[ 4 * i + 3 ] = 255;
+
+		}
+
+		ctx.putImageData( img, 0, 0 );
+
+	};
+
+	window.__drawAtlas = drawAtlas;
+
+	const hud = document.getElementById( 'hud' );
+	if ( + P( 'hud', 1 ) ) app.events.addEventListener( 'frame', () => {
+
+		if ( app.frame % 20 !== 0 ) return;
+		const st = labels.stats;
+		const info = st ? `labels ${st.labels}  glyphs ${st.glyphs}/${st.capacity}  atlas ${st.atlas.join( 'x' )} (${st.atlasGlyphs})  decisions ${st.decisions} (${st.decideMs.toFixed( 2 )} ms)  uploads ${st.uploads}` : `html labels ${labels._active.size}`;
+		hud.textContent = `${graph.name}  N=${graph.N} E=${graph.E}  ${html ? 'HTML' : 'GPU/' + comp}  dpr ${app.renderer.getPixelRatio()}  ${app.fps.toFixed( 1 )} fps\n${info}`;
+
+	} );
+
+	// ready once labels have been decided and had time to fade in
+	await frames( app, 3 );
+	await sleep( 600 );
+	await frames( app, 2 );
+	if ( + P( 'atlas', 0 ) && ! html ) drawAtlas();
+	window.__ready = true;
+
+} catch ( e ) {
+
+	console.error( e );
+	window.__error = e && e.stack ? e.stack : String( e );
+
+}
+</script>
+</body>
+</html>

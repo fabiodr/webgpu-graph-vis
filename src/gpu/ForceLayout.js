@@ -89,6 +89,7 @@ export class ForceLayout {
 			sphereOmega: 8, // rad/s of the sphere-mode spring
 			blendDuration: 1, // s
 			stateTau: 0.06, // s, nodeState easing time constant (~95% after 180 ms)
+			colorTau: 0.12, // s, nodeColor (color + radius factor) easing time constant
 			resortTicks: 20, // ticks between virtual-cluster re-partition cycles (× (1 − alpha))
 			resortBudgetMs: 1.5, // main-thread budget per frame for re-partitioning
 			mode: 'force',
@@ -121,6 +122,7 @@ export class ForceLayout {
 			cmdCount: uniform( 0, 'uint' ),
 			cmds: uniformArray( Array.from( { length: MAX_COMMANDS }, () => new Vector4() ), 'vec4' ),
 			stateEase: uniform( 0.2 ),
+			colorEase: uniform( 0.1 ),
 		};
 
 		this._charge = o.charge;
@@ -331,6 +333,7 @@ export class ForceLayout {
 
 		const b = this._blend;
 		U.stateEase.value = 1 - Math.exp( - dt / Math.max( 1e-3, this.options.stateTau ) );
+		U.colorEase.value = 1 - Math.exp( - dt / Math.max( 1e-3, this.options.colorTau ) );
 
 		// full sphere mode sleeps once converged; wake on CPU-visible changes of its targets
 		if ( b >= 1 ) {
@@ -421,6 +424,8 @@ export class ForceLayout {
 
 		}
 
+		if ( K > 0 || pre.length ) this.buffers.moveFrame = app.frame; // positions changed this frame
+		else if ( this.buffers.moveFrame === Infinity ) this.buffers.moveFrame = app.frame;
 		this._lastFrameTicks = K;
 		renderer.compute( this.kernels.state );
 

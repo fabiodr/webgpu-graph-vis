@@ -1011,8 +1011,9 @@ export function commandKernel( { buffers, U, N } ) {
 /** nodeState easing: xyz -> nodeStateTarget.xyz, w -> (i == hoverIndex); snaps when close. */
 export function stateKernel( { buffers, U, N } ) {
 
-	const { nodeState } = buffers;
+	const { nodeState, nodeColor } = buffers;
 	const nodeStateTarget = readOnly( buffers.nodeStateTarget );
+	const nodeColorTarget = readOnly( buffers.nodeColorTarget );
 	const { hoverIndex } = buffers.uniforms;
 	return Fn( () => {
 
@@ -1023,6 +1024,13 @@ export function stateKernel( { buffers, U, N } ) {
 		const n = mix( s, t, U.stateEase ).toVar();
 		const snap = vec4( 1 ).sub( step( vec4( 1e-3 ), abs( n.sub( t ) ) ) );
 		nodeState.element( i ).assign( mix( n, t, snap ) );
+
+		// color + radius factor follow their targets (palette / metric lens changes animate)
+		const c = nodeColor.element( i ).toVar();
+		const ct = nodeColorTarget.element( i ).toVar();
+		const cn = mix( c, ct, U.colorEase ).toVar();
+		const csnap = vec4( 1 ).sub( step( vec4( 1e-3 ), abs( cn.sub( ct ) ) ) );
+		nodeColor.element( i ).assign( mix( cn, ct, csnap ) );
 
 	} )().compute( N, WG() ).setName( 'layout.state' );
 

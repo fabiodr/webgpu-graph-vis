@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>spike: anti-aliasing and thin-strand transparency</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui;overflow:hidden}
+#gpu{position:fixed;left:0;top:0}
+#overlay{position:fixed;left:0;top:0;display:none}
+#hud{position:fixed;left:10px;bottom:8px;white-space:pre;opacity:.8;z-index:2;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="gpu"></div><canvas id="overlay"></canvas><div id="hud"></div>
+<script type="module" src="./aa.js"></script>
+</body>
+</html>

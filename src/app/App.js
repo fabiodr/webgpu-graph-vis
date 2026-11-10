@@ -18,6 +18,7 @@ import * as THREE from 'three/webgpu';
 import { pass } from 'three/tsl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GraphBuffers } from '../gpu/GraphBuffers.js';
+import { gfxUniforms, gfxState, updateMotionUniforms, commitMotionUniforms, resetMotionUniforms } from '../render/gfx/shared.js';
 
 export async function checkWebGPU() {
 
@@ -171,6 +172,7 @@ export class App {
 		const old = this.buffers;
 		this.graph = graph;
 		this.buffers = new GraphBuffers( graph );
+		resetMotionUniforms();
 		this.positions = new Float32Array( graph.initPos );
 		this.positionsVersion ++;
 		if ( this._readbackBuffer ) {
@@ -199,6 +201,7 @@ export class App {
 		this.camera.aspect = w / h;
 		this.camera.updateProjectionMatrix();
 		this.renderer.setSize( w, h );
+		gfxUniforms.pxScale.value = this.renderer.getPixelRatio() * gfxState.renderScale;
 		for ( const m of this.modules ) m.resize?.( w, h, this );
 
 	}
@@ -221,9 +224,13 @@ export class App {
 		}
 
 		if ( this.buffers ) this.buffers.uniforms.time.value = this.time;
+		// motion vectors: nodePrev = positions of the previous rendered frame (before the layout moves)
+		if ( this.buffers && gfxState.velocity ) this.buffers.snapshotPrev( this.renderer );
 		for ( const m of this.modules ) m.update?.( dt, this );
 		this.controls?.update( dt );
+		updateMotionUniforms( this.camera );
 		this.pipeline.render();
+		commitMotionUniforms();
 		for ( const m of this.modules ) m.afterRender?.( this );
 		if ( this.options.readback && this.buffers ) this._readPositions();
 		this.events.dispatchEvent( new Event( 'frame' ) );

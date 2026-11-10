@@ -11,7 +11,17 @@
 // │ nodeForce         │ vec4  │ N     │ scratch: repulsion accumulated by the layout        │
 // │ nodeTarget        │ vec4  │ N     │ unit direction of the paper's sphere layout         │
 // │ nodeInfo          │ uvec4 │ N     │ (adjStart, adjCount, 0, 0)                          │
-// │ nodeColor         │ vec4  │ N     │ linear RGB, w = radius factor (≈0.7..1.6)          │
+// │ nodeColor         │ vec4  │ N     │ linear RGB, w = radius factor (≈0.7..1.6). Animated: │
+// │                   │       │       │   eased toward nodeColorTarget every frame          │
+// │ nodeColorTarget   │ vec4  │ N     │ CPU-written targets for nodeColor (setColors)       │
+// │ nodePrev          │ vec4  │ N     │ nodePos at the previous rendered frame (motion       │
+// │                   │       │       │   vectors); kept by snapshotPrev() while             │
+// │                   │       │       │   gfxState.velocity is on, see render/gfx/shared.js  │
+// │ nodeFx            │ vec4  │ N     │ CPU-written effect channels (analysis tools):        │
+// │                   │       │       │   x hop distance from the ripple / k-hop source      │
+// │                   │       │       │     (−1 = none), y position along the highlighted    │
+// │                   │       │       │     path in [0,1] (−1 = not on it), z glow weight    │
+// │                   │       │       │     0..1, w normalized metric value 0..1             │
 // │ nodeState         │ vec4  │ N     │ animated: x selected, y neighbor-of-selected,       │
 // │                   │       │       │   z dimmed (context when a selection exists),      │
 // │                   │       │       │   w hovered. Each in [0,1], eased toward target.    │
@@ -28,7 +38,7 @@
 // Shared uniforms live in `buffers.uniforms` (see below). Buffers are allocated with at least one
 // element so empty graphs/hierarchies never create zero-sized bindings.
 
-import { instancedArray, uniform } from 'three/tsl';
+import { Fn, instanceIndex, instancedArray, uniform } from 'three/tsl';
 import { Vector3 } from 'three/webgpu';
 
 const at = ( n ) => Math.max( 1, n );
@@ -48,6 +58,9 @@ export class GraphBuffers {
 		this.nodeTarget = instancedArray( at( N ), 'vec4' ).setName( 'nodeTarget' );
 		this.nodeInfo = instancedArray( at( N ), 'uvec4' ).setName( 'nodeInfo' );
 		this.nodeColor = instancedArray( at( N ), 'vec4' ).setName( 'nodeColor' );
+		this.nodeColorTarget = instancedArray( at( N ), 'vec4' ).setName( 'nodeColorTarget' );
+		this.nodePrev = instancedArray( at( N ), 'vec4' ).setName( 'nodePrev' );
+		this.nodeFx = instancedArray( at( N ), 'vec4' ).setName( 'nodeFx' );
 		this.nodeState = instancedArray( at( N ), 'vec4' ).setName( 'nodeState' );
 		this.nodeStateTarget = instancedArray( at( N ), 'vec4' ).setName( 'nodeStateTarget' );
 		this.adjList = instancedArray( at( 2 * E ), 'uint' ).setName( 'adjList' );
@@ -60,6 +73,9 @@ export class GraphBuffers {
 
 		// fill static data
 		this.nodePos.value.array.set( g.initPos );
+		this.nodePrev.value.array.set( g.initPos );
+		const fx = this.nodeFx.value.array;
+		for ( let i = 0; i < N; i ++ ) fx[ 4 * i ] = fx[ 4 * i + 1 ] = - 1;
 		this.nodeTarget.value.array.set( g.sphereDir );
 		const info = this.nodeInfo.value.array;
 		for ( let i = 0; i < N; i ++ ) {
@@ -69,7 +85,7 @@ export class GraphBuffers {
 
 		}
 
-		this.setColors( g.colors, g.radii, false );
+		this.setColors( g.colors, g.radii, { upload: false, immediate: true } );
 		this.adjList.value.array.set( g.adjList.subarray( 0, Math.min( g.adjList.length, this.adjList.value.array.length ) ) );
 		this.anc.value.array.set( g.anc.subarray( 0, Math.min( g.anc.length, this.anc.value.array.length ) ) );
 		const ci = this.clusterInfo.value.array;
@@ -118,14 +134,34 @@ export class GraphBuffers {
 			levelScale: uniform( 0.35 ),
 			levelExponent: uniform( 2 ),
 			graphCenter: uniform( new Vector3() ),
+			// 0..1, eased by the layout: how strongly nodes are pulled to nodeTarget (any target
+			// layout: sphere, radial, stress, …). layoutBlend stays "sphere-ness" (edge curves, guide).
+			targetBlend: uniform( 0 ),
+			// ripple (analysis tools): nodes pulse while |nodeFx.x − rippleFront| < rippleWidth (hops)
+			rippleFront: uniform( - 1e6 ),
+			rippleWidth: uniform( 0.75 ),
+			rippleGain: uniform( 0 ),
 		};
+
+		/**
+		 * app.frame of the last frame in which node positions changed on the GPU (layout ticks,
+		 * drags, setPositions). Consumers (shadow map, edge curve cache, …) compare it with the
+		 * frame they last processed. Infinity = "assume moved" until a layout module maintains it.
+		 */
+		this.moveFrame = Infinity;
+		this._snapshotKernel = null;
 
 	}
 
-	/** Replace node colors (linear RGB vec4 array) and optionally radii. */
-	setColors( colors, radii = this.graph.radii, upload = true ) {
+	/**
+	 * Replace node colors (linear RGB vec4 array) and optionally radii. Writes the easing targets;
+	 * the GPU animates nodeColor toward them (layout state kernel, ~0.25 s). `immediate` also writes
+	 * nodeColor itself (no animation). Legacy call setColors( colors, radii, uploadBoolean ) works.
+	 */
+	setColors( colors, radii = this.graph.radii, options = {} ) {
 
-		const arr = this.nodeColor.value.array;
+		const { upload = true, immediate = false } = typeof options === 'boolean' ? { upload: options } : options;
+		const arr = this.nodeColorTarget.value.array;
 		for ( let i = 0; i < this.N; i ++ ) {
 
 			arr[ 4 * i ] = colors[ 4 * i ];
@@ -135,7 +171,43 @@ export class GraphBuffers {
 
 		}
 
-		if ( upload ) this.nodeColor.value.needsUpdate = true;
+		if ( immediate ) this.nodeColor.value.array.set( arr );
+		if ( upload ) {
+
+			this.nodeColorTarget.value.needsUpdate = true;
+			if ( immediate ) this.nodeColor.value.needsUpdate = true;
+
+		}
+
+	}
+
+	/** Write the CPU-side effect channels (Float32Array 4N, see nodeFx in the table above). */
+	setFx( fx4 ) {
+
+		this.nodeFx.value.array.set( fx4 );
+		this.nodeFx.value.needsUpdate = true;
+
+	}
+
+	/**
+	 * Copies nodePos → nodePrev on the GPU. The App calls it once per frame before the modules
+	 * update (i.e. before the layout moves anything) while motion vectors are in use, so during
+	 * rendering nodePrev holds the positions of the previous rendered frame.
+	 */
+	snapshotPrev( renderer ) {
+
+		if ( ! this._snapshotKernel ) {
+
+			const { nodePos, nodePrev } = this;
+			this._snapshotKernel = Fn( () => {
+
+				nodePrev.element( instanceIndex ).assign( nodePos.element( instanceIndex ) );
+
+			} )().compute( at( this.N ) ).setName( 'graph.snapshotPrev' );
+
+		}
+
+		renderer.compute( this._snapshotKernel );
 
 	}
 
@@ -144,6 +216,9 @@ export class GraphBuffers {
 
 		this.nodePos.value.array.set( pos4 );
 		this.nodePos.value.needsUpdate = true;
+		this.nodePrev.value.array.set( pos4 );
+		this.nodePrev.value.needsUpdate = true;
+		this.moveFrame = Infinity;
 		this.nodeVel.value.array.fill( 0 );
 		this.nodeVel.value.needsUpdate = true;
 		this.computeClusterCentroidsCPU( pos4 );
@@ -210,6 +285,8 @@ export class GraphBuffers {
 
 	dispose() {
 
+		this._snapshotKernel?.dispose?.();
+		this._snapshotKernel = null;
 		for ( const key of Object.keys( this ) ) {
 
 			const v = this[ key ];
