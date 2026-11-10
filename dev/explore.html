@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<base href="/" />
+<title>dev: explore</title>
+<style>
+html, body { margin: 0; height: 100%; background: #04060c; overflow: hidden; overscroll-behavior: none; color: #d8e2f0; font: 14px/1.4 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+#app { position: fixed; inset: 0; }
+#boot { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; transition: opacity .6s; }
+#boot.hidden { opacity: 0; }
+#boot .msg { max-width: 34rem; padding: 1.5rem; text-align: center; color: #9fb0c8; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="boot"><div class="msg">Starting WebGPU…</div></div>
+<script type="module">
+// Explore layer on the real application: this page runs src/main.js unchanged (the shell, the
+// renderers, the panel) and then drives the explore surfaces into the state the query asks for,
+// so every state can be opened by a link and photographed by scripts/shot.mjs.
+// window.__ready turns true once the application is up AND that state is applied.
+//
+// Query (besides what the application reads: ?ds= &quality= &autorotate=0 &layout=):
+//   gen=<model>&n=<nodes>[&seed=][&labels=words|none]   a generated graph instead of ?ds
+//                           (models: hsbm lfr ba ws rgg3d lattice3d caveman), e.g. gen=hsbm&n=20000&labels=words
+//   nolabels=1              drop the labels of the graph
+//   longlabels=1            replace the labels with long ones (ellipsis and wrapping checks)
+//   attrs=1                 give the graph synthetic node attributes (graph.attributes: a category,
+//                           two numbers, some values missing) as a file with attributes would
+//   fakeedges=1             pretend the edge renderer has setEdgeMetric (records calls in
+//                           window.__edgeMetric) when it does not have it yet
+//   preset=<id>             lens preset: influence brokers cohesion reach relevance communities
+//   color= size= glow=      metric ids per channel (degree pagerank betweenness … attr:<name>)
+//   ramp=<id>&reverse=1     colour ramp
+//   edge=<id>               edge metric (needs setEdgeMetric or fakeedges=1)
+//   menu=color|size|glow|edges   open that channel's menu
+//   insights=1[&top=<metric>]    open the drawer [ranking shown under "Top nodes"]
+//   select=<index|label>    select a node (the card opens)   focus=1 also flies to it
+//   hops=<1…3>              neighbourhood of the selection
+//   path=<a>,<b>[&all=1]    shortest path between two nodes (index or label)
+//   pick=1                  "path from here" waiting for its target (needs select)
+//   cluster=<k>             focus the k-th largest community (0 = largest)
+//   search=<text>           open the palette with that text (search= alone: the empty state)
+//   tour=1[&stop=<k>]       start the tour [and step on to stop k]
+//   state=<json>            explore.restore( state )
+//   esc=<n>                 then press Escape n times (peels the highlight layers)
+//   collapse=1              phones: fold the lens bar
+//   measure=1               time search keystrokes and card openings → window.__measure
+//   wait=<ms>               settle time before ready (default 600)
+//
+// window.__ui (from main.js) holds every module; window.__explore = window.__ui.explore.
+
+const params = new URLSearchParams( location.search );
+const sleep = ( ms ) => new Promise( ( r ) => setTimeout( r, ms ) );
+let appReady = false, driven = false;
+Object.defineProperty( window, '__ready', { configurable: true, get: () => appReady && driven, set: ( v ) => ( appReady = !! v ) } );
+
+await import( '/src/main.js' );
+while ( ! appReady ) await sleep( 50 );
+const u = window.__ui, app = u.app, explore = window.__explore = u.explore;
+
+function shown( graph ) {
+
+	app.setGraph( graph );
+	u.layout.resume();
+	u.rig.fitToGraph( { animate: false } );
+	u.rig.keepFramed?.( 6 );
+	u.panel.setDatasetInfo?.( { id: 'dev', name: graph.name, nodes: graph.N, edges: graph.E, levels: graph.D } );
+
+}
+
+function nodeOf( text ) {
+
+	const g = app.graph;
+	if ( /^\d+$/.test( text ) ) return Math.min( g.N - 1, + text );
+	const i = g.labels ? g.labels.indexOf( text ) : - 1;
+	return i >= 0 ? i : 0;
+
+}
+
+try {
+
+	// ── the graph ─────────────────────────────────────────────────────────────────────────
+	if ( params.get( 'gen' ) ) {
+
+		const spec = { model: params.get( 'gen' ), params: { n: + ( params.get( 'n' ) || 2000 ) }, seed: + ( params.get( 'seed' ) || 1 ) };
+		if ( params.get( 'labels' ) ) spec.labels = params.get( 'labels' );
+		const r = await u.data.generate( spec, { palette: u.settings.palette, linkDistance: u.settings.linkDistance } );
+		if ( ! r.cancelled ) shown( r.graph );
+
+	}
+
+	const g = app.graph;
+	let changed = false;
+	if ( params.get( 'nolabels' ) === '1' ) {
+
+		g.labels = null;
+		changed = true;
+
+	}
+
+	if ( params.get( 'longlabels' ) === '1' ) {
+
+		const words = [ 'Department', 'of', 'Computational', 'Linguistics', 'and', 'Phonetics', 'Interdisciplinary', 'Research', 'Group', 'for', 'Network', 'Science', 'Laboratory', 'Universitätsbibliothek', 'Donaudampfschifffahrtsgesellschaft' ];
+		g.labels = Array.from( { length: g.N }, ( _, i ) => Array.from( { length: 4 + ( i % 5 ) }, ( _, k ) => words[ ( i * 7 + k * 3 ) % words.length ] ).join( ' ' ) );
+		changed = true;
+
+	}
+
+	if ( params.get( 'attrs' ) === '1' ) {
+
+		const N = g.N, D = g.D;
+		const kinds = [ 'Mathematics', 'Physics', 'Biology', 'Computer science', 'Economics', 'History', 'Philosophy', 'Chemistry', 'Linguistics', 'Law', 'Medicine' ];
+		const field = new Int32Array( N ), score = new Float32Array( N ), year = new Float32Array( N );
+		for ( let i = 0; i < N; i ++ ) {
+
+			const c = D > 0 ? g.anc[ i * D + D - 1 ] : 0; // mostly follows the coarsest community
+			field[ i ] = i % 17 === 5 ? - 1 : ( i % 4 === 0 ? ( i * 7 ) % kinds.length : c % kinds.length );
+			score[ i ] = i % 13 === 4 ? NaN : Math.round( ( 20 + 80 * Math.abs( Math.sin( i * 12.9898 ) ) ) * 10 ) / 10;
+			year[ i ] = 1950 + ( ( i * 37 ) % 74 );
+
+		}
+
+		g.attributes = { field: { type: 'category', values: field, categories: kinds }, score: { type: 'number', values: score }, year: { type: 'number', values: year } };
+		changed = true;
+
+	}
+
+	if ( changed ) shown( g ); // every module reads the graph again
+
+	if ( params.get( 'fakeedges' ) === '1' && typeof u.edges.setEdgeMetric !== 'function' ) {
+
+		u.edges.setEdgeMetric = ( values, options ) => ( window.__edgeMetric = { edges: values ? values.length : 0, options: options || null, calls: ( window.__edgeMetric?.calls || 0 ) + 1 } );
+		explore.surfaces.lensBar.refresh();
+
+	}
+
+	// ── the state ─────────────────────────────────────────────────────────────────────────
+	if ( params.get( 'state' ) ) await explore.restore( JSON.parse( params.get( 'state' ) ) );
+	if ( params.get( 'select' ) !== null ) u.interaction.select( nodeOf( params.get( 'select' ) ), { focus: params.get( 'focus' ) === '1' } );
+	if ( params.get( 'preset' ) ) explore.lens.applyPreset( params.get( 'preset' ) );
+	for ( const channel of [ 'color', 'size', 'glow' ] ) if ( params.get( channel ) ) explore.lens.setChannel( channel, params.get( channel ), { ramp: params.get( 'ramp' ) || undefined, reverse: params.get( 'reverse' ) === '1' || undefined } );
+	if ( params.get( 'edge' ) ) explore.lens.setEdgeMetric( params.get( 'edge' ) );
+	if ( params.get( 'insights' ) === '1' ) explore.insights.toggle( true );
+	if ( params.get( 'top' ) ) explore.insights.setTopMetric( params.get( 'top' ) );
+	if ( params.get( 'cluster' ) !== null ) {
+
+		const list = explore.communities();
+		const c = list[ Math.min( list.length - 1, + params.get( 'cluster' ) ) ];
+		if ( c ) explore.focusCommunity( c.cluster );
+
+	}
+
+	if ( params.get( 'hops' ) ) u.interaction.showNeighborhood( + params.get( 'hops' ) );
+	if ( params.get( 'path' ) ) {
+
+		const [ a, b ] = params.get( 'path' ).split( ',' );
+		u.interaction.showPath( nodeOf( a ), nodeOf( b ), { all: params.get( 'all' ) === '1' } );
+
+	}
+
+	if ( params.get( 'pick' ) === '1' ) u.interaction.pickPathTarget();
+	if ( params.get( 'collapse' ) === '1' ) document.querySelector( '.wgx-lens-fold' )?.click();
+	if ( params.get( 'tour' ) === '1' ) {
+
+		explore.tour.start();
+		for ( let k = 0; k < + ( params.get( 'stop' ) || 0 ); k ++ ) {
+
+			await sleep( 300 );
+			explore.tour.next();
+
+		}
+
+	}
+
+	if ( params.get( 'menu' ) ) document.querySelector( `.wgx-chan[data-channel="${params.get( 'menu' )}"]` )?.click();
+	if ( params.get( 'search' ) !== null ) explore.search.open( params.get( 'search' ) );
+	for ( let k = 0; k < + ( params.get( 'esc' ) || 0 ); k ++ ) {
+
+		await sleep( 200 );
+		window.dispatchEvent( new KeyboardEvent( 'keydown', { key: 'Escape', bubbles: true } ) );
+
+	}
+
+	if ( params.get( 'measure' ) === '1' ) window.__measure = await measure();
+	await sleep( + ( params.get( 'wait' ) || 600 ) );
+
+} catch ( e ) {
+
+	console.error( e );
+
+}
+
+driven = true;
+
+/**
+ * Times what a person feels: every keystroke of a few queries typed into the palette (from the
+ * input event to the rebuilt rows, synchronously), and opening the card on nodes of high degree.
+ */
+async function measure() {
+
+	const input = document.querySelector( '.wgx-search-input' );
+	const g = app.graph;
+	const order = Array.from( { length: g.N }, ( _, i ) => i ).sort( ( a, b ) => g.degree[ b ] - g.degree[ a ] ).slice( 0, 8 );
+	const hub = order[ 0 ];
+	const label = g.labels ? String( g.labels[ hub ] ) : String( hub );
+	const queries = [ label.toLowerCase(), 'an', 'the ', 'xq', label.slice( 0, 3 ) + 'zz', '>lens', String( g.N - 1 ) ];
+	const strokes = [];
+	explore.search.open( '' );
+	for ( const q of queries ) {
+
+		for ( let k = 1; k <= q.length; k ++ ) {
+
+			input.value = q.slice( 0, k );
+			const t0 = performance.now();
+			input.dispatchEvent( new Event( 'input', { bubbles: true } ) );
+			const ms = performance.now() - t0;
+			strokes.push( { text: input.value, ms, queryMs: explore.search.stats.queryMs, matches: explore.search.stats.matches } );
+			await sleep( 0 );
+
+		}
+
+		input.value = '';
+		input.dispatchEvent( new Event( 'input', { bubbles: true } ) );
+
+	}
+
+	explore.search.close();
+	const sorted = strokes.map( ( s ) => s.ms ).sort( ( a, b ) => a - b );
+	const cards = [];
+	for ( const i of order ) {
+
+		const t0 = performance.now();
+		u.interaction.select( i );
+		cards.push( { node: i, degree: g.degree[ i ], ms: performance.now() - t0, cardMs: u.card.stats.ms } );
+		await sleep( 30 );
+
+	}
+
+	u.interaction.clearAll();
+	const round = ( v ) => Math.round( v * 100 ) / 100;
+	return {
+		nodes: g.N, edges: g.E,
+		search: { keystrokes: strokes.length, medianMs: round( sorted[ sorted.length >> 1 ] ), p95Ms: round( sorted[ Math.floor( sorted.length * 0.95 ) ] ), maxMs: round( sorted[ sorted.length - 1 ] ), slowest: strokes.slice().sort( ( a, b ) => b.ms - a.ms ).slice( 0, 3 ).map( ( s ) => ( { text: s.text, ms: round( s.ms ), matches: s.matches } ) ) },
+		card: { opened: cards.length, maxMs: round( Math.max( ...cards.map( ( c ) => c.ms ) ) ), meanMs: round( cards.reduce( ( s, c ) => s + c.ms, 0 ) / cards.length ), maxDegree: cards[ 0 ].degree },
+	};
+
+}
+</script>
+</body>
+</html>

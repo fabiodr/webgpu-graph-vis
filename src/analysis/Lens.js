@@ -12,7 +12,10 @@
 //           small and sets the leaders apart.
 //  colour   nodeColorTarget.rgb = rampColor( t, ramp ) · emissiveGain( …, intensity )   a
 //           sequential ramp of util/color.js; categorical metrics (component) get distinct hues
-//           for the first eight labels. The node and edge shaders are emissive and feed the
+//           for the first eight labels. A node without a value (a number the file does not
+//           give for it) is drawn in the neutral grey of the unnamed categories instead of the
+//           colour of the smallest value; on the size channel it gets the smallest radius, and
+//           legend().missing says how many there are. The node and edge shaders are emissive and feed the
 //           bloom, and the upper half of a ramp is far brighter than any cluster palette
 //           (luminance up to 0.95 against 0.05 … 0.59), so as defined the high values burn out
 //           into one glowing mass. `intensity` (default 0.4) holds the bright end back with a
@@ -68,9 +71,27 @@
 //  lens.load( ids? )    -> Promise<void>                all instant and fast metrics (node card)
 //  lens.describe( i )   -> [ { id, label, value, normalized, rank, of, exact, final } ]
 //                                                       every metric that has values, rank 1-based
-//  lens.legend( channel ) -> { metric, label, scale, min, max, ready, ramp?, css?, intensity?,
-//                              categorical?, gamma?, top?, count?, range? } | null
-//                                                       count: the number of nodes that glow
+//  lens.legend( channel ) -> { metric, label, scale, min, max, ready, ticks, missing, ramp?, css?, intensity?,
+//                              categorical?, categories?, gamma?, top?, count?, threshold?, range?,
+//                              missingColor? } | null
+//                                                       ticks: [ { t, value, bound } ] what the two
+//                                                       ends and the middle of the channel show, read
+//                                                       back from the data: value = a value some node
+//                                                       has at that position, bound = '≤' / '≥' when
+//                                                       the end also stands for everything beyond it
+//                                                       (log and robust scales clamp), else ''.
+//                                                       categories: [ { value, label, count, color } ]
+//                                                       of a categorical metric (the first eight have
+//                                                       a hue; color = linear RGB as on the nodes).
+//                                                       count: the number of nodes that glow,
+//                                                       threshold: the smallest value among them.
+//                                                       missing: nodes without a (finite) value of a
+//                                                       sequential metric, i.e. outside the ticks;
+//                                                       missingColor: linear RGB they are drawn in
+//                                                       on the colour channel
+//  lens.attributes( i ) -> [ { id, name, type, value, text } ]   the node attributes of the file
+//                                                       for node i (graph.attributes), text = the
+//                                                       category name or the number
 //  lens.summary( { onPreview, top, maxBfs } ) -> Promise<Summary | null>   see worker.js; computed
 //                                                       once per graph, lazily; labels attached
 //  lens.edgeChannel( id, { scale?, onUpdate?, maxMs? } ) -> Promise<{ metric, scale, values, raw,
@@ -85,7 +106,12 @@
 //  lens.state           { size, color, glow, ramp, reverse, intensity, top, palette, sizeRange,
 //                         sources, busy, metrics: { [id]: { ready, final, exact, pivots, total,
 //                         progress, error } } }
-//  lens.metrics, lens.edgeMetrics, lens.ramps           catalogues for a UI
+//  lens.metrics, lens.edgeMetrics, lens.ramps           catalogues for a UI. lens.metrics is the
+//                                                       catalogue of metrics.js plus one entry per
+//                                                       node attribute of the file ( id 'attr:<name>',
+//                                                       graph.attributes: numbers on the robust scale,
+//                                                       categories as distinct hues, most frequent
+//                                                       first ); they need no worker
 //  lens.radii, lens.colors                              current targets (Float32Array N / 4N)
 //  lens.base            { radii, colors }               the graph's own values
 //  lens.client          the AnalysisClient
@@ -136,6 +162,70 @@ function safely( fn, arg ) {
 
 }
 
+const isAttribute = ( id ) => typeof id === 'string' && id.startsWith( 'attr:' );
+
+/** Linear RGB of "no value" on the colour channel: the grey of the categories without a hue. */
+function neutralColor( intensity ) {
+
+	const c = categoryColor( - 1 );
+	const gain = emissiveGain( c[ 0 ], c[ 1 ], c[ 2 ], intensity );
+	return [ gain * c[ 0 ], gain * c[ 1 ], gain * c[ 2 ] ];
+
+}
+
+/**
+ * Catalogue entries for the node attributes of a graph ( graph.attributes, see the data package ):
+ * numbers as sequential metrics on the robust scale, categories as categorical ones.
+ */
+function attributeMetrics( graph ) {
+
+	const out = [];
+	const attrs = graph && graph.attributes;
+	if ( ! attrs || typeof attrs !== 'object' ) return out;
+	for ( const name of Object.keys( attrs ) ) {
+
+		const a = attrs[ name ];
+		if ( ! a || ! a.values || a.values.length < graph.N ) continue;
+		if ( a.type === 'category' ) {
+
+			// categories by frequency: the eight most frequent get the distinct hues
+			const counts = new Map();
+			for ( let i = 0; i < graph.N; i ++ ) if ( a.values[ i ] >= 0 ) counts.set( a.values[ i ], ( counts.get( a.values[ i ] ) || 0 ) + 1 );
+			const order = [ ...counts.entries() ].sort( ( x, y ) => y[ 1 ] - x[ 1 ] || x[ 0 ] - y[ 0 ] ).map( ( e ) => e[ 0 ] );
+			out.push( {
+				id: 'attr:' + name, label: name, scale: 'rank', cost: 'instant', kind: 'categorical', attribute: name,
+				description: `Attribute of the file: ${order.length} ${order.length === 1 ? 'category' : 'categories'}.`,
+				order, categories: order.map( ( v ) => ( a.categories && a.categories[ v ] !== undefined ? String( a.categories[ v ] ) : String( v ) ) ),
+			} );
+
+		} else if ( a.type === 'number' ) {
+
+			out.push( { id: 'attr:' + name, label: name, scale: 'robust', cost: 'instant', kind: 'sequential', attribute: name, description: 'Numeric attribute of the file.' } );
+
+		}
+
+	}
+
+	return out;
+
+}
+
+/** Raw lens values of an attribute: the numbers, or the frequency rank of the category (−1 = none). */
+function attributeValues( graph, info ) {
+
+	const a = graph.attributes[ info.attribute ], N = graph.N;
+	const raw = new Float32Array( N );
+	if ( info.kind === 'categorical' ) {
+
+		const rank = new Map( info.order.map( ( v, k ) => [ v, k ] ) );
+		for ( let i = 0; i < N; i ++ ) raw[ i ] = rank.has( a.values[ i ] ) ? rank.get( a.values[ i ] ) : - 1;
+
+	} else for ( let i = 0; i < N; i ++ ) raw[ i ] = a.values[ i ];
+
+	return raw;
+
+}
+
 export class Lens {
 
 	constructor( options = {} ) {
@@ -159,17 +249,19 @@ export class Lens {
 		this._records = new Map(); // metric id -> record
 		this._edges = new Map(); // 'id:scale' -> { result, promise, listeners }
 		this._glowCount = 0;
+		this._glowMin = NaN;
 		this._palette = 'paper';
 		this._sources = [];
 		this._generation = 0;
 		this._summary = null;
 		this._lastProgress = - Infinity;
+		this._attributes = []; // catalogue entries of the graph's node attributes
 
 	}
 
 	get metrics() {
 
-		return NODE_METRICS;
+		return this._attributes.length ? [ ...NODE_METRICS, ...this._attributes ] : NODE_METRICS;
 
 	}
 
@@ -251,6 +343,9 @@ export class Lens {
 		this._sources = [];
 		this._glowCount = 0;
 		this._palette = graph.palette || this._palette;
+		this._attributes = attributeMetrics( graph );
+		// a channel on an attribute the new graph does not have falls back to the graph's own look
+		for ( const key of [ '_size', '_color', '_glow' ] ) if ( this[ key ] && ! this._info( this[ key ].metric ) ) this[ key ] = null;
 		this.base = { radii: Float32Array.from( graph.radii ), colors: Float32Array.from( graph.colors ) };
 		if ( this.options.mirror ) {
 
@@ -471,9 +566,14 @@ export class Lens {
 		const rec = this._records.get( ch.metric );
 		const domain = rec && rec.raw ? this._domain( rec ) : [ NaN, NaN ];
 		const out = { metric: ch.metric, label: rec ? rec.info.label : ch.metric, scale: ch.scale || ( rec ? rec.info.scale : null ), min: domain[ 0 ], max: domain[ 1 ], ready: !! ( rec && rec.raw ) };
+		out.ticks = rec && rec.raw && ch !== this._glow ? this._ticks( rec, out.scale, ch.gamma || 1 ) : [];
+		// a category that is not given is the entry "none" of the categories, not a missing number
+		out.missing = rec && rec.raw && rec.info.kind !== 'categorical' ? this._missing( rec ) : 0;
 		if ( ch === this._color ) {
 
 			out.categorical = !! rec && rec.info.kind === 'categorical';
+			if ( out.categorical && rec.raw ) out.categories = this._categories( rec, ch.intensity );
+			if ( out.missing > 0 ) out.missingColor = neutralColor( ch.intensity );
 			out.ramp = ch.ramp;
 			out.css = rampCss( ch.ramp, { reverse: ch.reverse } );
 			out.intensity = ch.intensity;
@@ -485,6 +585,7 @@ export class Lens {
 
 			out.top = ch.top;
 			out.count = this._glowCount;
+			out.threshold = this._glowCount > 0 ? this._glowMin : NaN;
 
 		}
 
@@ -492,6 +593,24 @@ export class Lens {
 
 			out.range = ch.range.slice();
 			out.gamma = ch.gamma;
+
+		}
+
+		return out;
+
+	}
+
+	attributes( i ) {
+
+		const out = [];
+		const g = this.graph;
+		if ( ! g || ! g.attributes || ! ( i >= 0 && i < g.N ) ) return out;
+		for ( const info of this._attributes ) {
+
+			const a = g.attributes[ info.attribute ];
+			const v = a.values[ i ];
+			if ( a.type === 'category' ) out.push( { id: info.id, name: info.label, type: 'category', value: v, text: v >= 0 && a.categories && a.categories[ v ] !== undefined ? String( a.categories[ v ] ) : '' } );
+			else out.push( { id: info.id, name: info.label, type: 'number', value: v, text: Number.isFinite( v ) ? String( v ) : '' } );
 
 		}
 
@@ -623,7 +742,8 @@ export class Lens {
 
 	_on( key, channel ) {
 
-		if ( ! metricInfo( channel.metric ) ) throw new RangeError( `Lens: unknown metric "${channel.metric}" (${NODE_METRICS.map( ( m ) => m.id ).join( ', ' )})` );
+		// (without a graph an attribute cannot be checked yet: setGraph() drops what the graph lacks)
+		if ( ! this._info( channel.metric ) && ( this.graph || ! isAttribute( channel.metric ) ) ) throw new RangeError( `Lens: unknown metric "${channel.metric}" (${this.metrics.map( ( m ) => m.id ).join( ', ' )})` );
 		this[ key ] = channel;
 		if ( ! this.graph ) return Promise.resolve( false ); // applied when a graph arrives
 		const rec = this._ensure( channel.metric );
@@ -668,10 +788,26 @@ export class Lens {
 		let rec = this._records.get( metric );
 		if ( ! rec ) {
 
-			const info = metricInfo( metric );
+			const info = this._info( metric );
 			if ( ! info ) throw new RangeError( `Lens: unknown metric "${metric}"` );
-			rec = { id: metric, info, raw: null, final: false, exact: false, pivots: 0, total: 0, progress: 0, cache: new Map(), ranks: null, domain: null, request: null, open: false, pins: 0, error: null };
+			rec = { id: metric, info, raw: null, final: false, exact: false, pivots: 0, total: 0, progress: 0, cache: new Map(), ranks: null, domain: null, ticks: null, missing: - 1, request: null, open: false, pins: 0, error: null };
 			this._records.set( metric, rec );
+
+		}
+
+		if ( rec.info.attribute !== undefined ) {
+
+			// a node attribute of the file: the values are at hand, no worker involved
+			if ( ! rec.final && this.graph ) {
+
+				rec.raw = attributeValues( this.graph, rec.info );
+				rec.missing = - 1;
+				rec.final = rec.exact = true;
+				rec.progress = 1;
+
+			}
+
+			return rec;
 
 		}
 
@@ -763,6 +899,8 @@ export class Lens {
 		rec.cache.clear();
 		rec.ranks = null;
 		rec.domain = null;
+		rec.ticks = null;
+		rec.missing = - 1;
 		if ( this._uses( rec.id ) ) this._apply();
 		this._notify( 'data' );
 
@@ -816,7 +954,8 @@ export class Lens {
 			const raw = rec.raw, n = raw.length;
 			const order = new Uint32Array( n );
 			for ( let i = 0; i < n; i ++ ) order[ i ] = i;
-			order.sort( ( a, b ) => raw[ b ] - raw[ a ] || a - b );
+			// largest first; values that are not numbers (a missing attribute) go last
+			order.sort( ( a, b ) => ( raw[ b ] - raw[ a ] ) || ( ( raw[ a ] !== raw[ a ] ) - ( raw[ b ] !== raw[ b ] ) ) || a - b );
 			const rank = new Uint32Array( n );
 			for ( let k = 1; k < n; k ++ ) rank[ order[ k ] ] = raw[ order[ k ] ] === raw[ order[ k - 1 ] ] ? rank[ order[ k - 1 ] ] : k;
 			rec.ranks = { order, rank };
@@ -845,6 +984,88 @@ export class Lens {
 		}
 
 		return rec.domain;
+
+	}
+
+	/** The number of nodes without a finite value (an attribute the file does not give for them). */
+	_missing( rec ) {
+
+		if ( rec.missing < 0 ) {
+
+			let n = 0;
+			for ( let i = 0; i < rec.raw.length; i ++ ) if ( ! Number.isFinite( rec.raw[ i ] ) ) n ++;
+			rec.missing = n;
+
+		}
+
+		return rec.missing;
+
+	}
+
+	/** Catalogue entry of a node metric: the library's, or an attribute of the current graph. */
+	_info( metric ) {
+
+		return metricInfo( metric ) || this._attributes.find( ( m ) => m.id === metric ) || null;
+
+	}
+
+	/**
+	 * What the ends and the middle of a channel show, read back from the data instead of derived
+	 * from the scale's formula (so it is true for every scale and gamma): for t = 0, 0.5 and 1 the
+	 * value of a node that sits there. An end is a bound ( '≤', '≥' ) when values beyond it exist
+	 * and are clamped onto it. The middle is left out when no node is near it.
+	 */
+	_ticks( rec, scale, gamma = 1 ) {
+
+		const key = `${scale}^${gamma}`;
+		if ( ! rec.ticks ) rec.ticks = new Map();
+		let ticks = rec.ticks.get( key );
+		if ( ticks ) return ticks;
+		const raw = rec.raw, t = this._normalized( rec, scale, gamma ), n = raw.length;
+		const [ min, max ] = this._domain( rec );
+		let lo = - Infinity, hi = Infinity, mid = NaN, midGap = Infinity;
+		for ( let i = 0; i < n; i ++ ) {
+
+			const v = raw[ i ];
+			if ( ! Number.isFinite( v ) ) continue;
+			if ( t[ i ] <= 0 && v > lo ) lo = v;
+			if ( t[ i ] >= 1 && v < hi ) hi = v;
+			const gap = Math.abs( t[ i ] - 0.5 );
+			if ( gap < midGap ) {
+
+				midGap = gap;
+				mid = v;
+
+			}
+
+		}
+
+		ticks = [];
+		if ( Number.isFinite( lo ) ) ticks.push( { t: 0, value: lo, bound: lo > min ? '≤' : '' } );
+		else if ( Number.isFinite( min ) ) ticks.push( { t: 0, value: min, bound: '' } );
+		if ( midGap <= 0.12 && max > min ) ticks.push( { t: 0.5, value: mid, bound: '' } );
+		if ( Number.isFinite( hi ) ) ticks.push( { t: 1, value: hi, bound: hi < max ? '≥' : '' } );
+		else if ( Number.isFinite( max ) ) ticks.push( { t: 1, value: max, bound: '' } );
+		rec.ticks.set( key, ticks );
+		return ticks;
+
+	}
+
+	/** The labels of a categorical metric with their counts and node colours, most frequent first. */
+	_categories( rec, intensity = 1 ) {
+
+		const raw = rec.raw, counts = new Map();
+		for ( let i = 0; i < raw.length; i ++ ) counts.set( raw[ i ], ( counts.get( raw[ i ] ) || 0 ) + 1 );
+		const names = rec.info.categories || null;
+		const c = [ 0, 0, 0 ];
+		return [ ...counts.entries() ].sort( ( a, b ) => ( a[ 0 ] < 0 ) - ( b[ 0 ] < 0 ) || a[ 0 ] - b[ 0 ] ).map( ( [ value, count ] ) => {
+
+			categoryColor( value, c );
+			const gain = emissiveGain( c[ 0 ], c[ 1 ], c[ 2 ], intensity );
+			const label = value < 0 ? 'none' : names ? String( names[ value ] ) : rec.id === 'component' ? `Component ${value + 1}` : String( value );
+			return { value, label, count, color: [ gain * c[ 0 ], gain * c[ 1 ], gain * c[ 2 ] ], distinct: value >= 0 && value < 8 };
+
+		} );
 
 	}
 
@@ -881,6 +1102,7 @@ export class Lens {
 		for ( let i = 0; i < N; i ++ ) fx[ 4 * i + 2 ] = 0;
 		const K = Math.max( 1, Math.ceil( top * N - 1e-9 ) );
 		let count = 0;
+		this._glowMin = NaN;
 		for ( let k = 0; k < N && k < K; ) {
 
 			let end = k + 1; // the group of equal values at positions k … end − 1 has rank k
@@ -890,6 +1112,7 @@ export class Lens {
 
 				for ( let j = k; j < end; j ++ ) fx[ 4 * order[ j ] + 2 ] = w;
 				count += end - k;
+				this._glowMin = raw[ order[ k ] ];
 
 			}
 
@@ -933,7 +1156,23 @@ export class Lens {
 
 				}
 
-			} else rampColors( colorT, this._color.ramp, colors, this._color.reverse, intensity );
+			} else {
+
+				rampColors( colorT, this._color.ramp, colors, this._color.reverse, intensity );
+				if ( this._missing( rec ) > 0 ) {
+
+					// no value is not the smallest value: the neutral grey, not the low end of the ramp
+					const c = neutralColor( intensity ), raw = rec.raw;
+					for ( let i = 0; i < N; i ++ ) {
+
+						if ( Number.isFinite( raw[ i ] ) ) continue;
+						colors[ 4 * i ] = c[ 0 ]; colors[ 4 * i + 1 ] = c[ 1 ]; colors[ 4 * i + 2 ] = c[ 2 ];
+
+					}
+
+				}
+
+			}
 
 		}
 

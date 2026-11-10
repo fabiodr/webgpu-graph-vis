@@ -1000,3 +1000,109 @@ test( 'Lens: mirror off keeps the graph arrays; a lens set before the first grap
 	lens.dispose();
 
 } );
+
+test( 'Lens: node attributes of a file are metrics (numbers on the robust scale, categories as hues)', async () => {
+
+	// two triangles and an isolated node, with a category, a number (one value missing) and a
+	// malformed attribute that must be ignored
+	const g = prepareGraph( { name: 'parts', nodeCount: 7, edges: [ 0, 1, 1, 2, 2, 0, 3, 4, 4, 5, 5, 3 ], labels: null, hierarchy: null } );
+	g.attributes = {
+		field: { type: 'category', values: Int32Array.from( [ 2, 2, 2, 0, 0, 1, - 1 ] ), categories: [ 'Physics', 'Law', 'Biology' ] },
+		score: { type: 'number', values: Float32Array.from( [ 10, 20, 30, 40, 50, 60, NaN ] ) },
+		short: { type: 'number', values: new Float32Array( 3 ) },
+	};
+	const { lens, buffers, events } = setup( g );
+	const ids = lens.metrics.map( ( m ) => m.id );
+	assert.deepEqual( ids.filter( ( id ) => id.startsWith( 'attr:' ) ), [ 'attr:field', 'attr:score' ] );
+	assert.equal( ids.indexOf( 'degree' ) >= 0, true, 'after the catalogue of the worker metrics' );
+	const field = lens.metrics.find( ( m ) => m.id === 'attr:field' ), score = lens.metrics.find( ( m ) => m.id === 'attr:score' );
+	assert.deepEqual( [ field.label, field.kind, field.cost ], [ 'field', 'categorical', 'instant' ] );
+	assert.deepEqual( field.categories, [ 'Biology', 'Physics', 'Law' ], 'most frequent first' );
+	assert.deepEqual( [ score.label, score.kind, score.scale ], [ 'score', 'sequential', 'robust' ] );
+
+	// a category: the frequency rank picks the hue, missing values are "none"
+	assert.equal( await lens.setColor( 'attr:field' ), true );
+	const legend = lens.legend( 'color' );
+	assert.equal( legend.categorical, true );
+	assert.deepEqual( legend.categories.map( ( c ) => [ c.label, c.count ] ), [ [ 'Biology', 3 ], [ 'Physics', 2 ], [ 'Law', 1 ], [ 'none', 1 ] ] );
+	assert.ok( legend.categories.slice( 0, 3 ).every( ( c ) => c.distinct ) );
+	const got = buffers.colorCalls.at( - 1 );
+	const colorOf = ( i ) => Array.from( got.subarray( 4 * i, 4 * i + 3 ) );
+	assert.deepEqual( colorOf( 0 ), colorOf( 1 ), 'same category, same colour' );
+	assert.notDeepEqual( colorOf( 0 ), colorOf( 3 ) );
+	close( colorOf( 0 ), legend.categories[ 0 ].color, 1e-6 );
+	close( colorOf( 5 ), legend.categories[ 2 ].color, 1e-6 );
+
+	// a number: sized without a worker, the missing value at the low end, the legend in real units
+	assert.equal( await lens.setSize( 'attr:score' ), true );
+	const radii = column( buffers.colorCalls.at( - 1 ), 4, 3 );
+	assert.ok( radii[ 5 ] > radii[ 0 ], 'larger score, larger node' );
+	assert.ok( radii.every( ( r ) => Number.isFinite( r ) && r > 0 ), 'a missing value still has a size' );
+	const size = lens.legend( 'size' );
+	assert.equal( size.scale, 'robust' );
+	assert.deepEqual( [ size.ticks[ 0 ].value, size.ticks.at( - 1 ).value ], [ 10, 60 ] );
+	assert.equal( lens.state.metrics[ 'attr:score' ].exact, true );
+	// the legend counts the node without a score; the categories count theirs as "none" instead
+	assert.equal( size.missing, 1 );
+	assert.equal( legend.missing, 0 );
+	// on the colour channel no value is the neutral grey, not the colour of the smallest value
+	assert.equal( await lens.setColor( 'attr:score' ), true );
+	const scored = buffers.colorCalls.at( - 1 );
+	const rgb = ( i ) => Array.from( scored.subarray( 4 * i, 4 * i + 3 ) );
+	const byScore = lens.legend( 'color' );
+	assert.equal( byScore.missing, 1 );
+	close( rgb( 6 ), byScore.missingColor, 1e-6 );
+	assert.ok( Math.abs( rgb( 6 )[ 0 ] - rgb( 6 )[ 1 ] ) < 1e-3 && Math.abs( rgb( 6 )[ 1 ] - rgb( 6 )[ 2 ] ) < 1e-3, 'grey' );
+	assert.notDeepEqual( rgb( 6 ), rgb( 0 ), 'not the low end of the ramp' );
+	assert.equal( scored[ 4 * 6 + 3 ], scored[ 4 * 0 + 3 ], 'the smallest radius of the size lens' );
+
+	// the card reads the attributes of one node
+	assert.deepEqual( lens.attributes( 0 ).map( ( a ) => [ a.id, a.name, a.type, a.text ] ), [ [ 'attr:field', 'field', 'category', 'Biology' ], [ 'attr:score', 'score', 'number', '10' ] ] );
+	assert.deepEqual( lens.attributes( 6 ).map( ( a ) => a.text ), [ '', '' ], 'missing values have no text' );
+	assert.deepEqual( lens.attributes( 99 ), [] );
+	assert.equal( lens.describe( 5 ).some( ( m ) => m.id.startsWith( 'attr:' ) ), false, 'describe() stays the list of computed metrics' );
+	assert.equal( lens.values( 'attr:score' ).raw[ 5 ], 60 );
+	assert.equal( lens.values( 'attr:score' ).order[ 0 ], 5, 'ranked like any metric' );
+
+	// a graph without those attributes: the channels that showed them go back to the default look
+	const plain = prepareGraph( { name: 'plain', nodeCount: 4, edges: [ 0, 1, 1, 2, 2, 3 ], labels: null, hierarchy: null } );
+	lens.setGraph( fakeBuffers( plain ), plain );
+	await idle( lens );
+	assert.equal( lens.metrics.some( ( m ) => m.id.startsWith( 'attr:' ) ), false );
+	assert.deepEqual( [ lens.state.color, lens.state.size ], [ null, null ] );
+	assert.deepEqual( lens.attributes( 0 ), [] );
+	assert.throws( () => lens.setColor( 'attr:field' ), RangeError, 'unknown here, like any metric id that does not exist' );
+	assert.ok( events.some( ( e ) => e.reason === 'graph' ) );
+	lens.dispose();
+
+} );
+
+test( 'Lens: the legend reads its ends, middle and glow threshold back from the data', async () => {
+
+	const g = load( 'imsv/lesmis' );
+	const { lens } = setup( g );
+	await lens.setColor( 'degree' );
+	let legend = lens.legend( 'color' );
+	assert.deepEqual( [ legend.min, legend.max ], [ 1, 36 ] );
+	assert.deepEqual( legend.ticks.map( ( t ) => t.t ), [ 0, 0.5, 1 ] );
+	assert.deepEqual( [ legend.ticks[ 0 ].value, legend.ticks[ 2 ].value ], [ 1, 36 ] );
+	assert.deepEqual( legend.ticks.map( ( t ) => t.bound ), [ '', '', '' ], 'nothing is clamped' );
+	const mid = legend.ticks[ 1 ].value;
+	assert.ok( mid > 1 && mid < 36 );
+	// the middle tick is a degree that occurs, and the node that has it sits near the middle of the ramp
+	const v = lens.values( 'degree' );
+	const at = Array.from( v.raw ).indexOf( mid );
+	assert.ok( at >= 0 );
+	assert.ok( Math.abs( v.normalized[ at ] - 0.5 ) <= 0.12 );
+
+	await lens.setGlow( 'degree', { top: 0.1 } );
+	const glow = lens.legend( 'glow' );
+	assert.ok( glow.count >= 7 && glow.count <= 9, `${glow.count} of 77 glow` );
+	const sorted = Array.from( g.degree ).sort( ( a, b ) => b - a );
+	assert.equal( glow.threshold, sorted[ glow.count - 1 ], 'the smallest degree that still glows' );
+	assert.deepEqual( glow.ticks, [] );
+	await lens.setGlow( null );
+	assert.equal( lens.legend( 'glow' ), null );
+	lens.dispose();
+
+} );

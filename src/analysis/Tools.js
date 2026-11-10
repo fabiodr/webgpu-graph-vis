@@ -32,10 +32,12 @@
 //        (1 everywhere for a single path). null when b cannot be reached (the old path is cleared).
 //  tools.clear( what? )          'ripple' | 'khop' | 'path'; nothing = all three (also done by
 //                                dispose())
-//  tools.highlightSet()  -> Float32Array( N ) | null
+//  tools.highlightSet( what? )  -> Float32Array( N ) | null
 //        What a selection highlight should show for the active tools, as one weight per node:
 //        1 = primary (path ends, k-hop sources), 0.35 … 0.85 = secondary (path interior by its
 //        share of the geodesics, neighbourhood by hop), 0 = context. null when no tool is active.
+//        what = 'khop' | 'path' gives the set of that tool alone (the highlight model of the
+//        Interaction module keeps them as separate layers); nothing = both, merged by maximum.
 //  tools.stateTargets( out? ) -> Float32Array( 4N ) | null
 //        The same in the layout of nodeStateTarget (x selected, y neighbour, z dimmed, w 0) for
 //        Interaction to merge; this module never writes nodeStateTarget itself.
@@ -245,9 +247,11 @@ export class Tools {
 
 	}
 
-	highlightSet() {
+	highlightSet( what ) {
 
-		const g = this.graph, k = this._khop, p = this._path;
+		const g = this.graph;
+		const k = what === undefined || what === 'khop' ? this._khop : null;
+		const p = what === undefined || what === 'path' ? this._path : null;
 		if ( ! g || ( ! k && ! p ) ) return null;
 		const w = new Float32Array( g.N );
 		if ( k ) {

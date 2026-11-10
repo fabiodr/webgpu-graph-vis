@@ -436,3 +436,30 @@ test( 'Tools.highlightSet / stateTargets: weights for the selection highlight', 
 	near( w[ 1 ], 0.85 ); near( w[ 5 ], 0.85 );
 
 } );
+
+test( 'Tools.highlightSet( what ): the neighbourhood and the path as separate sets', () => {
+
+	const g = grid( 5, 5 );
+	const { tools } = setup( g );
+	assert.equal( tools.highlightSet( 'khop' ), null );
+	assert.equal( tools.highlightSet( 'path' ), null );
+	tools.khop( 12, 1 );
+	const ring = tools.highlightSet( 'khop' );
+	assert.deepEqual( Array.from( ring ).map( ( v, i ) => ( v > 0 ? i : - 1 ) ).filter( ( i ) => i >= 0 ), [ 7, 11, 12, 13, 17 ] );
+	assert.equal( tools.highlightSet( 'path' ), null, 'no path yet' );
+	tools.path( 0, 4 );
+	const path = tools.highlightSet( 'path' );
+	assert.deepEqual( Array.from( path ).map( ( v, i ) => ( v > 0 ? i : - 1 ) ).filter( ( i ) => i >= 0 ), [ 0, 1, 2, 3, 4 ] );
+	assert.deepEqual( [ path[ 0 ], path[ 4 ] ], [ 1, 1 ], 'the ends are primary' );
+	assert.equal( path[ 12 ], 0, 'the neighbourhood is not part of the path set' );
+	assert.deepEqual( Array.from( tools.highlightSet( 'khop' ) ), Array.from( ring ), 'and the path not part of the neighbourhood' );
+	// without an argument: both, as before
+	const both = tools.highlightSet();
+	assert.equal( both.filter( ( v ) => v > 0 ).length, 10 );
+	tools.clear( 'khop' );
+	assert.equal( tools.highlightSet( 'khop' ), null );
+	assert.ok( tools.highlightSet( 'path' ) );
+	tools.clear();
+	assert.equal( tools.highlightSet( 'path' ), null );
+
+} );
