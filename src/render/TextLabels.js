@@ -69,6 +69,58 @@
 //  compares against the scene depth in the fragment shader with a soft threshold. Selected and
 //  hovered labels are always on top (`onTop`).
 //
+// ─── Community labels and semantic zoom ─────────────────────────────────────────────────────
+//  At overview distance a node label would cover a dozen nodes; what can be named there is the
+//  community. `clusterLabels` ('auto' | 'on' | 'off') adds one name per community of one hierarchy
+//  level (`clusterLevel`: 'auto' = the level of the app's community field, the module with
+//  isClusterField, followed when it changes; chooseFieldLevel() without one), at most
+//  `maxClusterLabels`, largest first, communities of at least `clusterMinSize` members:
+//   text     the data's name when it has one ( graph.clusterNames[ cluster ] ), else derived: the
+//            label of the member with the highest degree, followed by the member count in a lighter
+//            weight and opacity: "Valjean · 17" (communityNames() in Labels.js)
+//   place    centred on the LIVE centroid (buffers.clusterPos, read in the vertex stage; pushed out
+//            onto the sphere in the sphere layout), always on top: a name belongs to a region, not
+//            to a point in depth
+//   look     larger than node labels (clusterScale × 1…1.4 with the community's size), wider letter
+//            spacing, a light tint of the community's colour (the mean colour of its members, so it
+//            follows a colour lens), calmer opacity; fades back while a selection exists
+//   zoom     every community cross-fades on its own between its name and the labels of its nodes,
+//            driven by its projected size: t = communityFade(), the mean on-screen distance between
+//            neighbouring members (measured inside the finest communities, where the members
+//            actually sit) mapped from `clusterFade` = [ 28, 44 ] CSS px to 0…1: below, a node
+//            label would cover its neighbours, above, most labels fit. communityWeights( t ) gives
+//            the opacity of the name and, in mode 'auto', of the context labels of the members
+//            (a cross-fade with a dip, so the two never show at full strength together). Mode
+//            'all' keeps every node label at full strength, 'on' keeps every name.
+//            Graphs larger than autoMaxNodes get node labels this way too (the camera has to come
+//            close), but as a map names towns: the nodes of the resolved communities in degree
+//            order, at most `maxZoomLabels` at once (null = zoomLabelBudget(): one per 20000 CSS
+//            px² of the view, 16…80) with `zoomSpacingLarge` px of air around each. Without that
+//            limit the mid view of a 2000-node graph was 290 labels, a page of text. Graphs whose
+//            nodes have no names get none of these labels (an index says nothing; the selection,
+//            the hovered node and the neighbours still show theirs).
+//            A community whose members are spread through the whole graph (compactness() of the
+//            community field) is no place and gets no name.
+//   fit      a name sits on what it names: it is placed while its community is at least as large
+//            on screen as the name ( nameFits(): width ≤ `clusterFit` × projected diameter, the
+//            diameter being 2.58 rms radii ). Of the names that do not fit (a small projection of
+//            the graph: the far view, a phone) only those of the largest communities are placed:
+//            in order of size while together they cover no more than a fifth of the graph's
+//            projected disc ( looseNameArea() ), at most `maxLooseNames` (4). No name is wider than
+//            `clusterMaxWidth` (0.3) of the view: its font shrinks, down to 0.85 of the smallest
+//            name's ( nameScale() ). A view carries at most `maxNamesInView` names (null =
+//            nameBudget(): one per 80000 CSS px², 6…24), the largest communities in it first.
+//            With clusterLabels 'on' every name may be placed.
+//   overlap  one LabelGrid for everything, in priority order: selected, hovered, neighbours, the
+//            community names that dominate their cross-fade (t ≤ ½, largest first), context
+//            node labels, then the receding names, which only take what is free. All with the
+//            same hysteresis; a name additionally keeps `clusterSpacing` (half its font size) of
+//            air to whatever is placed already.
+//  A second small instanced draw (a child of `mesh`, drawn before the node labels): 3 vertex storage
+//  buffers (clusterPos, the label records, the glyphs), the shared atlas, the same fragment stage.
+//  All names are laid out once per graph (≤ 48 names, a few hundred glyphs); the draw is skipped
+//  while no name is visible.
+//
 // ─── Color pipeline ─────────────────────────────────────────────────────────────────────────
 //  WebGPURenderer applies tone mapping and the output color space only in the final output quad,
 //  never per material, so the mesh must emit what its target expects:
@@ -87,6 +139,13 @@
 //  const labels = app.use( new TextLabels( { mode: 'auto' } ) );   // App module, order 20
 //  someScene.add( labels.mesh );      // the module never adds it itself (or pass { scene })
 //  labels.mode = 'auto' | 'all' | 'off';   labels.maxLabels / maxNeighbors / autoMaxNodes
+//  labels.clusterLabels = 'auto' | 'on' | 'off'   community names: 'auto' cross-fades them with the
+//                      node labels (and hides them with mode 'off'), 'on' always shows them
+//  labels.clusterLevel = 'auto' | hierarchy height;   labels.maxClusterLabels (48)
+//  labels.maxZoomLabels = null | n     context labels the semantic zoom brings up in graphs beyond
+//                      autoMaxNodes (null = from the size of the view, see "zoom")
+//  labels.clusterText( cluster ) → the name shown for a community of the active level, or null
+//  labels.clusterMesh  the second draw (a child of labels.mesh)
 //  labels.fontSize (CSS px, null = 11, 12 on coarse pointers) / fontFamily / fontWeight
 //  labels.depthTest, labels.setSceneDepth( node | null ), labels.output, labels.gain
 //  labels.fadeTime, labels.interval, labels.hysteresis, labels.rebuildFont()
@@ -95,7 +154,11 @@
 //  labels.setGraph( buffers, graph, app ), labels.update( dt, app ), labels.dispose()
 //  uniforms worth tuning: color, emphasisColor, opacity, tint, haloColor, outline, outlineOpacity,
 //  shadowBlur, shadowOpacity, shadowOffset, weight, weightPx, embolden, selScale, pad, snap, hint,
-//  depthFade, contextFade, onTop, depthBias, occlusionSoftness, gain, blendGamma.
+//  depthFade, contextFade, onTop, depthBias, occlusionSoftness, gain, blendGamma; community names:
+//  clusterScale, clusterColor, clusterOpacity, clusterTint, clusterCount, clusterWeight,
+//  clusterFocusFade, clusterDepthFade.
+//  labels.stats: { labels, clusters (names shown), zoomBudget (0 = not limited by it), glyphs,
+//                  clusterGlyphs, capacity, atlas, … }
 //  Not supported: orthographic cameras, logarithmic depth, more than one canvas per instance.
 //  Tests / Node: pass { source: { raster, measure, metrics } } instead of the canvas glyph source.
 
@@ -106,7 +169,10 @@ import {
 	cameraViewMatrix, cameraProjectionMatrix, cameraNear, cameraFar, screenSize, screenUV,
 	perspectiveDepthToViewZ, sRGBTransferOETF,
 } from 'three/tsl';
-import { LabelGrid } from './Labels.js';
+import {
+	LabelGrid, communityNames, communityFade, communityWeights, communityScale, communitySpacing, nameFits, looseNameArea, nameScale, zoomLabelBudget, nameBudget,
+} from './Labels.js';
+import { chooseFieldLevel, levelCounts, clusterStats, clusterColors, compactness } from './ClusterField.js';
 import { GlyphAtlas, createCanvasRaster, segmentText, layoutUnits, makeKerning, SYSTEM_UI_FONT } from './sdfAtlas.js';
 
 export const CTX = 0, NB = 1, HOV = 2, SEL = 3;
@@ -135,6 +201,21 @@ export class TextLabels {
 			maxLabels: 300,
 			maxNeighbors: 40,
 			autoMaxNodes: 150,
+			clusterLabels: 'auto', // 'auto' | 'on' | 'off': community names, see the header
+			clusterLevel: 'auto', // hierarchy height of the named communities
+			maxClusterLabels: 48,
+			clusterMinSize: 3, // communities with fewer members get no name
+			clusterMaxChars: 22, // longer names are shortened
+			clusterLetterSpacing: 0.03, // em
+			clusterFade: [ 28, 44 ], // CSS px of member spacing over which a name hands over to node labels
+			clusterFit: 1, // widest name in projected diameters of its community (0 = any); wider ones are "loose"
+			maxLooseNames: 4, // names placed although they do not fit (the largest communities, see looseNameArea())
+			maxNamesInView: null, // names shown at once (null = by the size of the view, nameBudget())
+			clusterSpacing: 0.5, // free space a name keeps to what is placed already, in units of its font size
+			clusterMaxWidth: 0.3, // widest name as a share of the view's width (its font shrinks)
+			maxZoomLabels: null, // context labels the zoom brings up in graphs beyond autoMaxNodes (null = by the size of the view)
+			zoomSpacing: 5, // CSS px of free space a context label of the semantic zoom needs around it …
+			zoomSpacingLarge: 12, // … and in graphs beyond autoMaxNodes, where only the larger nodes are named
 			fontSize: null, // CSS px; null = 11 (12 on coarse pointers), like the HTML labels
 			fontFamily: SYSTEM_UI_FONT,
 			fontWeight: 500,
@@ -170,6 +251,13 @@ export class TextLabels {
 		this._maxLabels = o.maxLabels;
 		this._maxNeighbors = o.maxNeighbors;
 		this._autoMaxNodes = o.autoMaxNodes;
+		this._clusterLabels = o.clusterLabels;
+		this._clusterLevel = o.clusterLevel;
+		this._maxClusterLabels = o.maxClusterLabels;
+		this._maxZoomLabels = o.maxZoomLabels;
+		this._named = false; // the nodes of the graph have names (graph.labels)
+		this._field = null; // the app's community field (the level of the names follows it)
+		this._cl = null; // community names of the graph, built on first use (see _ensureClusters)
 		this._fontSize = o.fontSize;
 		this._fontFamily = o.fontFamily;
 		this._fontWeight = o.fontWeight;
@@ -217,6 +305,16 @@ export class TextLabels {
 			occlusionSoftness: uniform( 1 ), // soft depth comparison width in node radii (setSceneDepth)
 			gain: uniform( o.gain ), // 'linear' output only: multiplies the emitted color
 			blendGamma: uniform( o.output === 'srgb' ? 1 : LINEAR_BLEND_GAMMA ), // coverage remap, see the fragment stage
+			// community names
+			clusterGlyphCount: uniform( 0, 'uint' ),
+			clusterScale: uniform( 1.3 ), // font size of the smallest community name relative to node labels
+			clusterColor: uniform( new THREE.Color( 0xeef3ff ) ),
+			clusterOpacity: uniform( 0.82 ),
+			clusterTint: uniform( 0.4 ), // toward the community's colour
+			clusterCount: uniform( 0.6 ), // opacity of the member count relative to the name
+			clusterWeight: uniform( 0.007 ), // em added to the strokes of the name and taken from the count
+			clusterFocusFade: uniform( 0.6 ), // names lose this much while a selection exists
+			clusterDepthFade: uniform( 0.35 ), // far names keep 1 − clusterDepthFade of their opacity
 		};
 
 		this._geometry = quadGeometry();
@@ -229,7 +327,18 @@ export class TextLabels {
 		this.mesh.visible = false;
 		this.mesh.raycast = () => {};
 
-		this.stats = { labels: 0, glyphs: 0, capacity: 0, atlas: [ 0, 0 ], atlasGlyphs: 0, decisions: 0, decideMs: 0, uploads: 0, compactions: 0 };
+		// community names: a second draw, a child of the node labels' mesh so that it goes wherever
+		// that is put (the overlay scene); drawn first, so node labels are never under a name
+		this.clusterMesh = new THREE.Mesh( this._geometry, this._placeholder );
+		this.clusterMesh.name = 'TextLabels.communities';
+		this.clusterMesh.frustumCulled = false;
+		this.clusterMesh.renderOrder = o.renderOrder - 1;
+		this.clusterMesh.count = 0;
+		this.clusterMesh.visible = false;
+		this.clusterMesh.raycast = () => {};
+		this.mesh.add( this.clusterMesh );
+
+		this.stats = { labels: 0, clusters: 0, zoomBudget: 0, glyphs: 0, clusterGlyphs: 0, capacity: 0, atlas: [ 0, 0 ], atlasGlyphs: 0, decisions: 0, decideMs: 0, uploads: 0, compactions: 0 };
 
 		this._grid = new LabelGrid();
 		this._stateNode = null;
@@ -318,6 +427,75 @@ export class TextLabels {
 
 	}
 
+	/** Community names: 'auto' (cross-fading with the node labels) | 'on' (always) | 'off'. */
+	get clusterLabels() {
+
+		return this._clusterLabels;
+
+	}
+
+	set clusterLabels( v ) {
+
+		this._clusterLabels = v === 'on' || v === true ? 'on' : v === 'off' || v === false ? 'off' : 'auto';
+		this._dirty = true;
+
+	}
+
+	/** Hierarchy height of the named communities: 'auto' or 1 (finest) … D. */
+	get clusterLevel() {
+
+		return this._clusterLevel;
+
+	}
+
+	set clusterLevel( v ) {
+
+		if ( v === this._clusterLevel ) return;
+		this._clusterLevel = v;
+		this._disposeClusters();
+		this._dirty = true;
+
+	}
+
+	get maxClusterLabels() {
+
+		return this._maxClusterLabels;
+
+	}
+
+	set maxClusterLabels( v ) {
+
+		v = Math.max( 0, v | 0 );
+		if ( v === this._maxClusterLabels ) return;
+		this._maxClusterLabels = v;
+		this._disposeClusters();
+		this._dirty = true;
+
+	}
+
+	/** Context labels the semantic zoom may bring up in graphs beyond autoMaxNodes (null = by the size of the view). */
+	get maxZoomLabels() {
+
+		return this._maxZoomLabels;
+
+	}
+
+	set maxZoomLabels( v ) {
+
+		this._maxZoomLabels = v === null || v === undefined ? null : Math.max( 0, v | 0 );
+		this._dirty = true;
+
+	}
+
+	/** The name shown for community `cluster` (an index of the active level), or null. */
+	clusterText( cluster ) {
+
+		const cl = this._cl || ( this.graph ? this._ensureClusters( true ) : null );
+		const slot = cl && cl.K > 0 ? cl.slots.find( ( s ) => s.cluster === cluster ) : null;
+		return slot ? slot.text : null;
+
+	}
+
 	/** Font size in CSS px. */
 	get fontSize() {
 
@@ -383,7 +561,7 @@ export class TextLabels {
 	set visible( v ) {
 
 		this._visible = !! v;
-		this.mesh.visible = this._visible && this._G > 0 && this.mesh.material !== this._placeholder;
+		this._syncVisibility();
 
 	}
 
@@ -401,6 +579,13 @@ export class TextLabels {
 
 			this.mesh.material.depthTest = this._depthTest;
 			this.mesh.material.needsUpdate = true;
+
+		}
+
+		if ( this.clusterMesh.material !== this._placeholder ) {
+
+			this.clusterMesh.material.depthTest = this._depthTest;
+			this.clusterMesh.material.needsUpdate = true;
 
 		}
 
@@ -485,6 +670,7 @@ export class TextLabels {
 		for ( let i = 0; i < N; i ++ ) order[ i ] = i;
 		order.sort( ( a, b ) => graph.degree[ b ] - graph.degree[ a ] || a - b );
 		this._byDegree = order;
+		this._named = Array.isArray( graph.labels ) && graph.labels.some( ( t ) => t !== null && t !== undefined && t !== '' );
 
 		this._stateNode = instancedArray( Math.max( 1, N ), 'vec4' ).setName( 'labelState' );
 		this._L = this._stateNode.value.array;
@@ -528,6 +714,20 @@ export class TextLabels {
 		this._syncNodeSizing( app );
 		this._updateDepthRange( app );
 
+		// names on 'auto' sit on the volumes of the community field: follow its level
+		const cl = this._cl;
+		if ( cl && cl.auto ) {
+
+			const height = this._fieldHeight();
+			if ( height > 0 && height !== cl.height ) {
+
+				this._disposeClusters();
+				this._dirty = true;
+
+			}
+
+		}
+
 		const BU = this.buffers.uniforms;
 		const sel = BU.selectedIndex.value | 0, hov = BU.hoverIndex.value | 0;
 		let need = this._dirty || sel !== this._lastSel || hov !== this._lastHov;
@@ -546,6 +746,7 @@ export class TextLabels {
 
 		}
 
+		this._syncClusterColors();
 		this._flush();
 
 	}
@@ -559,6 +760,7 @@ export class TextLabels {
 	dispose() {
 
 		this._disposeGraph();
+		this.clusterMesh.removeFromParent();
 		this.mesh.removeFromParent();
 		this._geometry.dispose();
 		this._placeholder.dispose();
@@ -585,6 +787,7 @@ export class TextLabels {
 		this._G = 0;
 		this.uniforms.glyphCount.value = 0;
 		this.mesh.count = 0;
+		this._disposeClusters(); // laid out again with the new font on the next decision
 		this._dirty = true;
 		this._rebuildMaterial();
 
@@ -770,9 +973,12 @@ export class TextLabels {
 		const g = this.graph, N = g.N;
 		const L = this._L, stamp = this._stamp;
 		const gen = ++ this._gen;
-		let shown = 0, starved = false;
+		let shown = 0, starved = false, named = 0, zoomBudget = 0;
+		const showNodes = this._mode !== 'off' && N > 0;
+		const cmode = this._clusterLabels;
+		const cl = N > 0 && ( cmode === 'on' || ( cmode === 'auto' && showNodes ) ) ? this._ensureClusters() : null;
 
-		if ( this._mode !== 'off' && N > 0 ) {
+		if ( showNodes || cl ) {
 
 			const pos = app.positions && app.positions.length >= 4 * N ? app.positions : this.buffers.nodePos.value.array;
 			const cam = app.camera;
@@ -787,7 +993,7 @@ export class TextLabels {
 			const hyst = this.hysteresis;
 			let budget = this.options.measureBudget;
 
-			const place = ( i, kind, force ) => {
+			const place = ( i, kind, force, alpha = 1, margin = 0 ) => {
 
 				if ( stamp[ i ] === gen ) return false;
 				const x = pos[ 4 * i ], y = pos[ 4 * i + 1 ], z = pos[ 4 * i + 2 ];
@@ -822,7 +1028,7 @@ export class TextLabels {
 
 					// hysteresis: a shown label has to be overlapped clearly before it goes, a hidden one
 					// has to be clear of its neighbours before it comes back (no flicker at the threshold)
-					const h = L[ 4 * i + 1 ] > 0 ? - hyst : hyst;
+					const h = ( L[ 4 * i + 1 ] > 0 ? - hyst : hyst ) + margin;
 					if ( ! grid.free( x0 - 1 - h, y0 - h * 0.5, x1 + 1 + h, y1 + h * 0.5 ) ) return false;
 
 				}
@@ -838,15 +1044,15 @@ export class TextLabels {
 				}
 
 				stamp[ i ] = gen;
-				this._setTarget( i, 1, kind, now );
+				this._setTarget( i, alpha, kind, now );
 				shown ++;
 				return true;
 
 			};
 
-			const hasSel = sel >= 0 && sel < N;
+			const hasSel = showNodes && sel >= 0 && sel < N;
 			if ( hasSel ) place( sel, SEL, true );
-			if ( hov >= 0 && hov < N && hov !== sel ) place( hov, HOV, true );
+			if ( showNodes && hov >= 0 && hov < N && hov !== sel ) place( hov, HOV, true );
 			if ( hasSel ) {
 
 				const nb = this._neighborsSorted( sel );
@@ -854,14 +1060,58 @@ export class TextLabels {
 
 			}
 
-			if ( this._mode === 'all' || ( this._mode === 'auto' && N <= this._autoMaxNodes ) ) {
+			// community names: the ones that dominate their cross-fade claim their place before the
+			// context labels, the receding ones take what is left afterwards
+			if ( cl ) {
 
-				const order = this._byDegree, cap = this._maxLabels;
-				for ( let k = 0; k < N && shown < cap; k ++ ) place( order[ k ], CTX, false );
+				this._measureClusters( cl, pos, m, cam, W, H, P11, fontPx );
+				named += this._placeClusters( cl, now, grid, fontPx, hyst, W, H, true );
 
 			}
 
+			if ( showNodes ) {
+
+				const all = this._mode === 'all' || ( this._mode === 'auto' && N <= this._autoMaxNodes );
+				// semantic zoom ('auto' only): the context labels of a community show with its cross-fade t;
+				// graphs beyond autoMaxNodes get the labels of the communities the camera has resolved
+				const zoom = cl !== null && this._mode === 'auto' && ( cmode === 'auto' || ! all );
+				// … those labels exist only because of the zoom: they have a small budget of their own
+				// (the larger nodes, like towns on a map), and there are none when the nodes have no
+				// names: a few hundred indices say nothing
+				const zoomOnly = zoom && ! all;
+				zoomBudget = zoomOnly ? Math.min( this._maxLabels, this._maxZoomLabels ?? zoomLabelBudget( W, H ) ) : 0;
+				if ( all || ( zoomOnly && cl.resolved && this._named ) ) {
+
+					const order = this._byDegree, cap = all ? this._maxLabels : zoomBudget;
+					const anc = g.anc, D = g.D, l = zoom ? cl.height - 1 : 0, offset = zoom ? cl.offset : 0, fade = zoom ? cl.nodes : null;
+					// labels that the zoom brings up keep a distance from what is placed already: a map
+					// names the larger towns first and leaves air between them
+					const air = zoomOnly ? this.options.zoomSpacingLarge : this.options.zoomSpacing;
+					// mode 'all' / small graphs: the limit counts every label; the zoom's budget only its own
+					for ( let k = 0, context = 0; k < N && ( all ? shown : context ) < cap; k ++ ) {
+
+						const i = order[ k ];
+						if ( ! zoom ) place( i, CTX, false );
+						else {
+
+							const a = fade[ anc[ i * D + l ] - offset ];
+							if ( a >= 0.06 && place( i, CTX, false, a, air ) ) context ++;
+
+						}
+
+					}
+
+				}
+
+			}
+
+			if ( cl ) named += this._placeClusters( cl, now, grid, fontPx, hyst, W, H, false );
+
 		}
+
+		this._retireClusters( now );
+		this.stats.clusters = named;
+		this.stats.zoomBudget = zoomBudget;
 
 		// labels that were not placed this time fade out; fully faded ones leave the active list
 		const active = this._active, fade = this.uniforms.fade.value;
@@ -939,6 +1189,374 @@ export class TextLabels {
 
 		const L = this._L, o = 4 * i;
 		return L[ o ] + ( L[ o + 1 ] - L[ o ] ) * smooth( ( now - L[ o + 2 ] ) / this.uniforms.fade.value );
+
+	}
+
+	// ── community names ─────────────────────────────────────────────────────────────────────
+
+	/**
+	 * Names, glyphs, buffers and material of the community labels, built the first time they are
+	 * needed for a graph. Returns the state, or null when the graph has no communities to name.
+	 * @param {boolean} [namesOnly] only resolve the level and the texts (no GPU objects)
+	 */
+	_ensureClusters( namesOnly = false ) {
+
+		let cl = this._cl;
+		if ( cl && ( cl.built || namesOnly ) ) return cl.K > 0 ? cl : null;
+		const g = this.graph, o = this.options;
+		if ( ! cl ) {
+
+			const level = this._clusterLevel;
+			const hierarchy = g.D > 0 && g.anc && g.levelOffset;
+			// 'auto': the level whose volumes the community field draws, so a name sits on its volume
+			const auto = level === 'auto' || level === null || level === undefined;
+			let height = ! hierarchy ? 0 : auto ? this._fieldHeight() || chooseFieldLevel( levelCounts( g ) ) : Math.round( + level ) || 0;
+			if ( height !== 0 ) height = Math.min( g.D, Math.max( 1, height ) );
+			cl = this._cl = { height, auto, offset: 0, count: 0, K: 0, built: false, slots: [], resolved: false, live: 0, stateDirty: false, colorVersion: - 1, loose: 0, looseArea: 0, looseRoom: Infinity, looseStop: false, placed: 0, graphPx: Infinity };
+			if ( height === 0 || this._maxClusterLabels === 0 ) return null;
+			cl.offset = g.levelOffset[ height - 1 ];
+			cl.count = g.levelOffset[ height ] - cl.offset; // communities of the level
+			const picked = communityNames( g, height, { maxChars: o.clusterMaxChars } )
+				.filter( ( r ) => r.count >= o.clusterMinSize )
+				.sort( ( a, b ) => b.count - a.count || a.cluster - b.cluster )
+				.slice( 0, this._maxClusterLabels );
+			const largest = picked.length > 0 ? picked[ 0 ].count : 1;
+			cl.slots = picked.map( ( r ) => ( { cluster: r.cluster, k: r.cluster - cl.offset, count: r.count, name: r.name, tail: r.tail, text: r.text, scale: communityScale( r.count, largest ), shown: 0, widthEm: 0, gen: 0 } ) );
+			cl.K = cl.slots.length;
+			// per community of the level (not only the named ones), refreshed by every decision
+			cl.sx = new Float32Array( cl.count );
+			cl.sy = new Float32Array( cl.count );
+			cl.fade = new Float32Array( cl.count ); // position in the semantic zoom: 0 = a name, 1 = node labels
+			cl.name = new Float32Array( cl.count ); // opacity of the name …
+			cl.nodes = new Float32Array( cl.count ); // … and of the members' labels (communityWeights)
+			cl.weight = new Float32Array( cl.count ); // 0 = not a place (dispersed) or behind the camera
+			cl.spacing = new Float32Array( cl.count ); // world units: rms radius / √members of the finest communities
+			cl.radius = new Float32Array( cl.count ); // projected radius of the community, CSS px (1.29 × rms: the ball)
+			cl.stats = null;
+			// the finest communities inside each community of the level (their member spacing is the one that counts)
+			cl.fineParent = null;
+			if ( height > 1 && g.clusterParent && g.clusterHeight ) {
+
+				const K1 = g.levelOffset[ 1 ] - g.levelOffset[ 0 ];
+				cl.fineParent = new Int32Array( K1 );
+				for ( let j = 0; j < K1; j ++ ) {
+
+					let c = j;
+					while ( c >= 0 && g.clusterHeight[ c ] < height ) c = g.clusterParent[ c ];
+					cl.fineParent[ j ] = c - cl.offset;
+
+				}
+
+				cl.acc = new Float64Array( 2 * cl.count );
+				cl.fineStats = null;
+
+			}
+
+		}
+
+		if ( cl.K === 0 ) return null;
+		if ( namesOnly ) return cl;
+
+		// lay every name out once: the name, then the count in the second style
+		this._ensureAtlas();
+		const atlas = this.atlas, S = atlas.size;
+		const spacing = { kerning: this._kerning, letterSpacing: o.clusterLetterSpacing * S };
+		const records = [];
+		for ( let j = 0; j < cl.K; j ++ ) {
+
+			const slot = cl.slots[ j ];
+			const a = layoutUnits( segmentText( slot.name, { maxUnits: o.clusterMaxChars + 1 } ), atlas, spacing );
+			const b = layoutUnits( segmentText( slot.tail ), atlas, spacing );
+			const width = a.width + ( a.width > 0 ? spacing.letterSpacing : 0 ) + b.width;
+			slot.widthEm = width / S;
+			const half = width / 2;
+			for ( let k = 0; k < a.glyphs.length; k ++ ) records.push( [ j, a.x[ k ] - half, a.glyphs[ k ], 0 ] );
+			for ( let k = 0; k < b.glyphs.length; k ++ ) records.push( [ j, width - b.width + b.x[ k ] - half, b.glyphs[ k ], slot.name ? 1 : 0 ] );
+
+		}
+
+		const G = records.length;
+		cl.G = G;
+		cl.glyphNode = instancedArray( 2 * Math.max( 1, G ), 'vec4' ).setName( 'clusterLabelGlyphs' );
+		const A = cl.glyphNode.value.array;
+		for ( let r = 0; r < G; r ++ ) {
+
+			const [ j, x, glyph, style ] = records[ r ];
+			// A = ( label, x of the cell's left edge from the CENTRE of the line, top above the baseline, style ), em
+			A.set( [ j, ( x + glyph.left ) / S, glyph.top / S, style, glyph.x, glyph.y, glyph.w, glyph.h ], 8 * r );
+
+		}
+
+		// two records per name: ( alpha0, alpha1, t0, font scale ), ( cluster index, rgb of the community )
+		cl.stateNode = instancedArray( 2 * cl.K, 'vec4' ).setName( 'clusterLabelState' );
+		const T = cl.S = cl.stateNode.value.array;
+		for ( let j = 0; j < cl.K; j ++ ) {
+
+			cl.slots[ j ].shown = cl.slots[ j ].scale; // the scale on screen: limited on narrow views (nameScale())
+			T.set( [ 0, 0, - 1e3, cl.slots[ j ].scale, cl.slots[ j ].cluster, 1, 1, 1 ], 8 * j );
+
+		}
+
+		cl.built = true;
+		cl.colorVersion = - 1;
+		this._syncClusterColors();
+		this.uniforms.clusterGlyphCount.value = G;
+		this.clusterMesh.count = 2 * G;
+		this.stats.clusterGlyphs = G;
+		this._rebuildClusterMaterial();
+		return cl;
+
+	}
+
+	/**
+	 * Screen position, cross-fade and weight of every community of the level for this decision,
+	 * from the readback (the GPU draws the names at the live centroid; the two differ by what the
+	 * layout moved in a frame or two, which the collision boxes tolerate).
+	 */
+	_measureClusters( cl, pos, m, cam, W, H, P11, fontPx = this.fontSize ) {
+
+		const g = this.graph, BU = this.buffers.uniforms;
+		const s = cl.stats = clusterStats( g, pos, cl.height, cl.stats );
+		const [ lo, hi ] = this.options.clusterFade;
+
+		// no name is wider than a share of the view: its font shrinks (nameScale(); a resize, rarely more)
+		const size = fontPx * this.uniforms.clusterScale.value, share = this.options.clusterMaxWidth;
+		for ( let j = 0; j < cl.K; j ++ ) {
+
+			const slot = cl.slots[ j ];
+			const scale = share > 0 ? nameScale( slot.scale, slot.widthEm * size, W, { share } ) : slot.scale;
+			if ( scale === slot.shown ) continue;
+			slot.shown = scale;
+			cl.S[ 8 * j + 3 ] = scale;
+			cl.stateDirty = true;
+
+		}
+
+		// projected radius of the whole graph (for the names that do not fit their community)
+		let gx = 0, gy = 0, gz = 0;
+		for ( let k = 0; k < cl.count; k ++ ) {
+
+			const n = s.size[ k ];
+			gx += n * s.center[ 3 * k ]; gy += n * s.center[ 3 * k + 1 ]; gz += n * s.center[ 3 * k + 2 ];
+
+		}
+
+		const total = Math.max( 1, s.total );
+		const gw = ( m[ 3 ] * gx + m[ 7 ] * gy + m[ 11 ] * gz ) / total + m[ 15 ];
+		cl.graphPx = gw > cam.near ? 1.29 * s.graphRms * P11 * H * 0.5 / gw : Infinity; // the camera is inside or past it: no limit
+		cl.looseRoom = looseNameArea( cl.graphPx );
+		cl.loose = cl.looseArea = cl.placed = 0;
+		cl.looseStop = false;
+
+		const sphere = BU.layoutBlend ? Math.min( 1, Math.max( 0, BU.layoutBlend.value ) ) : 0;
+		const gc = BU.graphCenter ? BU.graphCenter.value : null, sr = BU.sphereRadius ? BU.sphereRadius.value : 0;
+		// member spacing in world units: the community's own or that of the finest communities inside
+		// it, whichever is smaller (communitySpacing())
+		const sp = cl.spacing, acc = cl.acc;
+		if ( cl.fineParent ) {
+
+			const f = cl.fineStats = clusterStats( g, pos, 1, cl.fineStats );
+			acc.fill( 0 );
+			for ( let j = 0; j < f.count; j ++ ) {
+
+				const n = f.size[ j ], k = cl.fineParent[ j ];
+				if ( n < 3 || k < 0 ) continue;
+				acc[ 2 * k ] += Math.sqrt( n ) * f.rms[ j ]; // n · rms / √n
+				acc[ 2 * k + 1 ] += n;
+
+			}
+
+		}
+
+		for ( let k = 0; k < cl.count; k ++ ) sp[ k ] = communitySpacing( s.rms[ k ], s.size[ k ], acc ? acc[ 2 * k ] : 0, acc ? acc[ 2 * k + 1 ] : 0 );
+
+		// communities of one or two nodes have no size of their own: they take the spacing of the
+		// typical (median) community, so their nodes get labels when their surroundings do
+		const known = Array.from( sp ).filter( ( v ) => v > 0 ).sort( ( a, b ) => a - b );
+		const typical = known.length > 0 ? known[ known.length >> 1 ] : s.graphRms / Math.sqrt( Math.max( 1, s.total ) );
+		let resolved = false;
+		for ( let k = 0; k < cl.count; k ++ ) {
+
+			let x = s.center[ 3 * k ], y = s.center[ 3 * k + 1 ], z = s.center[ 3 * k + 2 ];
+			if ( sphere > 0 && gc ) {
+
+				// the centroid of a cap lies inside the sphere: the name goes out onto it, like the glow
+				const dx = x - gc.x, dy = y - gc.y, dz = z - gc.z, d = Math.max( 1e-4, Math.hypot( dx, dy, dz ) );
+				x += ( gc.x + dx / d * sr - x ) * sphere; y += ( gc.y + dy / d * sr - y ) * sphere; z += ( gc.z + dz / d * sr - z ) * sphere;
+
+			}
+
+			const cw = m[ 3 ] * x + m[ 7 ] * y + m[ 11 ] * z + m[ 15 ];
+			if ( ! ( cw > cam.near ) || s.size[ k ] === 0 ) {
+
+				cl.weight[ k ] = 0;
+				cl.fade[ k ] = cl.name[ k ] = cl.nodes[ k ] = cl.radius[ k ] = 0;
+				continue;
+
+			}
+
+			cl.sx[ k ] = ( ( m[ 0 ] * x + m[ 4 ] * y + m[ 8 ] * z + m[ 12 ] ) / cw * 0.5 + 0.5 ) * W;
+			cl.sy[ k ] = ( 0.5 - ( m[ 1 ] * x + m[ 5 ] * y + m[ 9 ] * z + m[ 13 ] ) / cw * 0.5 ) * H;
+			cl.radius[ k ] = 1.29 * s.rms[ k ] * P11 * H * 0.5 / cw;
+			// projected spacing = 1.29 · ( rms / √n ) · √π · px per unit (a uniform ball of radius r has an rms radius of 0.775 r)
+			const rPx = 1.29 * ( sp[ k ] > 0 ? sp[ k ] : typical ) * P11 * H * 0.5 / cw;
+			const t = Math.round( communityFade( rPx, 1, { lo, hi } ) * 16 ) / 16;
+			const w = communityWeights( t );
+			cl.fade[ k ] = t;
+			cl.name[ k ] = w.name;
+			cl.nodes[ k ] = Math.round( w.nodes * 16 ) / 16;
+			cl.weight[ k ] = compactness( s.rms[ k ], s.size[ k ], s.graphRms, s.total );
+			if ( cl.nodes[ k ] >= 0.06 ) resolved = true;
+
+		}
+
+		cl.resolved = resolved;
+
+	}
+
+	/**
+	 * Places the community names of one priority class: `dominant` = the names of communities in
+	 * the first half of their cross-fade (t ≤ ½). Returns how many were placed.
+	 */
+	_placeClusters( cl, now, grid, fontPx, hyst, W, H, dominant ) {
+
+		const gen = this._gen, always = this._clusterLabels === 'on';
+		const size = fontPx * this.uniforms.clusterScale.value;
+		const fit = always ? 0 : this.options.clusterFit, air = this.options.clusterSpacing;
+		const most = always ? Infinity : this.options.maxNamesInView ?? nameBudget( W, H );
+		let placed = 0;
+		for ( let j = 0; j < cl.K && cl.placed < most; j ++ ) {
+
+			const slot = cl.slots[ j ], k = slot.k;
+			if ( slot.gen === gen ) continue;
+			const alpha = Math.round( ( always ? 1 : cl.name[ k ] ) * cl.weight[ k ] * 16 ) / 16;
+			if ( alpha < 0.06 || ( always || cl.fade[ k ] <= 0.5 ) !== dominant ) continue;
+			const F = size * slot.shown;
+			const width = slot.widthEm * F;
+			const hw = width * 0.5 + 3, hh = F * 0.66;
+			const sx = cl.sx[ k ], sy = cl.sy[ k ];
+			if ( sx + hw < 0 || sx - hw > W || sy + hh < 0 || sy - hh > H ) continue;
+			const was = cl.S[ 8 * j + 1 ] > 0;
+			// a name sits on what it names; of those that are wider than their community only the
+			// largest few are placed (the slots are in order of size). A shown name keeps its place
+			// a little longer than a hidden one needs to get it (no flicker at the threshold)
+			const loose = fit > 0 && ! nameFits( width, cl.radius[ k ], was ? fit * 1.1 : fit );
+			if ( loose && ( cl.looseStop || cl.loose >= this.options.maxLooseNames || cl.looseArea + width * 2 * hh > cl.looseRoom ) ) {
+
+				cl.looseStop = true; // the following names belong to smaller communities
+				continue;
+
+			}
+
+			const h = ( was ? - hyst : hyst ) + air * F;
+			if ( ! grid.free( sx - hw - h, sy - hh - h * 0.5, sx + hw + h, sy + hh + h * 0.5 ) ) continue;
+			grid.insert( sx - hw, sy - hh, sx + hw, sy + hh );
+			if ( loose ) {
+
+				cl.loose ++;
+				cl.looseArea += width * 2 * hh;
+
+			}
+
+			slot.gen = gen;
+			this._setClusterTarget( cl, j, alpha, now );
+			placed ++;
+			cl.placed ++;
+
+		}
+
+		return placed;
+
+	}
+
+	/** Hierarchy height of the app's community field for this graph (0: there is none, or it has no level). */
+	_fieldHeight() {
+
+		const app = this.app, modules = app && app.modules;
+		let field = this._field;
+		if ( ! field || ! modules || ! modules.includes( field ) ) field = this._field = ( modules && modules.find( ( m ) => m && m.isClusterField ) ) || null;
+		return field && field.graph === this.graph && field.height > 0 ? field.height : 0;
+
+	}
+
+	/** Names that were not placed by the decision in progress fade out. */
+	_retireClusters( now ) {
+
+		const cl = this._cl;
+		if ( ! cl || ! cl.built ) return;
+		for ( let j = 0; j < cl.K; j ++ ) if ( cl.slots[ j ].gen !== this._gen ) this._setClusterTarget( cl, j, 0, now );
+
+	}
+
+	_setClusterTarget( cl, j, alpha, now ) {
+
+		const T = cl.S, o = 8 * j;
+		if ( T[ o + 1 ] === alpha ) return;
+		T[ o ] = T[ o ] + ( T[ o + 1 ] - T[ o ] ) * smooth( ( now - T[ o + 2 ] ) / this.uniforms.fade.value );
+		T[ o + 1 ] = alpha;
+		T[ o + 2 ] = now;
+		cl.stateDirty = true;
+
+	}
+
+	/** Current eased alpha of the name of slot j (what the shader computes, before the fades). */
+	clusterAlphaOf( j, now = performance.now() / 1000 - this._time0 ) {
+
+		const cl = this._cl;
+		if ( ! cl || ! cl.built || ! ( j >= 0 && j < cl.K ) ) return 0;
+		const T = cl.S, o = 8 * j;
+		return T[ o ] + ( T[ o + 1 ] - T[ o ] ) * smooth( ( now - T[ o + 2 ] ) / this.uniforms.fade.value );
+
+	}
+
+	/** Tint of every name: the mean colour of the community's members (palette or colour lens). */
+	_syncClusterColors() {
+
+		const cl = this._cl;
+		if ( ! cl || ! cl.built ) return;
+		const target = this.buffers.nodeColorTarget;
+		const colors = target && target.value;
+		if ( ! colors || cl.colorVersion === colors.version ) return;
+		cl.colorVersion = colors.version;
+		const mean = cl.mean = clusterColors( this.graph, colors.array, cl.height, cl.mean );
+		const T = cl.S;
+		for ( let j = 0; j < cl.K; j ++ ) {
+
+			const k = cl.slots[ j ].k;
+			const r = mean[ 3 * k ], g = mean[ 3 * k + 1 ], b = mean[ 3 * k + 2 ];
+			const top = Math.max( r, g, b );
+			if ( top > 1e-4 ) T.set( [ r / top, g / top, b / top ], 8 * j + 5 );
+			else T.set( [ 1, 1, 1 ], 8 * j + 5 );
+
+		}
+
+		cl.stateDirty = true;
+
+	}
+
+	_disposeClusters() {
+
+		const cl = this._cl;
+		this._cl = null;
+		const m = this.clusterMesh.material;
+		if ( m && m !== this._placeholder ) {
+
+			this.clusterMesh.material = this._placeholder;
+			m.dispose();
+
+		}
+
+		this.clusterMesh.visible = false;
+		this.clusterMesh.count = 0;
+		this.uniforms.clusterGlyphCount.value = 0;
+		this.stats.clusters = 0;
+		this.stats.clusterGlyphs = 0;
+		if ( cl && cl.built ) {
+
+			cl.glyphNode.value.dispose();
+			cl.stateNode.value.dispose();
+
+		}
 
 	}
 
@@ -1081,6 +1699,14 @@ export class TextLabels {
 
 		const shift = now - 8, L = this._L;
 		for ( let o = 2; o < L.length; o += 4 ) L[ o ] = Math.max( - 1e3, L[ o ] - shift );
+		const cl = this._cl;
+		if ( cl && cl.built ) {
+
+			for ( let o = 2; o < cl.S.length; o += 8 ) cl.S[ o ] = Math.max( - 1e3, cl.S[ o ] - shift );
+			cl.stateDirty = true;
+
+		}
+
 		this._time0 += shift;
 		this._lastDecision -= shift;
 		this._stateRange = [ 0, L.length / 4 - 1 ];
@@ -1113,12 +1739,41 @@ export class TextLabels {
 
 		}
 
+		const cl = this._cl;
+		if ( cl && cl.built ) {
+
+			if ( cl.stateDirty ) {
+
+				cl.stateNode.value.needsUpdate = true;
+				cl.stateDirty = false;
+				this.stats.uploads ++;
+
+			}
+
+			// names that show or are still fading out
+			const T = cl.S, now = this.uniforms.time.value, fade = this.uniforms.fade.value;
+			let live = 0;
+			for ( let o = 0; o < T.length; o += 8 ) if ( T[ o + 1 ] > 0 || now - T[ o + 2 ] <= fade ) live ++;
+			cl.live = live;
+
+		}
+
 		this._syncAtlas();
 		this.uniforms.glyphCount.value = this._G;
 		this.mesh.count = 2 * this._G;
-		this.mesh.visible = this._visible && this._G > 0 && this.mesh.material !== this._placeholder;
+		this._syncVisibility();
 		this.stats.glyphs = this._G;
 		this.stats.capacity = this._capacity;
+
+	}
+
+	/** The node labels' mesh is the parent of the community names: it is visible while either draws. */
+	_syncVisibility() {
+
+		const cl = this._cl;
+		const names = this._visible && !! cl && cl.built && cl.live > 0 && cl.G > 0 && this.clusterMesh.material !== this._placeholder;
+		this.clusterMesh.visible = names;
+		this.mesh.visible = this._visible && ( this._G > 0 || names ) && this.mesh.material !== this._placeholder;
 
 	}
 
@@ -1130,20 +1785,30 @@ export class TextLabels {
 		const old = this.mesh.material;
 		this.mesh.material = this._buildMaterial();
 		if ( old && old !== this._placeholder ) old.dispose();
+		this._rebuildClusterMaterial();
+
+	}
+
+	_rebuildClusterMaterial() {
+
+		const cl = this._cl;
+		if ( ! cl || ! cl.built || ! this.buffers || ! this.atlas ) return;
+		const old = this.clusterMesh.material;
+		this.clusterMesh.material = this._buildClusterMaterial( cl );
+		if ( old && old !== this._placeholder ) old.dispose();
 
 	}
 
 	_buildMaterial() {
 
 		const U = this.uniforms, buffers = this.buffers;
-		const glyphs = this._glyphNode, labelState = this._stateNode, atlasTex = this._atlasNode;
+		const glyphs = this._glyphNode, labelState = this._stateNode;
 		const focus = buffers.uniforms.focus;
 		const atlas = this.atlas;
-		const S = atlas.size, BUF = atlas.buffer, EDGE = atlas.edge, RANGE = atlas.radius;
-		const REACH = EDGE * RANGE; // texels of field outside the outline (= BUF for the defaults)
+		const S = atlas.size, BUF = atlas.buffer;
+		const REACH = atlas.edge * atlas.radius; // texels of field outside the outline (= BUF for the defaults)
 		const srgb = this._output === 'srgb';
 		const fromState = this.options.emphasis !== 'class';
-		const shadow = !! this.options.shadow;
 		const depthNode = this._depthNode;
 
 		const vUv = varyingProperty( 'vec2', 'vLabelUv' ); // atlas texel coordinates
@@ -1272,7 +1937,26 @@ export class TextLabels {
 
 		} )();
 
-		material.colorNode = Fn( () => {
+		material.colorNode = this._inkNode( { vUv, vCell, vColor, vParams, vDepth }, depthNode );
+		return material;
+
+	}
+
+	/**
+	 * Fragment stage shared by the node labels and the community names: SDF ink or halo of one
+	 * glyph quad. Varyings: vUv (atlas texels), vCell (cell rect), vColor (encoded rgb, alpha),
+	 * vParams ( grow px, layer 0 halo / 1 fill, target px per CSS px, on-top ), vDepth ( label
+	 * distance, softness, halo density 0..1 ). depthNode: scene depth for the soft occlusion or null.
+	 */
+	_inkNode( { vUv, vCell, vColor, vParams, vDepth }, depthNode ) {
+
+		const U = this.uniforms, atlasTex = this._atlasNode;
+		const atlas = this.atlas;
+		const EDGE = atlas.edge, RANGE = atlas.radius;
+		const REACH = EDGE * RANGE; // texels of field outside the outline
+		const shadow = !! this.options.shadow;
+
+		return Fn( () => {
 
 			// screen px per atlas texel from the derivative of the texel coordinate (x and y differ
 			// by the hinting stretch; the mean is exact to a few percent)
@@ -1317,6 +2001,103 @@ export class TextLabels {
 
 		} )();
 
+	}
+
+	/** The community names: the node labels' vertex stage without a node (centred text on clusterPos). */
+	_buildClusterMaterial( cl ) {
+
+		const U = this.uniforms, buffers = this.buffers, BU = buffers.uniforms;
+		const glyphs = cl.glyphNode, records = cl.stateNode;
+		const atlas = this.atlas;
+		const S = atlas.size, BUF = atlas.buffer, REACH = atlas.edge * atlas.radius;
+		const srgb = this._output === 'srgb';
+
+		const vUv = varyingProperty( 'vec2', 'vNameUv' );
+		const vCell = varyingProperty( 'vec4', 'vNameCell' );
+		const vColor = varyingProperty( 'vec4', 'vNameColor' );
+		const vParams = varyingProperty( 'vec4', 'vNameParams' );
+		const vDepth = varyingProperty( 'vec3', 'vNameDepth' );
+
+		const material = new THREE.NodeMaterial();
+		material.name = 'TextLabels.communities';
+		material.lights = false;
+		material.fog = false;
+		material.transparent = true;
+		material.depthWrite = false;
+		material.depthTest = this._depthTest;
+		material.premultipliedAlpha = true;
+		material.side = THREE.DoubleSide;
+
+		const encode = ( c ) => ( srgb ? sRGBTransferOETF( c ) : c.mul( U.gain ) );
+
+		material.vertexNode = Fn( () => {
+
+			const G = U.clusterGlyphCount;
+			const isFill = instanceIndex.greaterThanEqual( G );
+			const gi = instanceIndex.sub( select( isFill, G, uint( 0 ) ) ).toVar( 'nGlyph' );
+			const gA = glyphs.element( gi.mul( uint( 2 ) ) ).toVar( 'nGA' );
+			const gB = glyphs.element( gi.mul( uint( 2 ) ).add( uint( 1 ) ) ).toVar( 'nGB' );
+			const slot = uint( gA.x.add( 0.5 ) ).toVar( 'nSlot' );
+			const lab = records.element( slot.mul( uint( 2 ) ) ).toVar( 'nState' ); // alpha0, alpha1, t0, font scale
+			const info = records.element( slot.mul( uint( 2 ) ).add( uint( 1 ) ) ).toVar( 'nInfo' ); // cluster, rgb
+			const layer = select( isFill, float( 1 ), float( 0 ) );
+			const count = gA.w; // 1: the member count (lighter)
+
+			// the live centroid; in the sphere layout the communities lie on the sphere
+			const cp = buffers.clusterPos.element( uint( info.x.add( 0.5 ) ) ).xyz.toVar( 'nCentroid' );
+			const rel = cp.sub( BU.graphCenter ).toVar( 'nRel' );
+			const onSphere = BU.graphCenter.add( rel.div( max( length( rel ), 1e-4 ) ).mul( BU.sphereRadius ) );
+			const world = mix( cp, onSphere, clamp( BU.layoutBlend, 0, 1 ) );
+
+			const k = clamp( U.time.sub( lab.z ).div( U.fade ), 0, 1 );
+			const present = mix( lab.x, lab.y, k.mul( k ).mul( k.mul( - 2 ).add( 3 ) ) );
+			const center = cameraViewMatrix.mul( vec4( world, 1 ) ).xyz.toVar( 'nCenter' );
+			const dist = center.z.negate();
+			const depthT = clamp( dist.sub( U.depthRange.x ).mul( U.depthRange.y ), 0, 1 );
+			const alpha = present
+				.mul( float( 1 ).sub( U.clusterDepthFade.mul( depthT ) ) )
+				.mul( float( 1 ).sub( U.clusterFocusFade.mul( BU.focus ) ) ).toVar( 'nAlpha' );
+
+			const css = screenSize.y.div( U.cssHeight ).toVar( 'nCss' );
+			const F = U.fontSize.mul( css ).mul( U.clusterScale ).mul( lab.w ).toVar( 'nF' ); // target px per em
+			const xh = U.xHeight.mul( F );
+			const hintY = mix( float( 1 ), max( floor( xh.add( 0.5 ) ), 1 ).div( xh ), U.hint.mul( smoothstep( 24, 40, F ).oneMinus() ) );
+
+			const clipC = cameraProjectionMatrix.mul( vec4( center, 1 ) ).toVar( 'nClip' );
+			const sp = clipC.xy.div( clipC.w ).mul( 0.5 ).add( 0.5 ).mul( screenSize );
+			const oy = sp.y.sub( U.baseline.mul( F ) );
+			const origin = vec2( mix( sp.x, floor( sp.x.add( 0.5 ) ), U.snap ), mix( oy, floor( oy.add( 0.5 ) ), U.snap ) );
+
+			const tpp = float( S ).div( F ).toVar( 'nTpp' );
+			const reachPx = float( REACH ).div( tpp );
+			const growFill = U.weightPx.add( F.mul( U.weight.add( U.clusterWeight.mul( float( 1 ).sub( count.mul( 2 ) ) ) ) ) );
+			const growHalo = min( U.outline.mul( 1.2 ).mul( css ), max( reachPx.sub( 1.25 ), 0 ) );
+			const grow = select( isFill, growFill, growHalo ).toVar( 'nGrow' );
+			const inset = select( isFill, clamp( float( BUF ).sub( growFill.add( 1 ).mul( tpp ).add( 1 ) ), 0, BUF ), float( 0 ) );
+			const t = positionGeometry.xy.mul( gB.zw.sub( inset.mul( 2 ) ) ).add( inset ).toVar( 'nT' );
+			const em = vec2( gA.y.add( t.x.div( S ) ), gA.z.sub( t.y.div( S ) ) );
+			const P = origin.add( em.mul( vec2( F, F.mul( hintY ) ) ) );
+			const ndc = P.div( screenSize ).mul( 2 ).sub( 1 );
+
+			// a name belongs to a region, not to a depth: always in front
+			const zNear = cameraNear.negate().mul( 1.001 );
+			const cz = cameraProjectionMatrix.mul( vec4( 0, 0, zNear, 1 ) );
+
+			const fillC = mix( U.clusterColor, info.yzw, U.clusterTint );
+			const fillA = U.clusterOpacity.mul( mix( float( 1 ), U.clusterCount, count ) );
+
+			vUv.assign( gB.xy.add( t ) );
+			vCell.assign( vec4( gB.xy, gB.xy.add( gB.zw ) ) );
+			vColor.assign( vec4( encode( select( isFill, fillC, U.haloColor ) ), alpha.mul( select( isFill, fillA, mix( float( 1 ), float( 0.8 ), count ) ) ) ) );
+			vParams.assign( vec4( grow, layer, css, 1 ) );
+			vDepth.assign( vec3( dist, 1, 0.5 ) );
+
+			const visible = alpha.greaterThan( 1 / 255 ).and( clipC.w.greaterThan( cameraNear ) ).and( gB.z.greaterThan( 0 ) );
+			return select( visible, vec4( ndc, cz.z.div( cz.w ), 1 ), vec4( 0, 0, 2, 1 ) );
+
+		} )();
+
+		material.colorNode = this._inkNode( { vUv, vCell, vColor, vParams, vDepth }, null );
 		return material;
 
 	}
@@ -1331,6 +2112,7 @@ export class TextLabels {
 
 		}
 
+		this._disposeClusters();
 		this.mesh.visible = false;
 		this.mesh.count = 0;
 		this._stateNode?.value.dispose();

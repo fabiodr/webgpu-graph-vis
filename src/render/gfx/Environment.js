@@ -36,6 +36,30 @@
 //    (the backdrop colour distant things fade to), fogStart / fogDensity (see `fog`).
 //  • The paper's faint latitude / longitude guide sphere that fades in with the sphere layout
 //    (thin anti-aliased lines, additive, no depth write, opacity × uniforms.layoutBlend).
+//  • Depth motes (`dust`): a sparse field of tiny dim points in the volume around the graph, dust
+//    in the key light's beam rather than stars. They are fixed in the world (plus a drift of a few
+//    pixels per minute), so they slide past each other when the camera moves and give the empty
+//    space parallax and scale. One instanced draw of ENV_MOTES[ tier ] quads (0 in the low tier:
+//    nothing is drawn or allocated), positions hashed from the instance index in the vertex stage
+//    (no buffer, no texture).
+//    Scale: the dust lives in MOTE_OCTAVES lattices of cubic cells, each a third of the size of the
+//    one before (the largest spans the volume around the graph, 2 · MOTE_VOLUME graph radii). A
+//    mote has one position inside its octave's cell; the copy that is drawn is the one nearest to
+//    the point the camera looks at (wrap-around), faded out toward the border of the cell, so the
+//    wrap is never seen. Sizes scale with the octave. The view therefore holds about the same
+//    number of motes of about the same on-screen size at every zoom, from the overview to a
+//    close-up of one node, and every one of them stays where it is in the world.
+//    Point response: each mote is a Gaussian sprite of a WORLD size. Its drawn radius never drops
+//    below 1.1 px and grows by the shared circle of confusion (cocPixels), while its radiance
+//    falls by ( true radius / drawn radius )², so the light it sends stays what a point of that
+//    size would send: far motes fade out instead of popping or twinkling under the TRAA jitter,
+//    defocused ones turn into faint discs (moteResponse()).
+//    Light: brighter inside the beam of the key light through the graph, fogged with the shared
+//    fog, only within MOTE_VOLUME graph radii of the graph, hidden behind nodes (depth test, no
+//    depth write), additive. In the TRAA tiers a mote writes its own motion vector where the
+//    sprite has weight (the velocity attachment blends per pixel), so the history follows it
+//    under camera motion instead of averaging it away. The lattice is tied to a quantised graph
+//    radius (quantizeRadius); when that changes, the dust fades out, re-scales and fades in.
 //
 // ─── Public API ─────────────────────────────────────────────────────────────────────────────
 //   const env = app.use( new Environment( { preset: 'aurora', guide: true } ) );   // order 12
@@ -48,6 +72,8 @@
 //   env.fog                        0..1 depth cue: 0 off, 1 = the far side of the graph keeps
 //                                  about 40 % of its light. Starts a little in front of the
 //                                  graph centre, density is relative to the graph radius.
+//   env.dust                       0..1 depth motes: 0 off (not drawn), 1 = clearly visible dust.
+//                                  Presets: aurora 0.4, void 0.2, studio 0
 //   env.setKeyDirection( v )       world-space direction TOWARD the light (Vector3 or [x,y,z])
 //   env.keyDirection               Vector3 (read only; use setKeyDirection)
 //   env.shadowSoftness             penumbra as a fraction of the base node radius (default 0.3)
@@ -58,19 +84,21 @@
 //   env.updateSky()                force a regeneration of the environment in the next frame
 //   env.stats                      { shadowRenders, skyRenders, shadowRadius, shadowTexel (world
 //                                  units), shadowTexels (node radius in texels), shadowStrength
-//                                  (0..1 from shadowResolve), shadowCasting, boundsRadius, … }
+//                                  (0..1 from shadowResolve), shadowCasting, boundsRadius,
+//                                  motes (drawn instances), … }
 //   env.guide = false; env.guideOpacity = 0.08; env.setColors( center, edge )   (as Background)
 //   env.setGraph( buffers, graph, app ), env.update( dt, app ), env.dispose()
 //
 // Pure helpers (tested in test/environment.test.js): skyRadiance, skyIrradiance, quantizeRadius,
-// fitShadowBox, shadowResolve, fogParameters, boundsOfPositions.
+// fitShadowBox, shadowResolve, fogParameters, boundsOfPositions, moteResponse.
 import * as THREE from 'three/webgpu';
 import {
 	Fn, uniform, vec2, vec3, vec4, float, screenUV, screenSize, exp, mix, smoothstep, normalWorldGeometry,
-	uv, fract, abs, fwidth, clamp, max, sin, frontFacing, positionGeometry, positionLocal, select, normalize,
-	dot, length,
+	uv, fract, abs, fwidth, clamp, max, min, sin, sqrt, pow, frontFacing, positionGeometry, positionLocal, select, normalize,
+	dot, length, floor, uint, instanceIndex, hash, varyingProperty, cameraViewMatrix, cameraProjectionMatrix, cameraNear, mrt, output, step,
 } from 'three/tsl';
-import { gfxUniforms, gfxState, skipVelocity } from './shared.js';
+import { gfxUniforms, gfxState, skipVelocity, motionVector, fogTransmittance, cocPixels } from './shared.js';
+import { pixelsPerUnit, quadGeometry } from './impostor.js';
 
 // ── presets ──────────────────────────────────────────────────────────────────────────────────
 // Colours are linear RGB. `key.light` is the DirectionalLight intensity, `key.box` the radiance of
@@ -92,6 +120,7 @@ export const ENV_PRESETS = {
 		envIntensity: 1.2,
 		shadow: 0.8,
 		fog: 0.45,
+		dust: 0.4,
 		nodes: { roughness: 0.26, emissive: 2, rim: 0.55 },
 	},
 	// neutral product-shot lighting: larger white soft box, grey sweep, stronger key-to-fill ratio
@@ -107,6 +136,7 @@ export const ENV_PRESETS = {
 		envIntensity: 0.6,
 		shadow: 1,
 		fog: 0.3,
+		dust: 0,
 		nodes: { roughness: 0.34, emissive: 0.7, rim: 0.3 },
 	},
 	// pure black behind the graph, maximum contrast; lighting as aurora, a little less fill
@@ -122,9 +152,19 @@ export const ENV_PRESETS = {
 		envIntensity: 1.2,
 		shadow: 0.8,
 		fog: 0.4,
+		dust: 0.2,
 		nodes: { roughness: 0.26, emissive: 2.2, rim: 0.6 },
 	},
 };
+
+/** Depth motes drawn per quality tier (0 = none). About 4 % of them are in view at a time. */
+export const ENV_MOTES = { low: 0, medium: 640, high: 1280, ultra: 1920 };
+/** The dust reaches this many graph radii from the graph's centre. */
+export const MOTE_VOLUME = 2.6;
+/** Lattices of cells, each a third of the size of the one before; the largest cell is 2 · MOTE_VOLUME radii. */
+export const MOTE_OCTAVES = 4;
+/** World radius of a mote in cells of its octave: about 1 px at half a cell from the camera. */
+export const MOTE_SIZE = 0.00055;
 
 export const DEFAULT_KEY_DIRECTION = /*@__PURE__*/ new THREE.Vector3( - 0.45, 0.65, 0.62 ).normalize();
 
@@ -278,6 +318,21 @@ export function fogParameters( strength, distance, radius ) {
 }
 
 /**
+ * Point response of a mote (the CPU mirror of the vertex stage): a sprite whose true on-screen
+ * radius is `truePx` is drawn with at least `minPx` and widened by the circle of confusion `cocPx`
+ * (all in pixels of the target); its radiance is scaled so that the light it sends is that of the
+ * true disc. Nothing pops at the minimum size and nothing gains energy by being blurred.
+ * @return {{ radius: number, gain: number }} drawn radius in pixels, radiance factor 0..1
+ */
+export function moteResponse( truePx, minPx = 1.1, cocPx = 0 ) {
+
+	const sharp = Math.max( truePx, minPx );
+	const radius = Math.sqrt( sharp * sharp + cocPx * cocPx );
+	return { radius, gain: Math.min( 1, ( truePx * truePx ) / ( radius * radius ) ) };
+
+}
+
+/**
  * Bounding sphere (box centre + largest distance) of the first `count` positions of a vec4 array.
  * @return {{ center: number[], radius: number }}
  */
@@ -324,6 +379,7 @@ const nebulaNodes = ( d ) => {
 };
 
 const _v = /*@__PURE__*/ new THREE.Vector3();
+const _moteDir = /*@__PURE__*/ new THREE.Vector3();
 
 export class Environment {
 
@@ -345,6 +401,7 @@ export class Environment {
 		this._keyIntensity = this._preset.key.light;
 		this._envIntensity = this._preset.envIntensity;
 		this._fog = this._preset.fog;
+		this._dust = this._preset.dust ?? 0;
 		this._keyDir = new THREE.Vector3().copy( keyDirection ).normalize();
 
 		this.uniforms = {
@@ -364,13 +421,26 @@ export class Environment {
 			rim: uniform( new THREE.Color() ),
 			nebulaA: uniform( new THREE.Color() ),
 			nebulaB: uniform( new THREE.Color() ),
+			// depth motes
+			moteVolume: uniform( new THREE.Vector4( 0, 0, 0, 1 ) ), // graph centre, reach of the dust (world units)
+			moteCell: uniform( 1 ), // size of the largest lattice cell (world units)
+			moteFocus: uniform( new THREE.Vector3() ), // the point the camera looks at: the drawn copies surround it
+			moteTime: uniform( new THREE.Vector2( 0, 0 ) ), // seconds now, at the previous rendered frame
+			moteIntensity: uniform( 0 ), // peak radiance of the brightest mote in focus
+			moteTint: uniform( new THREE.Color( 0.72, 0.84, 1 ) ), // outside the beam; inside it tends to the key colour
 		};
 
 		this.light = new THREE.DirectionalLight( 0xffffff, this._keyIntensity );
 		this.light.name = 'Environment.key';
 		this.light.shadow.autoUpdate = false;
 
-		this.stats = { shadowRenders: 0, skyRenders: 0, shadowRadius: 0, shadowTexel: 0, shadowTexels: 0, shadowStrength: 1, shadowCasting: false, boundsRadius: 0, lastShadowFrame: - 1 };
+		this.stats = { shadowRenders: 0, skyRenders: 0, shadowRadius: 0, shadowTexel: 0, shadowTexels: 0, shadowStrength: 1, shadowCasting: false, boundsRadius: 0, lastShadowFrame: - 1, motes: 0 };
+		this.moteMesh = null;
+		this._moteMaterials = new Map(); // 'mv' | 'still' → material
+		this._moteCenter = [ 0, 0, 0 ];
+		this._moteRadius = 0; // quantised graph radius the lattice is tied to
+		this._moteFade = 0; // 0..1, eases to 0 while the lattice re-scales
+		this._moteValid = false;
 
 		// counts actual shadow map renders (updateMatrices is called once per render of the map)
 		const updateMatrices = this.light.shadow.updateMatrices.bind( this.light.shadow );
@@ -449,6 +519,19 @@ export class Environment {
 
 	}
 
+	/** Depth motes 0..1 (0 = off: nothing is drawn). */
+	get dust() {
+
+		return this._dust;
+
+	}
+
+	set dust( v ) {
+
+		this._dust = Math.min( 1, Math.max( 0, + v || 0 ) );
+
+	}
+
 	get keyDirection() {
 
 		return this._keyDir;
@@ -513,6 +596,7 @@ export class Environment {
 		this._keyIntensity = preset.key.light;
 		this._envIntensity = preset.envIntensity;
 		this._fog = preset.fog;
+		this._dust = preset.dust ?? 0;
 		this._applyPreset();
 		if ( nodes && preset.nodes && this.app ) this._nodeRenderer()?.setLook?.( preset.nodes );
 		return this;
@@ -554,6 +638,18 @@ export class Environment {
 		this._skyScene = new THREE.Scene();
 		this._skyScene.add( new THREE.Mesh( new THREE.SphereGeometry( 10, 48, 24 ), material ) );
 
+		// depth motes: one instanced quad mesh, positions hashed in the vertex stage
+		this._moteGeometry = quadGeometry();
+		this.moteMesh = new THREE.Mesh( this._moteGeometry, null );
+		this.moteMesh.name = 'Environment.motes';
+		this.moteMesh.frustumCulled = false;
+		this.moteMesh.renderOrder = 4; // after the edges, before the halos
+		this.moteMesh.castShadow = this.moteMesh.receiveShadow = false;
+		this.moteMesh.visible = false;
+		this.moteMesh.count = 0;
+		this.moteMesh.raycast = () => {};
+		scene.add( this.moteMesh );
+
 		app.renderer.shadowMap.type = THREE.PCFShadowMap;
 		this._applyPreset();
 		this._applyGfx(); // renders the sky unless gfxState.lit is false
@@ -575,6 +671,7 @@ export class Environment {
 		this._seen.state = - 1;
 		this._resolved = true;
 		this._shadowDirty = true;
+		this._moteValid = false; // the dust jumps to the new graph instead of sliding there
 		this._buildGuide( buffers, app || this.app );
 
 	}
@@ -598,6 +695,7 @@ export class Environment {
 		gfxUniforms.fogStart.value = fog.start;
 		gfxUniforms.fogDensity.value = fog.density;
 
+		this._updateMotes( dt, app );
 		this._updateShadow( app );
 
 	}
@@ -925,6 +1023,165 @@ export class Environment {
 
 	}
 
+	// ── depth motes ─────────────────────────────────────────────────────────────────────────
+
+	/** Visibility, count and material variant from the tier; lattice scale, focus point, time. */
+	_updateMotes( dt, app ) {
+
+		const mesh = this.moteMesh, U = this.uniforms;
+		if ( ! mesh ) return;
+		const count = this._dust > 0 ? ( ENV_MOTES[ gfxState.tier ] ?? 0 ) : 0;
+		this.stats.motes = count;
+		if ( count === 0 ) {
+
+			mesh.visible = false;
+			this._moteValid = false;
+			return;
+
+		}
+
+		const key = gfxState.velocity ? 'mv' : 'still';
+		let material = this._moteMaterials.get( key );
+		if ( ! material ) {
+
+			material = this._moteMaterial( { velocity: !! gfxState.velocity } );
+			this._moteMaterials.set( key, material );
+
+		}
+
+		if ( mesh.material !== material ) mesh.material = material;
+		mesh.count = count;
+		mesh.visible = true;
+
+		// the lattice is tied to a quantised graph radius: a breathing layout does not pump the dust.
+		// When the radius leaves its step, the dust fades out, takes the new scale and fades in
+		const b = this._bounds, c = this._moteCenter;
+		const radius = quantizeRadius( b.radius, this._moteRadius );
+		if ( ! this._moteValid ) {
+
+			this._moteRadius = radius;
+			this._moteFade = 1;
+			for ( let i = 0; i < 3; i ++ ) c[ i ] = b.center[ i ];
+
+		} else if ( radius !== this._moteRadius ) {
+
+			this._moteFade = Math.max( 0, this._moteFade - dt / 0.35 );
+			if ( this._moteFade === 0 ) this._moteRadius = radius;
+
+		} else this._moteFade = Math.min( 1, this._moteFade + dt / 0.6 );
+
+		// brightness envelope and beam follow the graph's centre slowly (they do not move a mote)
+		const k = this._moteValid ? 1 - Math.exp( - dt * 1.5 ) : 1;
+		for ( let i = 0; i < 3; i ++ ) c[ i ] += ( b.center[ i ] - c[ i ] ) * k;
+		const reach = MOTE_VOLUME * this._moteRadius;
+		U.moteVolume.value.set( c[ 0 ], c[ 1 ], c[ 2 ], reach );
+		U.moteCell.value = 2 * reach;
+
+		// the point the camera looks at: the orbit target's distance along the view axis, else the
+		// depth of the graph's centre
+		const cam = app.camera;
+		cam.getWorldDirection( _moteDir );
+		const target = app.controls && app.controls.target;
+		let d = target ? cam.position.distanceTo( target ) : ( c[ 0 ] - cam.position.x ) * _moteDir.x + ( c[ 1 ] - cam.position.y ) * _moteDir.y + ( c[ 2 ] - cam.position.z ) * _moteDir.z;
+		d = Math.min( 2 * reach, Math.max( 0, d ) );
+		U.moteFocus.value.copy( cam.position ).addScaledVector( _moteDir, d );
+
+		const t = U.moteTime.value;
+		t.y = t.x;
+		t.x = app.time % 4096; // float32 keeps milliseconds
+		if ( ! this._moteValid || t.x < t.y ) t.y = t.x;
+		this._moteValid = true;
+		U.moteIntensity.value = 2 * this._dust * this._moteFade;
+
+	}
+
+	_moteMaterial( { velocity = false } = {} ) {
+
+		const U = this.uniforms, G = gfxUniforms;
+		const vQuad = varyingProperty( 'vec2', 'vMoteQuad' ); // quad coordinates, 1 = the drawn radius
+		const vColor = varyingProperty( 'vec3', 'vMoteColor' ); // radiance at the centre of the sprite
+		const vMotion = varyingProperty( 'vec2', 'vMoteMotion' ); // NDC motion since the previous frame
+		const EXTENT = 1.7; // quad half size in drawn radii: the Gaussian is below 0.2 % there
+		const SHARP = 2.2;
+
+		const material = new THREE.NodeMaterial();
+		material.name = 'Environment.motes.' + ( velocity ? 'mv' : 'still' );
+		material.lights = false;
+		material.fog = false;
+		material.transparent = true;
+		material.depthWrite = false;
+		material.depthTest = true;
+		material.blending = THREE.AdditiveBlending;
+		material.side = THREE.DoubleSide;
+
+		const h = ( k ) => hash( instanceIndex.mul( 8 ).add( k ) );
+
+		material.vertexNode = Fn( () => {
+
+			// octave → cell size; the mote's place in its cell, with a drift of ±1.2 % of the cell
+			// (periods of 45 s to 2.5 min)
+			const octave = float( instanceIndex.mod( uint( MOTE_OCTAVES ) ) );
+			const cell = U.moteCell.mul( pow( float( 1 / 3 ), octave ) ).toVar( 'mCell' );
+			const rate = vec3( h( 3 ), h( 4 ), h( 5 ) ).mul( 0.1 ).add( 0.04 ).toVar( 'mRate' );
+			const phase = vec3( h( 5 ), h( 3 ), h( 4 ) ).mul( 2 * Math.PI ).toVar( 'mPhase' );
+			const drift = ( t ) => sin( rate.mul( t ).add( phase ) ).mul( 0.012 );
+			const driftNow = drift( U.moteTime.x ).toVar( 'mDrift' );
+			// the copy nearest to the focus point (wrap-around in the lattice of the octave)
+			const local = vec3( h( 0 ), h( 1 ), h( 2 ) ).add( driftNow ).sub( U.moteFocus.div( cell ) );
+			const rel = local.sub( floor( local.add( 0.5 ) ) ).mul( cell ).toVar( 'mRelFocus' ); // in [ −cell/2, cell/2 )
+			const world = U.moteFocus.add( rel ).toVar( 'mWorld' );
+			const center = cameraViewMatrix.mul( vec4( world, 1 ) ).xyz.toVar( 'mCenter' );
+			const dist = length( center ).toVar( 'mDist' );
+			const ppu = pixelsPerUnit( center.z ).toVar( 'mPpu' ); // target px per world unit
+			const px = G.pxScale;
+
+			// point response: a minimum drawn size and the circle of confusion widen the sprite, its
+			// radiance drops so that the light it sends stays that of the true disc (moteResponse())
+			const r0 = cell.mul( MOTE_SIZE ).mul( h( 7 ).mul( 0.8 ).add( 0.6 ) ).mul( ppu ).toVar( 'mTrue' );
+			const sharp = max( r0, px.mul( 1.1 ) );
+			const coc = cocPixels( center.z.negate() );
+			const r = sqrt( sharp.mul( sharp ).add( coc.mul( coc ) ) ).toVar( 'mR' );
+			const energy = min( r0.mul( r0 ).div( r.mul( r ) ), 1 );
+
+			// lit dust: brighter inside the beam of the key light through the graph; a few bright
+			// motes among many dim ones
+			const toGraph = world.sub( U.moteVolume.xyz ).toVar( 'mRel' );
+			const perp = length( toGraph.sub( G.keyDir.mul( dot( toGraph, G.keyDir ) ) ) ).div( U.moteVolume.w.mul( 0.4 ) );
+			const beam = exp( perp.mul( perp ).negate() ).toVar( 'mBeam' );
+			const b = h( 6 );
+			const bright = b.mul( b ).mul( 0.75 ).add( 0.25 );
+			// fades: the border of the cell (hides the wrap), the reach of the dust around the graph,
+			// fog, and nearness: a mote stays a speck. One that the camera approaches goes out between
+			// 2.2 and 5 px of true radius instead of growing into a ball (the next octave has specks
+			// there), and a defocused one before its disc gets large
+			const edge = smoothstep( 0.5, 0.34, length( rel ).div( cell ) );
+			const reach = smoothstep( 1, 0.7, length( toGraph ).div( U.moteVolume.w ) );
+			const large = smoothstep( px.mul( 5 ), px.mul( 2.2 ), r0 ).mul( smoothstep( px.mul( 30 ), px.mul( 10 ), r ) );
+			const gain = U.moteIntensity.mul( bright ).mul( energy ).mul( mix( float( 0.35 ), float( 1 ), beam ) )
+				.mul( fogTransmittance( dist ) ).mul( edge ).mul( reach ).mul( large ).toVar( 'mGain' );
+			const key = vec3( G.keyColor ).div( max( max( G.keyColor.x, G.keyColor.y ), max( G.keyColor.z, 1e-3 ) ) );
+			vColor.assign( mix( vec3( U.moteTint ), key, beam.mul( 0.6 ) ).mul( gain ) );
+
+			const q = positionGeometry.xy.mul( EXTENT );
+			vQuad.assign( q );
+			// the world position only changes by the drift (the wrap happens where the mote is faded out)
+			if ( velocity ) vMotion.assign( motionVector( world, world.sub( driftNow.sub( drift( U.moteTime.y ) ).mul( cell ) ) ) );
+			const p = center.add( vec3( q.mul( r.div( ppu ) ), 0 ) );
+			const off = gain.lessThan( 2e-3 ).or( center.z.greaterThan( cameraNear.negate() ) );
+			return select( off, vec4( 0, 0, 2, 1 ), cameraProjectionMatrix.mul( vec4( p, 1 ) ) );
+
+		} )();
+
+		// Gaussian sprite, shifted down so that it is exactly 0 at the border of the quad
+		const floorValue = Math.exp( - SHARP * EXTENT * EXTENT );
+		const shape = max( exp( dot( vQuad, vQuad ).mul( - SHARP ) ).sub( floorValue ), 0 ).div( 1 - floorValue ).toVar( 'moteShape' );
+		material.colorNode = vec4( vColor.mul( shape ), 1 );
+		// the velocity attachment blends per pixel: the mote owns the pixels where it has weight
+		if ( velocity ) material.mrtNode = mrt( { output, velocity: vec4( vMotion, 0, step( 0.3, shape ) ) } );
+		return material;
+
+	}
+
 	// ── guide sphere ────────────────────────────────────────────────────────────────────────
 
 	_buildGuide( buffers, app ) {
@@ -1004,6 +1261,16 @@ export class Environment {
 				app.scene.remove( this.light, this.light.target );
 
 			}
+
+		}
+
+		if ( this.moteMesh ) {
+
+			this.moteMesh.removeFromParent();
+			this._moteGeometry.dispose();
+			for ( const material of this._moteMaterials.values() ) material.dispose();
+			this._moteMaterials.clear();
+			this.moteMesh = null;
 
 		}
 

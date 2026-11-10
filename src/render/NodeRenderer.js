@@ -27,16 +27,47 @@
 //  ('mv' materials can only be drawn into a target that has an `output` texture, i.e. through a
 //  PassNode: three uses material.mrtNode as the whole fragment output otherwise.)
 //  Storage buffers per stage: vertex 4 (nodePos, nodeColor, nodeState, nodeFx), 5 with 'mv'
-//  (+ nodePrev); shadow pass vertex 3; halo vertex 3; fragment 0 in every variant.
+//  (+ nodePrev); shadow pass vertex 3; halo vertex 4, 5 with 'mv'; fragment 0 in every variant.
 //
 // ─── Size ───────────────────────────────────────────────────────────────────────────────────
 //  radius = baseSize · nodeColor.w · size · (1 + 0.5·selected + 0.25·hovered)
-//  baseSize = 0.065 · graph.layoutRadius / ∛N. Below `minPixelRadius` (CSS px) a node keeps that
-//  on-screen size and fades out instead of shrinking into sub-pixel flicker: through coverage with
-//  MSAA ('a2c'); in the single-sample variants ('cut') the dot stays solid and its colour fades
-//  toward the backdrop (gfxUniforms.fogColor), which is what the coverage fade averages to. That is
-//  deterministic: no stipple, nothing that crawls while the camera moves, with or without a
-//  temporal resolve. Dots that would keep less than 4 % are dropped in the vertex stage.
+//  baseSize = 0.065 · graph.layoutRadius / ∛N. A node whose radius falls below `minPixelRadius`
+//  (CSS px) is not shrunk into sub-pixel flicker; it turns into a POINT with an energy-conserving
+//  response: with f = true radius / minimum radius, the true disc covers f² of the minimum dot, so
+//  the node sends f² of the light a dot of the minimum size would (look.point = 1; 0 gives the
+//  linear fade f, which lets a sub-pixel node send 1 / f times the light it has).
+//   'a2c' (MSAA)   the sphere stays, drawn at the minimum size, and alpha-to-coverage gives it
+//                  that share of the samples: its colour over a share of the pixel, what lies
+//                  behind it over the rest.
+//   'cut' (single sample: TRAA, SMAA, FXAA)   an opaque dot cannot be partly there. Fading its
+//                  colour toward the backdrop (the stage-1 approach) is right over empty space,
+//                  but over the luminous edge mass of a large graph it leaves a dark, depth
+//                  writing speck per node: an overview of 20k nodes was pepper on colour. So the
+//                  sphere is dropped below the minimum size and the node is drawn by the halo
+//                  pass as a blended POINT SPRITE: a Gaussian (σ = 0.6 minimum radii) whose value
+//                  is the node's COVERAGE of the pixel and whose integral is the area of the true
+//                  disc, f² · π · minimum radius². The pixel becomes coverage · C + ( 1 − coverage ) · what is
+//                  behind it, C being the mean radiance of the bead (emissive core + key and
+//                  ambient light on the enamel, emphasis and context dimming as on the sphere,
+//                  fogged): exactly what alpha-to-coverage averages to. Sprites that pile up
+//                  converge to the bead colour instead of adding up without bound (20k of them
+//                  blew the bloom out when they were additive), strands behind them are covered
+//                  by that share. A sprite has no silhouette to alias (nothing crawls or pops
+//                  under the TRAA jitter: a point that moves by a sub-pixel changes by a
+//                  fraction), widens with the shared circle of confusion (σ² + coc² / 4, coverage
+//                  scaled down: defocused points turn into faint discs like the strands do), and
+//                  writes its own motion vector in the velocity tiers: over the disc of the
+//                  minimum radius (what the opaque dot it replaces owned), for every sprite that
+//                  covers at least SPRITE_OWN (4 %) at its centre, i.e. down to a fifth of the
+//                  minimum radius. The TRAA resolve has no other source for these pixels (sprites
+//                  write no depth, strands no vector): without it the history of an overview is
+//                  taken from the same pixel and the whole cloud softens under camera motion.
+//                  Sprites that cover less than 0.5 % are dropped. The hand-over at f = 1 keeps
+//                  size and mean colour (calibrated against true-size spheres: total light within 5 %).
+//  In an overview of a large graph the leaves therefore are a fine dust of light and the hubs,
+//  still near their true size, stand out: brightness follows size, as it does for the beads close
+//  up. Important nodes additionally get a soft point glow (the halo pass, below) while they are
+//  small, so the hierarchy also reads where no disc is resolved.
 //  A ripple pulse (below) adds a transient scale-up of rippleScale · gain.
 //
 // ─── Look ("glass enamel") ──────────────────────────────────────────────────────────────────
@@ -66,9 +97,16 @@
 //  the node's OWN core colour plus the scale-up, so clusters stay distinguishable on the front),
 //  z = glow weight (extra emissive). Fog (gfx/shared.js) is applied to the final colour, emissive
 //  included.
-//  A second additive pass draws the "halo": a crisp ring plus a faint corona around the selected
-//  node (strong), the hovered node and the neighbours of the selection (mild). It writes no depth
-//  and no motion vector; instances without any highlight are collapsed in the vertex shader.
+//  A second, blended pass draws the "halo": a crisp ring plus a faint corona around the selected
+//  node (strong), the hovered node and the neighbours of the selection (mild); the point sprites
+//  of the single-sample variants (see "Size"); and the point glow: a small Gaussian in the node's
+//  hue around nodes that are IMPORTANT (radius factor above the average: degree, or the size
+//  lens; or the glow lens, nodeFx.z) and SMALL on screen (it is gone once the bead is 7 CSS px in
+//  radius and shows its own core). Strength look.pointGlow, × 0.7 in the medium tier, off in the
+//  low tier; context nodes have none. The pass writes no depth; instances without highlight, glow
+//  and sprite are collapsed in the vertex shader. Cost in a 20k-node overview: a sprite quad of
+//  about 7 × 7 CSS px per node (1 MP of additive fragments at 1080p, a Gaussian each) and a glow
+//  quad of ~20 × 20 CSS px for about a tenth of the nodes.
 //
 // ─── Public API ─────────────────────────────────────────────────────────────────────────────
 //  const nodes = app.use( new NodeRenderer( { size: 1 } ) );   // App module, order 11
@@ -80,16 +118,16 @@
 //  nodes.worldRadius( i )       // world radius of node i at rest (no emphasis), for labels/picking
 //  nodes.haloRadius( rPx, sel ) // outer halo ring radius (CSS px) for a sphere of rPx CSS px
 //  nodes.setLook( { roughness, metalness, clearcoat, clearcoatRoughness, emissive, coreShift, rim,
-//                   shade, flash, glow, rippleScale, variation } )   // any subset, live (uniforms)
+//                   shade, flash, glow, rippleScale, variation, point, pointGlow } )   // any subset, live
 //  nodes.look                   // current values (plain object copy)
 //  nodes.variant                // key of the active material variant, e.g. 'std|a2c|still'
 //  nodes.setGraph( buffers, graph ), nodes.dispose()
 import * as THREE from 'three/webgpu';
 import {
-	Fn, instanceIndex, vec3, vec4, float, uniform, varyingProperty, property, positionGeometry, cameraViewMatrix,
-	normalize, length, dot, max, min, clamp, pow, mix, smoothstep, select, abs, luminance, exp, sin, sqrt,
+	Fn, instanceIndex, vec2, vec3, vec4, float, uniform, varyingProperty, property, positionGeometry, cameraViewMatrix,
+	normalize, length, dot, max, min, clamp, pow, mix, smoothstep, select, abs, luminance, exp, sin, sqrt, step, mrt, output,
 } from 'three/tsl';
-import { gfxUniforms, gfxState, motionVector, velocityOutput, skipVelocity, applyFog, fogTransmittance } from './gfx/shared.js';
+import { gfxUniforms, gfxState, motionVector, velocityOutput, applyFog, fogTransmittance, cocPixels } from './gfx/shared.js';
 import {
 	pixelsPerUnit, viewToDepth, viewToWorld, applySurface, sphereBillboard, raySphere, discCoverage,
 	SurfaceStandardMaterial, SurfacePhysicalMaterial, quadGeometry,
@@ -109,7 +147,50 @@ export const NODE_LOOK = {
 	glow: 1.1, // extra emissive gain of nodeFx.z = 1
 	rippleScale: 0.18, // transient radius increase of a ripple pulse at gain 1
 	variation: 0.5, // 0..1: larger (higher-degree) nodes are glossier, small ones more matte
+	point: 1, // 0..1: fade of nodes below the minimum size, 0 = linear in the radius, 1 = energy conserving (area)
+	pointGlow: 0.6, // strength of the soft glow around important nodes while they are dots
 };
+
+/** Share of the emissive core's peak that a bead averages to over its disc (point sprites). */
+export const POINT_CORE = 0.35;
+
+/** Emissive gain and overall boost of the selected node (hovered and neighbour nodes get less). */
+const SEL_GAIN = 0.25, SEL_BOOST = 0.12;
+
+/**
+ * σ of a point sprite in minimum radii. 1 / √2 would put the coverage f² at the centre; 0.6 gives a
+ * tighter point with 1.39 · f² there (limited to 1: nodes near the minimum size get a flat top,
+ * i.e. nearly the disc they are about to become).
+ */
+export const POINT_SIGMA = 0.6;
+
+/** Centre coverage from which a point sprite writes its motion vector (over the disc of the minimum radius). */
+export const SPRITE_OWN = 0.04;
+
+/** Factor on look.pointGlow per quality tier. */
+export const POINT_GLOW_TIER = { low: 0, medium: 0.7, high: 1, ultra: 1 };
+
+/**
+ * Point sprite of a node below the minimum size: the CPU twin of the halo pass's vertex stage (tests,
+ * tools). A Gaussian of variance σ² = ( POINT_SIGMA · minPx )² + cocPx² / 4 whose centre coverage is
+ * chosen so that the coverage integrated over the sprite, 2πσ² · cover, is the area that the fade
+ * leaves of the minimum disc: π · minPx² · fade with fade = f · mix( 1, f, point ), f = truePx / minPx.
+ * With point = 1 that is π · truePx², the true disc of the node: its light does not depend on the
+ * zoom or on the focus. The fragment stage limits the coverage to 1.
+ * @param {number} truePx true radius in pixels
+ * @param {number} minPx minimum radius in pixels (minPixelRadius)
+ * @param {number} [cocPx] diameter of the circle of confusion in pixels
+ * @param {number} [point] look.point
+ * @returns {{ sigma: number, cover: number, fade: number }} σ in pixels, coverage at the centre
+ */
+export function pointSprite( truePx, minPx, cocPx = 0, point = 1 ) {
+
+	const f = Math.min( 1, Math.max( 0, truePx / minPx ) );
+	const fade = f * ( 1 + ( f - 1 ) * point );
+	const var2 = ( POINT_SIGMA * minPx ) ** 2 + cocPx * cocPx / 4;
+	return { sigma: Math.sqrt( var2 ), cover: fade * minPx * minPx / ( 2 * var2 ), fade };
+
+}
 
 /** Material variant for a pipeline configuration (see the header). */
 export function nodeVariant( state = gfxState ) {
@@ -141,6 +222,8 @@ export class NodeRenderer {
 			size: uniform( size ),
 			baseSize: uniform( 1 ),
 			minPx: uniform( minPixelRadius ),
+			pointGlowTier: uniform( 1 ), // POINT_GLOW_TIER of the active tier
+			sprites: uniform( 1 ), // 1: nodes below the minimum size are blended point sprites (single-sample variants)
 		};
 		for ( const key in NODE_LOOK ) this.uniforms[ key ] = uniform( NODE_LOOK[ key ] );
 		if ( look ) this.setLook( look );
@@ -281,6 +364,9 @@ export class NodeRenderer {
 		// robust against a missed 'gfx' event: the key is a short string compare
 		if ( this.mesh && this.variant !== nodeVariant() ) this._applyVariant();
 		if ( this.mesh && this._castShadow !== ( gfxState.shadows && gfxState.lit !== false ) ) this._applyVariant();
+		this.uniforms.pointGlowTier.value = POINT_GLOW_TIER[ gfxState.tier ] ?? 1;
+		// with MSAA the sphere fades by coverage; without the halo pass nobody would draw the sprites
+		this.uniforms.sprites.value = gfxState.samples > 1 || ! this._halo ? 0 : 1;
 
 	}
 
@@ -351,19 +437,21 @@ export class NodeRenderer {
 
 		const R0 = U.baseSize.mul( col.w ).mul( U.size ).mul( scale ).toVar( 'nR0' );
 		const ppu = pixelsPerUnit( center.z ).toVar( 'nPpu' ); // target pixels per world unit at the node
-		let R = R0, fade = float( 1 );
+		let R = R0, fade = float( 1 ), sub = float( 1 );
 		if ( ! shadow ) {
 
 			const minPx = U.minPx.mul( gfxUniforms.pxScale );
 			R = max( R0, minPx.div( ppu ) ).toVar( 'nR' );
-			fade = clamp( R0.mul( ppu ).div( max( minPx, 1e-3 ) ), 0, 1 );
+			// share of the minimum dot the true disc covers: f in the radius, f² in the area (see "Size")
+			sub = clamp( R0.mul( ppu ).div( max( minPx, 1e-3 ) ), 0, 1 ).toVar( 'nSub' );
+			fade = sub.mul( mix( float( 1 ), sub, U.point ) );
 
 		}
 
 		const bb = sphereBillboard( center, R );
 		const h = bb.h.toVar( 'nH' );
 		const rPx = h.mul( ppu ).toVar( 'nRPx' ); // silhouette radius in target pixels
-		return { pos, col, st, center, R, fade, h, rPx, ripple, glow, right: bb.right, up: bb.up, inside: bb.inside };
+		return { pos, col, st, center, R, fade, sub, h, rPx, ripple, glow, right: bb.right, up: bb.up, inside: bb.inside };
 
 	}
 
@@ -414,9 +502,9 @@ export class NodeRenderer {
 			vState.assign( I.st );
 			if ( velocity && ! shadow ) vDelta.assign( I.pos.xyz.sub( buffers.nodePrev.element( instanceIndex ).xyz ) );
 			// positionNode is local space; the mesh transform is the identity. Camera inside the sphere: collapse.
-			// Single-sample variants: a dot that has faded to (almost) the backdrop colour would only punch a
-			// hole into what is behind it, so it is dropped (alpha-to-coverage gives it no sample either)
-			const off = a2c || shadow ? I.inside : I.inside.or( I.fade.lessThan( 0.04 ) );
+			// Single-sample variants: below the minimum size the node is a point sprite of the halo pass
+			// ( uniforms.sprites; with the halo pass switched off it stays a disc of the minimum size )
+			const off = a2c || shadow ? I.inside : I.inside.or( I.sub.lessThan( 0.999 ).and( U.sprites.greaterThan( 0.5 ) ) );
 			return viewToWorld( select( off, I.center, viewPos ) );
 
 		} )();
@@ -430,7 +518,7 @@ export class NodeRenderer {
 		const normal = s.normal.toVar( 'nodeNormal' );
 		const viewDir = s.viewDir;
 		const coverage = discCoverage( vQuad.xy ).toVar( 'nodeCoverage' );
-		const fade = vPoint.w;
+		const fade = vPoint.w; // 'a2c' only
 
 		if ( a2c ) {
 
@@ -440,7 +528,7 @@ export class NodeRenderer {
 
 		} else {
 
-			// solid dot; the minimum-size fade is applied to the colour in finish() below
+			// solid sphere; below the minimum size the halo pass draws the node (the vertex stage drops it here)
 			material.maskNode = coverage.greaterThan( 0.5 );
 
 		}
@@ -478,7 +566,10 @@ export class NodeRenderer {
 		const closeUp = mix( float( 1 ), float( 0.55 ), smoothstep( 10, 90, sizePx ) );
 		// context nodes stop glowing: a dimmed core in a darkened hue is what reads as mud
 		const lit01 = dim.mul( 0.85 ).oneMinus();
-		const gain = float( 1 ).add( sel.mul( 0.5 ) ).add( hov.mul( 0.4 ) ).add( nb.mul( 0.3 ) ).add( vQuad.w.mul( U.glow ) ).mul( closeUp ).mul( lit01 );
+		// emphasis adds a little light only: under the Neutral tone mapper a saturated colour that is pushed
+		// far above 1 turns pastel (a selected red bead was pink), and the ring, the corona and the growth
+		// already say "selected". The hue is the identity of the node and stays
+		const gain = float( 1 ).add( sel.mul( SEL_GAIN ) ).add( hov.mul( 0.2 ) ).add( nb.mul( 0.2 ) ).add( vQuad.w.mul( U.glow ) ).mul( closeUp ).mul( lit01 );
 		const tint = mix( base, vec3( 1 ), 0.22 ).mul( 1.25 );
 		// ripple: more of the node's own light (a hint of white only), so the hues on the front stay apart
 		const flash = mix( coreColor, vec3( 1 ), 0.08 ).mul( vQuad.z ).mul( U.flash ).mul( core.mul( 0.7 ).add( 0.3 ) );
@@ -490,19 +581,16 @@ export class NodeRenderer {
 		// stays 1 while the light casts no shadows (the hook below is then never called)
 		const shadowTerm = property( 'float', 'nodeShadow' );
 
-		// final colour: cast shadow, emphasis, context dimming (cool, dark, nearly hue-free), fog, minimum-size fade
+		// final colour: cast shadow, emphasis, context dimming (cool, dark, nearly hue-free), fog
 		const finish = ( rgb ) => {
 
 			if ( lit ) rgb = rgb.mul( shadowTerm.oneMinus().mul( smoothstep( 0, 0.35, dot( normal, keyV ) ) ).mul( U.shade ).oneMinus() );
-			const boost = float( 1 ).add( sel.mul( 0.25 ) ).add( hov.mul( 0.2 ) ).add( nb.mul( 0.1 ) );
-			const c = mix( rgb, rgb.add( vec3( luminance( rgb ).mul( 0.6 ) ) ), sel.mul( 0.15 ) ).mul( boost );
+			const c = rgb.mul( float( 1 ).add( sel.mul( SEL_BOOST ) ).add( hov.mul( 0.1 ) ).add( nb.mul( 0.06 ) ) );
 			// context: a cool dark grey with only a trace of the hue (a darkened yellow or orange reads as
 			// olive / brown), so it recedes behind the focus without looking dirty
 			const gray = vec3( 0.40, 0.47, 0.62 ).mul( luminance( c ) );
 			const d = mix( c, gray, dim.mul( 0.92 ) ).mul( float( 1 ).sub( dim.mul( 0.6 ) ) );
-			const fogged = applyFog( d, length( hit ) );
-			// single-sample variants: what the coverage fade of a sub-pixel node averages to over the backdrop
-			return a2c ? fogged : mix( vec3( G.fogColor ), fogged, fade );
+			return applyFog( d, length( hit ) );
 
 		};
 
@@ -569,12 +657,17 @@ export class NodeRenderer {
 
 	_haloMaterial( buffers, { velocity = false } = {} ) {
 
-		const px = gfxUniforms.pxScale;
+		const px = gfxUniforms.pxScale, G = gfxUniforms;
 		const time = buffers.uniforms.time;
 
+		const focus = buffers.uniforms.focus;
+		const U = this.uniforms;
 		const vHalo = varyingProperty( 'vec4', 'vHaloQuad' ); // quad coords in target px, silhouette radius px, inscribed quad radius px
 		const vColor = varyingProperty( 'vec4', 'vHaloColor' ); // rgb, strength
-		const vSel = varyingProperty( 'float', 'vHaloSel' );
+		const vSel = varyingProperty( 'vec2', 'vHaloSel' ); // selection weight, point glow strength
+		const vSprite = varyingProperty( 'vec4', 'vHaloSprite' ); // point sprite: mean radiance of the bead, 1 / ( 2 σ² ) in target px
+		const vCover = varyingProperty( 'float', 'vHaloCover' ); // point sprite: coverage at its centre
+		const vMotion = varyingProperty( 'vec2', 'vHaloMotion' ); // NDC motion of the node since the previous frame
 
 		const material = new THREE.NodeMaterial();
 		material.name = 'NodeRenderer.halo';
@@ -583,35 +676,73 @@ export class NodeRenderer {
 		material.transparent = true;
 		material.depthWrite = false;
 		material.depthTest = true;
-		material.blending = THREE.AdditiveBlending;
-		// additive: leave the motion vector of what is behind it. Only while the scene pass has a velocity
-		// attachment: a material with an mrtNode cannot be drawn into a target without an `output` texture
-		if ( velocity ) material.mrtNode = skipVelocity();
+		// rgb + dst · ( 1 − a ): rings and glows are light ( a = 0 ), a point sprite is the node itself
+		// and covers its share of what is behind it ( a = coverage ). Custom blending, because three
+		// multiplies the colour of a `premultipliedAlpha` material by its alpha
+		material.blending = THREE.CustomBlending;
+		material.blendEquation = THREE.AddEquation;
+		material.blendSrc = material.blendSrcAlpha = THREE.OneFactor;
+		material.blendDst = material.blendDstAlpha = THREE.OneMinusSrcAlphaFactor;
 
 		// ring radius / width in target px for a silhouette of rPx px (mirrored by haloRadius())
 		const ringR = ( rPx, sel ) => rPx.mul( 1.3 ).add( px.mul( float( 2.5 ).add( sel.mul( 1.5 ) ) ) );
 		const ringW = ( sel ) => px.mul( float( 1.0 ).add( sel.mul( 0.8 ) ) );
+		// width of the point glow in target px for a dot of rPx px
+		const pointSigma = ( rPx ) => rPx.mul( 1.2 ).add( px.mul( 1.5 ) );
 
 		material.positionNode = Fn( () => {
 
-			const I = this._instance( buffers, { fx: false } );
-			const k = ringR( I.rPx, I.st.x ).add( ringW( I.st.x ).mul( 3 ) ).add( px.mul( 8 ) ).div( max( I.rPx, 1e-3 ) ).toVar( 'nExtent' );
-			const { q, viewPos } = this._corner( I, k );
+			const I = this._instance( buffers );
 			// selected: full; hovered: strong; neighbors of the selection: mild
 			const strength = max( I.st.x, max( I.st.y.mul( 0.5 ), I.st.w.mul( 0.8 ) ) ).toVar( 'nStrength' );
+			const dist = length( I.center ).toVar( 'nDist' );
+			const fog = fogTransmittance( dist ).toVar( 'nFog' );
+			const dim = min( I.st.z, focus ).mul( I.st.w.oneMinus() ).toVar( 'nDim' );
+
+			// point sprite: the node itself while it is below the minimum size (single-sample variants).
+			// Peak = mean radiance of the bead × the share of the minimum dot its true disc covers
+			const below = step( I.sub, 0.999 ).mul( U.sprites );
+			const minR = U.minPx.mul( px );
+			const sigma0 = minR.mul( POINT_SIGMA );
+			const coc = cocPixels( I.center.z.negate() );
+			const var2 = sigma0.mul( sigma0 ).add( coc.mul( coc ).mul( 0.25 ) ).toVar( 'nVar' ); // σ² in target px²
+			// coverage at the centre: the Gaussian holds what the true disc covers, f² · π · minimum radius²
+			const cover = below.mul( I.fade ).mul( minR.mul( minR ).div( var2.mul( 2 ) ) ).toVar( 'nCover' );
+			const radiance = applyFog( this._pointRadiance( I, dim ), dist ).toVar( 'nSprite' );
+			const sprite = cover.greaterThan( 0.005 );
+			const spriteExtent = sqrt( var2 ).mul( 3 );
+
+			// point glow: important nodes (radius factor above the average, or the glow lens) while they are dots
+			const importance = clamp( smoothstep( 1, 1.6, I.col.w ).add( I.glow.mul( 0.8 ) ), 0, 1.5 );
+			const dots = smoothstep( 7, 2.5, I.rPx.div( px ) );
+			const point = importance.mul( dots ).mul( U.pointGlow ).mul( U.pointGlowTier ).mul( dim.oneMinus() ).mul( fog ).toVar( 'nPoint' );
+			const glowExtent = select( point.greaterThanEqual( 0.01 ), pointSigma( I.rPx ).mul( 3 ), float( 0 ) );
+
+			// the quad reaches whatever it has to show: ring and its glow, point glow ( 3 σ ), sprite ( 3 σ )
+			const ringed = ringR( I.rPx, I.st.x ).add( ringW( I.st.x ).mul( 3 ) ).add( px.mul( 8 ) );
+			const extent = max( select( strength.lessThan( 0.004 ), float( 0 ), ringed ), max( glowExtent, select( sprite, spriteExtent, float( 0 ) ) ) );
+			const k = extent.div( max( I.rPx, 1e-3 ) ).toVar( 'nExtent' );
+			const { q, viewPos } = this._corner( I, k );
 			vHalo.assign( vec4( q.mul( I.rPx ), I.rPx, I.rPx.mul( k ) ) );
-			vColor.assign( vec4( I.col.xyz, strength.mul( I.fade.mul( 0.6 ).add( 0.4 ) ).mul( fogTransmittance( length( I.center ) ) ) ) );
-			vSel.assign( max( I.st.x, I.st.w.mul( 0.5 ) ) );
-			const off = I.inside.or( strength.lessThan( 0.004 ) );
+			vColor.assign( vec4( I.col.xyz, strength.mul( I.fade.mul( 0.6 ).add( 0.4 ) ).mul( fog ) ) );
+			vSel.assign( vec2( max( I.st.x, I.st.w.mul( 0.5 ) ), point ) );
+			vSprite.assign( vec4( radiance, float( 0.5 ).div( var2 ) ) );
+			vCover.assign( select( sprite, cover, float( 0 ) ) );
+			if ( velocity ) vMotion.assign( motionVector( I.pos.xyz, buffers.nodePrev.element( instanceIndex ).xyz ) );
+			const off = I.inside.or( extent.lessThan( 0.5 ) );
 			return viewToWorld( select( off, I.center, viewPos ) );
 
 		} )();
 
+		const r2 = dot( vHalo.xy, vHalo.xy ).toVar( 'haloR2' );
+		// the sprite: coverage of the node at this pixel, shifted down so that it is exactly 0 at the border of its quad ( 3 σ )
+		const spriteCover = exp( r2.mul( vSprite.w ).negate() ).sub( 0.0111 ).max( 0 ).mul( vCover ).min( 1 ).toVar( 'haloSprite' );
+
 		material.colorNode = Fn( () => {
 
-			const r = length( vHalo.xy );
+			const r = sqrt( r2 );
 			const rPx = vHalo.z, edgePx = vHalo.w;
-			const sel = vSel;
+			const sel = vSel.x;
 			const rr = ringR( rPx, sel );
 			const hw = ringW( sel ).mul( 0.5 );
 			// crisp ring: 1 px anti-aliased edges around a constant pixel width
@@ -622,15 +753,50 @@ export class NodeRenderer {
 			const win = smoothstep( edgePx, edgePx.mul( 0.7 ), r );
 			const corona = exp( r.sub( rPx ).max( 0 ).negate().div( rPx.mul( 0.3 ).add( px.mul( 2.5 ) ) ) ).mul( 0.16 );
 			const glow = exp( abs( r.sub( rr ) ).negate().div( px.mul( 2.2 ) ) ).mul( 0.22 );
-			const pulse = sin( time.mul( 2.4 ) ).mul( 0.1 ).mul( vSel ).add( 1 );
+			const pulse = sin( time.mul( 2.4 ) ).mul( 0.1 ).mul( sel ).add( 1 );
 			// neighbors keep their hue, the selection goes towards white-hot
 			const tint = mix( vColor.xyz, vec3( 1 ), sel.mul( 0.45 ).add( 0.12 ) );
 			const a = ring.mul( 0.95 ).add( corona.add( glow ).mul( win ) ).mul( outside ).mul( vColor.w ).mul( pulse );
-			return vec4( tint.mul( a ).mul( float( 1.5 ).add( sel.mul( 0.9 ) ) ), 1 );
+			// point glow: a Gaussian in the node's hue, equalised in luminance like the core, 0 at the quad border
+			const sigma = pointSigma( rPx );
+			const lum = max( luminance( vColor.xyz ), 0.04 );
+			const hue = vColor.xyz.mul( mix( float( 1 ), float( 0.3 ).div( lum ), 0.4 ) );
+			const gauss = exp( r2.div( sigma.mul( sigma ).mul( - 2 ) ) ).sub( 0.0111 ).max( 0 ).mul( win ); // exp( −4.5 ) at 3 σ
+			return vec4( tint.mul( a ).mul( float( 1.5 ).add( sel.mul( 0.9 ) ) ).add( hue.mul( gauss ).mul( vSel.y ) ).add( vSprite.xyz.mul( spriteCover ) ), spriteCover );
 
 		} )();
 
+		// additive: ring and glows leave the motion vector of what is behind them; a point sprite owns
+		// the disc of the minimum radius (the velocity attachment blends per pixel: alpha 1 sets the
+		// vector), so the history follows the node, however faint it is, and the strands that end in it.
+		// Only while the scene pass has a velocity attachment: a material with an mrtNode cannot be
+		// drawn into a target without an `output` texture
+		if ( velocity ) material.mrtNode = mrt( { output, velocity: vec4( vMotion, 0, step( SPRITE_OWN, vCover ).mul( step( r2, vHalo.z.mul( vHalo.z ) ) ) ) } );
+
 		return material;
+
+	}
+
+	/**
+	 * Mean radiance of a bead that is too small to show its surface (vertex stage): what the sphere
+	 * shader averages to over the disc. Emissive core (the core lobe averages to about a third over
+	 * the disc) with the emphasis gains, the enamel under the key light and the hemisphere, context
+	 * dimming as in the sphere's finish().
+	 */
+	_pointRadiance( I, dim ) {
+
+		const U = this.uniforms, G = gfxUniforms;
+		const col = I.col.xyz, st = I.st;
+		const lum = luminance( col );
+		const base = col.mul( mix( float( 1 ), float( 0.28 ).div( max( lum, 0.04 ) ), select( lum.greaterThan( 0.28 ), float( 0.22 ), float( 0.45 ) ) ) ).toVar( 'nBase' );
+		const baseLum = luminance( base );
+		const coreColor = base.mul( mix( float( 1 ), float( 0.3 ).div( max( baseLum, 0.04 ) ), select( baseLum.greaterThan( 0.3 ), float( 0.15 ), float( 0.35 ) ) ) );
+		const gain = float( 1 ).add( st.x.mul( SEL_GAIN ) ).add( st.w.mul( 0.2 ) ).add( st.y.mul( 0.2 ) ).add( I.glow.mul( U.glow ) ).mul( dim.mul( 0.85 ).oneMinus() );
+		const light = vec3( G.keyColor ).mul( 0.3 ).add( vec3( G.ambientSky ).add( vec3( G.ambientGround ) ).mul( 0.5 ) ).mul( 1 / Math.PI );
+		const boost = float( 1 ).add( st.x.mul( SEL_BOOST ) ).add( st.w.mul( 0.1 ) ).add( st.y.mul( 0.06 ) );
+		const c = coreColor.mul( U.emissive ).mul( POINT_CORE ).mul( gain ).add( min( base, vec3( 1.2 ) ).mul( light ) ).mul( boost ).toVar( 'nMean' );
+		const gray = vec3( 0.40, 0.47, 0.62 ).mul( luminance( c ) );
+		return mix( c, gray, dim.mul( 0.92 ) ).mul( float( 1 ).sub( dim.mul( 0.6 ) ) );
 
 	}
 

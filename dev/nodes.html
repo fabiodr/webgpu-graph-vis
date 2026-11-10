@@ -21,13 +21,12 @@ html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui
 <body>
 <div id="app"></div><div id="hud"></div><div id="ui"></div>
 <script type="module">
-// Dev page for the lighting package: the real App with the real ForceLayout and EdgeRenderer plus
-// src/render/NodeRenderer.js (lit impostor spheres) and src/render/gfx/Environment.js (sky → PMREM,
-// backdrop, key light, shadows, fog). The scene pass is LOCAL to this page so the material variants
-// can be exercised without the production pipeline: pass( scene, camera, { samples } ), optionally
-// with an MRT { output, velocity } that is set up like the production one (RGBA16F, normal blending
-// per attachment, cleared to 0). gfxState is written here and the 'gfx' event dispatched, exactly
-// what the pipeline package will do.
+// Dev page for the node look: the real App with its render graph (quality tiers, TRAA / MSAA, shadows,
+// post chain), the real ForceLayout and EdgeRenderer plus src/render/NodeRenderer.js (lit impostor
+// spheres, halo pass with rings, point glow and point sprites) and src/render/gfx/Environment.js
+// (sky → PMREM, backdrop, key light, shadows, fog). The tier of the render graph decides the
+// material variant (gfxState: lit, samples, velocity, shadow map size); the page shows it.
+// dev/atmosphere.html is the page for the community field, community labels and motes.
 //
 // Query parameters (every switch is also in the panel, top right; ui=0 hides the panel)
 //   ds=imsv/lesmis           dataset under /data/ (generated/hsbm-500, generated/lfr-2k, …)
@@ -36,12 +35,15 @@ html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui
 //   settle=6000              ms to wait for the layout before the camera is fitted (0 = no wait)
 //   ticks=0                  layout ticks per frame (0 = adaptive); e.g. 12 settles fast in software rendering
 //   preset=aurora|studio|void          Environment preset (with its node look hints)
-//   lit=1|0  samples=4|1  velocity=0|1  tier=high|ultra|medium|low     material variant
-//   shadows=1|0  map=2048  soft=0.3    shadow switches (gfxState.shadows / shadowMapSize, softness)
-//   view=beauty|velocity     velocity: the motion-vector attachment (needs velocity=1), ×vgain
-//   rough metal coat coatrough emissive rim variation shade flash glow coreshift   node look (NodeRenderer.setLook)
+//   tier=high|ultra|medium|low         quality tier of the render graph: it decides the material variant
+//                            (lit, samples, velocity, shadow map size; shown in the panel)
+//   shadows=1|0  soft=0.3    shadows on / off (app.gfx.set( 'shadows' )), softness
+//   view=beauty|velocity     velocity: the render graph's motion-vector debug view (TRAA tiers)
+//   rough metal coat coatrough emissive rim variation shade flash glow coreshift point pointglow   node look (NodeRenderer.setLook)
 //   key envint fog  ldir=x,y,z         key intensity, environment intensity, fog 0..1, light direction
-//   size=1  minpx=1.5  halo=1          node size multiplier, minimum pixel radius, halo pass
+//   size=1  minpx=1.5  halo=1          node size multiplier, minimum pixel radius, halo pass (rings, point
+//                                      glow and, in the single-sample variants, the point sprites of
+//                                      nodes below the minimum size)
 //   edges=1|0  eo=1  post=1|0  bloom=0.8  exposure=1
 //   sel=<index|label|max>  hover=<index|label>      selection / hover emphasis (written directly)
 //   ripple=<index|label|max>  front=<hops>  glow=degree   nodeFx tests: static ripple front, glow weights
@@ -50,15 +52,17 @@ html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui
 //                            'shadow' frames a pair of nodes where one shadows the other
 //   spin=<deg per frame>     orbit the camera every frame (motion-vector / shadow-update tests)
 // Helpers on window (for scripts/shot.mjs --eval / --report)
-//   __set( { preset, lit, samples, velocity, tier, shadows, map, view } )   change switches
+//   __set( { preset, tier, shadows, view } )   change switches
 //   __stats()                variant, shadow / sky render counters, bounds, fps
 //   __shaderInfo()           storage buffers and texture samples per stage of every compiled node shader
 //   __checkVelocity( { mode: 'camera' | 'node' | 'layout', count } )   motion vectors vs CPU values
-//                            ( { ok, maxError, … }: ok needs every sampled pixel to carry a written vector )
+//                            ( { ok, maxError, covered, samples, … }: ok needs every sampled pixel to carry a
+//                            written vector. Samples are the largest nodes whose centre pixel no other node
+//                            owns (`covered` counts the skipped ones); each reports its radius in pixels
+//                            and `f`, its share of the minimum radius: below 1 it is a point sprite )
 //   __shadowIdle( frames )   renders frames with the layout at rest, returns the shadow renders
 //   __select( i ), __hover( i ), __ripple( i, front ), __focus( i | 'shadow', dist ), __fit()
 import * as THREE from 'three/webgpu';
-import { pass, mrt, output, vec4 } from 'three/tsl';
 import { createApp } from '../src/app/App.js';
 import { loadPrepared } from '../src/data/load.js';
 import { prepareGraph } from '../src/graph/prepare.js';
@@ -67,7 +71,6 @@ import { ForceLayout } from '../src/gpu/ForceLayout.js';
 import { EdgeRenderer } from '../src/render/EdgeRenderer.js';
 import { NodeRenderer, NODE_LOOK } from '../src/render/NodeRenderer.js';
 import { Environment, ENV_PRESETS } from '../src/render/gfx/Environment.js';
-import { PostFX } from '../src/render/PostFX.js';
 import { gfxState, gfxUniforms } from '../src/render/gfx/shared.js';
 
 const params = new URLSearchParams( location.search );
@@ -96,12 +99,8 @@ try {
 	// ── switches ──
 	const cfg = {
 		preset: P( 'preset', 'aurora' ),
-		lit: num( 'lit', 1 ) === 1,
-		samples: num( 'samples', 4 ),
-		velocity: num( 'velocity', 0 ) === 1,
-		tier: P( 'tier', 'high' ),
+		tier: P( 'tier', P( 'quality', 'high' ) ),
 		shadows: num( 'shadows', 1 ) === 1,
-		map: num( 'map', 2048 ),
 		view: P( 'view', 'beauty' ),
 	};
 
@@ -110,66 +109,41 @@ try {
 	const edges = num( 'edges', 1 ) === 1 ? app.use( new EdgeRenderer( { opacity: num( 'eo', 1 ) } ) ) : null;
 	const nodes = app.use( new NodeRenderer( { size: num( 'size', 1 ), minPixelRadius: num( 'minpx', 1.5 ), halo: num( 'halo', 1 ) === 1 } ) );
 	const env = app.use( new Environment( { preset: cfg.preset, shadowSoftness: num( 'soft', 0.3 ) } ) );
-	const post = num( 'post', 1 ) === 1 ? new PostFX( { bloom: num( 'bloom', 0.8 ), quality: 'high', exposure: num( 'exposure', 1 ) } ) : null;
-	Object.assign( window, { __layout: layout, __edges: edges, __nodes: nodes, __env: env, __post: post, __gfx: gfxState, __gfxUniforms: gfxUniforms } );
+	Object.assign( window, { __layout: layout, __edges: edges, __nodes: nodes, __env: env, __gfx: gfxState, __gfxUniforms: gfxUniforms } );
 
 	// look parameters from the URL (after the preset's hints)
 	env.setPreset( cfg.preset );
-	const lookKeys = { rough: 'roughness', metal: 'metalness', coat: 'clearcoat', coatrough: 'clearcoatRoughness', emissive: 'emissive', rim: 'rim', variation: 'variation', shade: 'shade', flash: 'flash', glow: 'glow', coreshift: 'coreShift' };
+	const lookKeys = { rough: 'roughness', metal: 'metalness', coat: 'clearcoat', coatrough: 'clearcoatRoughness', emissive: 'emissive', rim: 'rim', variation: 'variation', shade: 'shade', flash: 'flash', glow: 'glow', coreshift: 'coreShift', point: 'point', pointglow: 'pointGlow' };
 	for ( const k in lookKeys ) if ( params.has( k ) ) nodes.setLook( { [ lookKeys[ k ] ]: num( k ) } );
 	if ( params.has( 'key' ) ) env.keyIntensity = num( 'key' );
 	if ( params.has( 'envint' ) ) env.envIntensity = num( 'envint' );
 	if ( params.has( 'fog' ) ) env.fog = num( 'fog' );
 	if ( params.has( 'ldir' ) ) env.setKeyDirection( P( 'ldir' ).split( ',' ).map( Number ) );
 
-	// ── local scene pass (+ optional velocity MRT, as the production pipeline will provide it) ──
-	// one MRT node for the lifetime of the page: render contexts are keyed by it (aa recipe §8)
-	const velocityMRT = mrt( { output, velocity: vec4( 0 ) } );
-	velocityMRT.setBlendMode( 'velocity', new THREE.BlendMode( THREE.NormalBlending ) );
-	velocityMRT.setClearColor( 'velocity', new THREE.Color( 0, 0, 0 ), 0 );
-	let postUsed = false;
-
+	// ── pipeline: the App's render graph. The tier decides the material variant ( lit, samples,
+	// velocity, shadow map size ); the switches of this page map to app.gfx ──
 	function rebuild() {
 
-		const old = app.scenePass;
-		const scenePass = pass( app.scene, app.camera, { samples: cfg.samples > 1 ? cfg.samples : 0 } );
-		if ( cfg.velocity ) {
-
-			scenePass.setMRT( velocityMRT );
-			scenePass.getTexture( 'velocity' ); // an attachment only exists once it was requested (TRAA does that in production)
-
-		}
-
-		app.scenePass = scenePass;
-
-		Object.assign( gfxState, { tier: cfg.tier, samples: cfg.samples > 1 ? cfg.samples : 1, velocity: cfg.velocity, shadows: cfg.shadows, shadowMapSize: cfg.map, lit: cfg.lit } );
-		app.events.dispatchEvent( new CustomEvent( 'gfx', { detail: gfxState } ) );
-
-		if ( cfg.view === 'velocity' && cfg.velocity ) {
-
-			// 0.5 grey = no motion; ±1 / vgain NDC = full scale
-			app.pipeline.outputColorTransform = false;
-			app.setOutput( () => vec4( scenePass.getTextureNode( 'velocity' ).rg.mul( num( 'vgain', 25 ) ).add( 0.5 ), 0.5, 1 ) );
-
-		} else if ( post ) {
-
-			if ( ! postUsed ) {
-
-				app.use( post ); // init() builds the chain on app.scenePass
-				postUsed = true;
-
-			} else post.build();
-
-		} else {
-
-			app.pipeline.outputColorTransform = true;
-			app.setOutput( () => scenePass );
-
-		}
-
-		if ( old && old !== scenePass ) old.dispose();
+		const gfx = app.gfx;
+		gfx.setQuality( cfg.tier );
+		gfx.set( 'shadows', cfg.shadows ? null : false );
+		gfx.set( 'post', num( 'post', 1 ) === 1 ? null : false );
+		gfx.set( 'debug', cfg.view === 'velocity' ? 'velocity' : null );
+		if ( params.has( 'bloom' ) ) gfx.set( 'bloom', num( 'bloom' ) );
+		if ( params.has( 'exposure' ) ) gfx.set( 'exposure', num( 'exposure' ) );
+		variantLine();
 
 	}
+
+	const variantEl = document.createElement( 'div' );
+	variantEl.style.cssText = 'font:11px/1.4 ui-monospace,monospace;color:#8f9bb3;white-space:pre';
+	function variantLine() {
+
+		variantEl.textContent = `lit ${gfxState.lit ? 'on' : 'off'}  samples ${gfxState.samples}  velocity ${gfxState.velocity ? 'on' : 'off'}\nshadow map ${gfxState.shadowMapSize}  aa ${gfxState.aa}`;
+
+	}
+
+	app.events.addEventListener( 'gfx', variantLine );
 
 	rebuild();
 
@@ -545,13 +519,26 @@ try {
 		const camPos = camera.position.clone();
 		const N = graph.N;
 		const R = ( i ) => nodes.worldRadius( i );
-		const c = new THREE.Vector3(), o = new THREE.Vector3(), ray = new THREE.Ray(), sph = new THREE.Sphere();
+		const c = new THREE.Vector3(), dir = new THREE.Vector3();
+		// every node on screen: centre and what it owns of the velocity attachment, in scene-pass pixels.
+		// A sphere owns its silhouette (taken 1.6 times wider: rim, antialiasing), a point sprite the
+		// disc of the minimum radius. Sprites write no depth: where two of them overlap, the one drawn
+		// last sets the vector, whichever is nearer
+		const P11 = camera.projectionMatrix.elements[ 5 ], minPx = nodes.minPixelRadius * gfxUniforms.pxScale.value;
+		const view = camera.matrixWorldInverse;
+		const sx = new Float32Array( N ), sy = new Float32Array( N ), sr = new Float32Array( N ), sd = new Float32Array( N ), sprite = new Uint8Array( N );
 		// candidates: nodes in view, largest on screen first; the dragged one always
 		const order = [];
 		for ( let i = 0; i < N; i ++ ) {
 
 			c.set( now[ 4 * i ], now[ 4 * i + 1 ], now[ 4 * i + 2 ] );
 			const ndc = c.clone().applyMatrix4( VP );
+			sd[ i ] = - c.clone().applyMatrix4( view ).z;
+			const radiusPx = sd[ i ] > 0 ? R( i ) * P11 * rt.height * 0.5 / sd[ i ] : 0;
+			sx[ i ] = ( ndc.x * 0.5 + 0.5 ) * rt.width;
+			sy[ i ] = ( 0.5 - ndc.y * 0.5 ) * rt.height;
+			sprite[ i ] = radiusPx < minPx ? 1 : 0;
+			sr[ i ] = sd[ i ] > 0 ? ( sprite[ i ] ? minPx : radiusPx * 1.6 ) + 1 : 0;
 			if ( Math.abs( ndc.x ) > 0.92 || Math.abs( ndc.y ) > 0.92 || ndc.z < 0 || ndc.z > 1 ) continue;
 			order.push( [ i, R( i ) / c.distanceTo( camPos ) ] );
 
@@ -560,27 +547,30 @@ try {
 		order.sort( ( a, b ) => b[ 1 ] - a[ 1 ] );
 		if ( dragged >= 0 ) order.unshift( [ dragged, 0 ] );
 		const out = [];
-		let maxErr = 0, maxMotion = 0;
+		let maxErr = 0, maxMotion = 0, covered = 0;
 		for ( const [ i ] of order ) {
 
 			if ( out.length >= count ) break;
 			c.set( now[ 4 * i ], now[ 4 * i + 1 ], now[ 4 * i + 2 ] );
-			ray.origin.copy( camPos );
-			ray.direction.copy( c ).sub( camPos ).normalize();
-			const d = c.distanceTo( camPos );
+			dir.copy( c ).sub( camPos ).normalize();
 			let occluded = false;
 			for ( let j = 0; j < N && ! occluded; j ++ ) {
 
-				if ( j === i ) continue;
-				o.set( now[ 4 * j ], now[ 4 * j + 1 ], now[ 4 * j + 2 ] );
-				if ( o.distanceTo( camPos ) > d ) continue;
-				sph.center.copy( o ); sph.radius = R( j ) * 1.6;
-				occluded = ray.intersectsSphere( sph );
+				if ( j === i || sr[ j ] === 0 ) continue;
+				if ( sd[ j ] > sd[ i ] && ! ( sprite[ i ] && sprite[ j ] ) ) continue;
+				const dx = sx[ j ] - sx[ i ], dy = sy[ j ] - sy[ i ];
+				occluded = dx * dx + dy * dy < sr[ j ] * sr[ j ];
 
 			}
 
-			if ( occluded ) continue;
-			const front = c.clone().addScaledVector( ray.direction, - R( i ) );
+			if ( occluded ) {
+
+				covered ++;
+				continue;
+
+			}
+
+			const front = c.clone().addScaledVector( dir, - R( i ) );
 			const prev = front.clone().sub( new THREE.Vector3( now[ 4 * i ] - before[ 4 * i ], now[ 4 * i + 1 ] - before[ 4 * i + 1 ], now[ 4 * i + 2 ] - before[ 4 * i + 2 ] ) );
 			const a = front.clone().applyMatrix4( VP ), b = prev.clone().applyMatrix4( prevVP );
 			const px = Math.floor( ( a.x * 0.5 + 0.5 ) * rt.width ), py = Math.floor( ( 0.5 - a.y * 0.5 ) * rt.height ); // readback origin: top left
@@ -591,7 +581,9 @@ try {
 			const err = Math.hypot( read[ 0 ] - expected[ 0 ], read[ 1 ] - expected[ 1 ] );
 			maxErr = Math.max( maxErr, err );
 			maxMotion = Math.max( maxMotion, Math.hypot( ...expected ) );
-			out.push( { node: i, dragged: i === dragged, expected: expected.map( ( v ) => + v.toFixed( 5 ) ), read: read.map( ( v ) => + v.toFixed( 5 ) ), alpha: + dec( data[ 3 ] ).toFixed( 2 ) } );
+			// true radius in scene-pass pixels and as a share of the minimum radius (below 1: a point sprite)
+			const radiusPx = R( i ) * P11 * rt.height * 0.5 / sd[ i ];
+			out.push( { node: i, dragged: i === dragged, radiusPx: + radiusPx.toFixed( 2 ), f: + ( radiusPx / minPx ).toFixed( 2 ), expected: expected.map( ( v ) => + v.toFixed( 5 ) ), read: read.map( ( v ) => + v.toFixed( 5 ) ), alpha: + dec( data[ 3 ] ).toFixed( 2 ) } );
 
 		}
 
@@ -607,7 +599,7 @@ try {
 		// a sampled pixel without a written vector (alpha 0) means the frame was not rendered or the node was missed
 		const written = out.every( ( o ) => o.alpha > 0.5 );
 		const ok = out.length > 0 && written && maxErr < 5e-4 && background.every( ( v ) => v === 0 );
-		return { mode, ok, checked: out.length, written, maxError: + maxErr.toExponential( 2 ), maxMotion: + maxMotion.toFixed( 5 ), background, samples: out };
+		return { mode, ok, checked: out.length, covered, written, maxError: + maxErr.toExponential( 2 ), maxMotion: + maxMotion.toFixed( 5 ), background, samples: out };
 
 	};
 
@@ -654,7 +646,7 @@ try {
 	const syncs = [];
 	function setSwitches( o ) {
 
-		const structural = [ 'lit', 'samples', 'velocity', 'tier', 'shadows', 'map', 'view' ].some( ( k ) => k in o && o[ k ] !== cfg[ k ] );
+		const structural = [ 'tier', 'shadows', 'view' ].some( ( k ) => k in o && o[ k ] !== cfg[ k ] );
 		Object.assign( cfg, o );
 		if ( 'preset' in o ) env.setPreset( cfg.preset );
 		if ( structural ) rebuild();
@@ -670,13 +662,10 @@ try {
 	syncs.push( slider( 'fog', 0, 1, 0.01, () => env.fog, ( v ) => ( env.fog = v ) ) );
 	syncs.push( slider( 'shadow soft', 0, 1, 0.01, () => env.shadowSoftness, ( v ) => ( env.shadowSoftness = v ) ) );
 	section( 'Variant' );
-	choice( 'lit', 'lit', [ 'on', 'off' ], ( v ) => setSwitches( { lit: v === 'on' } ) );
-	choice( 'samples', 'samples', [ 4, 1 ], ( v ) => setSwitches( { samples: + v } ) );
-	choice( 'velocity', 'velocity', [ 'off', 'on' ], ( v ) => setSwitches( { velocity: v === 'on' } ) );
 	choice( 'tier', 'tier', [ 'low', 'medium', 'high', 'ultra' ], ( v ) => setSwitches( { tier: v } ) );
 	choice( 'shadows', 'shadows', [ 'on', 'off' ], ( v ) => setSwitches( { shadows: v === 'on' } ) );
-	choice( 'shadow map', 'map', [ 1024, 2048, 4096 ], ( v ) => setSwitches( { map: + v } ) );
 	choice( 'view', 'view', [ 'beauty', 'velocity' ], ( v ) => setSwitches( { view: v } ) );
+	ui.appendChild( variantEl );
 	section( 'Node look' );
 	const look = ( key ) => [ () => nodes.look[ key ], ( v ) => nodes.setLook( { [ key ]: v } ) ];
 	syncs.push( slider( 'roughness', 0.05, 1, 0.01, ...look( 'roughness' ) ) );
@@ -688,6 +677,8 @@ try {
 	syncs.push( slider( 'variation', 0, 1, 0.01, ...look( 'variation' ) ) );
 	syncs.push( slider( 'shade', 0, 1, 0.01, ...look( 'shade' ) ) );
 	syncs.push( slider( 'flash', 0, 3, 0.01, ...look( 'flash' ) ) );
+	syncs.push( slider( 'point fade', 0, 1, 0.01, ...look( 'point' ) ) );
+	syncs.push( slider( 'point glow', 0, 2, 0.01, ...look( 'pointGlow' ) ) );
 	syncs.push( slider( 'node size', 0.2, 4, 0.05, () => nodes.size, ( v ) => ( nodes.size = v ) ) );
 	const row = document.createElement( 'div' );
 	for ( const [ text, fn ] of [ [ 'fit', () => fit( 1 ) ], [ 'shadow pair', () => focus( 'shadow' ) ], [ 'select hub', () => select( indexOf( 'max' ) ) ], [ 'clear', () => select( - 1, - 1 ) ], [ 'reheat', () => layout.reheat() ], [ 'defaults', () => {

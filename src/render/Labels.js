@@ -25,6 +25,24 @@
 //   labels.setColors( colors4 )   // after a palette change (pill border colors)
 //   labels.setGraph( buffers, graph, app ), labels.dispose()
 //   LabelGrid: the culling grid (exported for tests).
+//
+// Community names and semantic zoom (pure helpers, used by TextLabels, tested in
+// test/atmosphere-labels.test.js):
+//   communityNames( graph, height, { names, maxChars } )   one record per community of a hierarchy
+//       level: { cluster, count, representative, name, tail, text }. The name is the data's own
+//       ( graph.clusterNames[ cluster ], when the data package provides one ) or derived: the label of
+//       the member with the highest degree. `tail` is the member count, set in a lighter weight:
+//       "Valjean" + " · 17".
+//   communityFade( radiusPx, members, { lo, hi } )   0 = the community is a name, 1 = its nodes are
+//       names: the position in the semantic zoom, driven by the projected size of the community.
+//   communitySpacing( rms, members, fineSum, fineMembers )   the member spacing that drives it
+//   communityWeights( t )   { name, nodes }: the opacities of the two kinds of text at position t
+//   communityScale( count, largest )   font scale of a community name relative to the smallest
+//   nameFits( widthPx, radiusPx, fit )   a name may sit on its community while it is not wider than it
+//   looseNameArea( graphRadiusPx )   screen area for the names that are placed although they do not fit
+//   nameScale( scale, widthPx, viewportWidth )   font scale of a name limited to a share of the view
+//   zoomLabelBudget( width, height )   how many context labels the semantic zoom may bring up
+//   nameBudget( width, height )   how many community names a view carries at once
 
 import { linearToSrgb } from '../util/color.js';
 
@@ -142,6 +160,222 @@ export class LabelGrid {
 		return true;
 
 	}
+
+}
+
+// ── community names and semantic zoom ───────────────────────────────────────────────────────
+
+/** Separator between a community's name and its member count. */
+export const COMMUNITY_SEPARATOR = ' \u00b7 ';
+
+const nameOf = ( names, c ) => {
+
+	if ( ! names ) return '';
+	const v = typeof names.get === 'function' ? names.get( c ) : names[ c ];
+	return v === null || v === undefined ? '' : String( v ).trim();
+
+};
+
+/** Cuts a name to `maxChars` characters at a word boundary where one is near, with an ellipsis. */
+export function shortenName( text, maxChars = 22 ) {
+
+	const chars = Array.from( String( text ).trim() );
+	if ( chars.length <= maxChars ) return chars.join( '' );
+	let cut = maxChars - 1;
+	for ( let k = cut; k > maxChars * 0.6; k -- ) if ( /\s/.test( chars[ k ] ) ) {
+
+		cut = k;
+		break;
+
+	}
+
+	return chars.slice( 0, cut ).join( '' ).replace( /[\s,;:.\-–]+$/, '' ) + '\u2026';
+
+}
+
+/**
+ * Names of the communities of one hierarchy height (1 = finest).
+ * @param {object} graph prepared graph ( N, D, anc, levelOffset, degree, labels )
+ * @param {number} height 1…D
+ * @param {object} [options] { names: array / Map by cluster index (default graph.clusterNames),
+ *                             maxChars: longest name before it is shortened }
+ * @return {{ cluster, count, representative, name, tail, text }[]} in cluster order.
+ *   representative: the member with the highest degree (ties: the lowest index), −1 for an empty
+ *   community. name: the data's name, else the representative's label, else '' (unlabelled data).
+ *   tail: what follows in the lighter weight (" · 17", or "17 nodes" when there is no name).
+ */
+export function communityNames( graph, height, { names = graph.clusterNames, maxChars = 22 } = {} ) {
+
+	const { N, D } = graph;
+	if ( ! ( height >= 1 && height <= D ) ) return [];
+	const offset = graph.levelOffset[ height - 1 ], K = graph.levelOffset[ height ] - offset;
+	const count = new Uint32Array( K ), best = new Int32Array( K ).fill( - 1 );
+	const anc = graph.anc, degree = graph.degree, l = height - 1;
+	for ( let i = 0; i < N; i ++ ) {
+
+		const k = anc[ i * D + l ] - offset;
+		count[ k ] ++;
+		if ( best[ k ] < 0 || degree[ i ] > degree[ best[ k ] ] ) best[ k ] = i;
+
+	}
+
+	const out = [];
+	for ( let k = 0; k < K; k ++ ) {
+
+		const cluster = offset + k, n = count[ k ], rep = best[ k ];
+		let name = nameOf( names, cluster );
+		if ( ! name && rep >= 0 && graph.labels ) {
+
+			const label = graph.labels[ rep ];
+			if ( label !== null && label !== undefined ) name = String( label ).trim();
+
+		}
+
+		name = shortenName( name, maxChars );
+		const tail = name ? COMMUNITY_SEPARATOR + n : n + ( n === 1 ? ' node' : ' nodes' );
+		out.push( { cluster, count: n, representative: rep, name, tail, text: name + tail } );
+
+	}
+
+	return out;
+
+}
+
+/**
+ * The cross-fade of the semantic zoom for one community: 0 while it reads as ONE thing (show its
+ * name), 1 once its members can carry names of their own. The measure is the mean distance between
+ * neighbouring members on screen, radiusPx · √( π / members ) (members spread over the projected
+ * disc): below `lo` CSS px a node label would cover several nodes, above `hi` most labels fit (a
+ * label is about 60 × 14 px: at a spacing of 30 px one other node falls into its box on average,
+ * at 45 px less than half a node).
+ * It depends only on the community's own projected size, so a near community shows its nodes while
+ * the far ones still show their names.
+ * @param {number} radiusPx projected radius of the community, CSS px
+ * @param {number} members
+ */
+export function communityFade( radiusPx, members, { lo = 28, hi = 44 } = {} ) {
+
+	if ( ! ( radiusPx > 0 ) ) return 0;
+	const spacing = radiusPx * Math.sqrt( Math.PI / Math.max( 1, members ) );
+	const t = Math.min( 1, Math.max( 0, ( spacing - lo ) / Math.max( 1e-6, hi - lo ) ) );
+	return t * t * ( 3 - 2 * t );
+
+}
+
+/**
+ * Member spacing of a community in world units for communityFade(): rms radius / √members (project
+ * it as 1.29 · spacing · px per unit · √π, see TextLabels). Two estimates, the smaller one counts:
+ * the community's own, and the member-weighted mean over the finest communities inside it
+ * (`fineSum` = Σ √nᵢ · rmsᵢ, `fineMembers` = Σ nᵢ over fine communities of at least three nodes).
+ * A community of dense sub-communities is clumped, so its own radius overstates the spacing; where
+ * the finest level is pairs and triples, their rms radius is an edge length while the nodes of
+ * other fine communities lie in between, and the community as a whole is the better measure.
+ * @return {number} 0 when the community has fewer than three members and no fine estimate
+ */
+export function communitySpacing( rms, members, fineSum = 0, fineMembers = 0 ) {
+
+	const own = members >= 3 ? rms / Math.sqrt( members ) : 0;
+	const fine = fineMembers > 0 ? fineSum / fineMembers : 0;
+	return own > 0 && fine > 0 ? Math.min( own, fine ) : own > 0 ? own : fine;
+
+}
+
+/**
+ * Opacity of a community's name and of its members' labels at position t of the semantic zoom
+ * (communityFade()). A cross-fade with a dip: the two ramps overlap only around t = ½, where both
+ * are at 3/8, so there is never a double exposure of names and node labels at full strength, and
+ * node labels do not appear as a faint noise long before they can be read.
+ * @return {{ name: number, nodes: number }} both 0..1; name ≥ nodes exactly while t ≤ ½
+ */
+export function communityWeights( t ) {
+
+	const ramp = ( a, b ) => {
+
+		const k = Math.min( 1, Math.max( 0, ( t - a ) / ( b - a ) ) );
+		return k * k * ( 3 - 2 * k );
+
+	};
+
+	return { name: 1 - ramp( 0.15, 0.75 ), nodes: ramp( 0.25, 0.85 ) };
+
+}
+
+/** Font scale of a community name: 1 for the smallest, up to 1 + `range` for the largest community. */
+export function communityScale( count, largest, range = 0.4 ) {
+
+	if ( ! ( largest > 0 ) || ! ( count > 0 ) ) return 1;
+	return 1 + range * Math.sqrt( Math.min( 1, count / largest ) );
+
+}
+
+/**
+ * A name may sit on its community while the community is at least as large as the name: the text
+ * then lies on what it names instead of covering its neighbours (at a distance where a community
+ * is 60 px across, a name of 150 px hides three of them).
+ * @param {number} widthPx width of the name
+ * @param {number} radiusPx projected radius of the community (1.29 × its rms radius: the ball)
+ * @param {number} [fit] how much wider than the community's diameter a name may be
+ */
+export function nameFits( widthPx, radiusPx, fit = 1 ) {
+
+	return radiusPx > 0 && widthPx <= 2 * fit * radiusPx;
+
+}
+
+/**
+ * Screen area (CSS px²) that the names which do not fit their community (nameFits()) may cover
+ * between them: `share` of the graph's projected disc. A small projection of a graph (the far
+ * view, a phone) still gets the names of its largest communities this way, three or four of them
+ * (names over more than about a third of a small graph hide it: measured on the far views of
+ * lesmis, 5 names over 26 % read well, and of hsbm-500, 8 names over 44 % did not), while a graph
+ * that is itself about the size of a name gets none: there is nothing left to point at.
+ * TextLabels hands the area out in order of community size and stops at the first name that does
+ * not get any (and at `maxLooseNames`).
+ * @param {number} graphRadiusPx projected radius of the graph (1.29 × its rms radius; Infinity
+ *   when the camera is inside it)
+ */
+export function looseNameArea( graphRadiusPx, share = 0.22 ) {
+
+	return graphRadiusPx > 0 ? share * Math.PI * graphRadiusPx * graphRadiusPx : 0;
+
+}
+
+/**
+ * Font scale of a community name on a viewport: the name is no wider than `share` of the view (a
+ * phone in portrait is 400 px wide; a name of 170 px is nearly half of it), but its scale does not
+ * fall below `floor` (or its own scale, when that is smaller).
+ * @param {number} scale the name's scale (communityScale())
+ * @param {number} widthPx width of the name at scale 1
+ * @param {number} viewportWidth CSS px
+ */
+export function nameScale( scale, widthPx, viewportWidth, { share = 0.3, floor = 0.85 } = {} ) {
+
+	if ( ! ( widthPx > 0 ) || ! ( viewportWidth > 0 ) ) return scale;
+	return Math.min( scale, Math.max( floor, share * viewportWidth / widthPx ) );
+
+}
+
+/**
+ * How many context labels the semantic zoom may bring up at once: one per `area` CSS px² of the
+ * viewport (a cell of about 140 × 140 px), between `min` and `max`. A label is about 60 × 14 px, so
+ * the text covers 4 % of the view at most: enough to name the larger nodes of what the camera has
+ * come close to, taken in degree order, without turning the picture into a page of text.
+ */
+export function zoomLabelBudget( width, height, { area = 20000, min = 16, max = 80 } = {} ) {
+
+	return Math.min( max, Math.max( min, Math.round( ( width * height ) / area ) ) );
+
+}
+
+/**
+ * How many community names a view carries at once: one per `area` CSS px² (a cell of about
+ * 280 × 280 px), between `min` and `max`: 13 on 1280 × 800, 6 on a phone. They go to the largest
+ * communities in the view; a level with 40 communities then reads like a map at a small scale,
+ * which names the cities and leaves the towns to the next zoom step.
+ */
+export function nameBudget( width, height, { area = 80000, min = 6, max = 24 } = {} ) {
+
+	return Math.min( max, Math.max( min, Math.round( ( width * height ) / area ) ) );
 
 }
 

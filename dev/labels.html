@@ -20,6 +20,7 @@ html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui
 // Query:
 //   ds=imsv/lesmis            any id of public/data/manifest.json (files and generate specs)
 //   labels=auto|all|off       max=300  neighbors=40  fs=<CSS px>  weight=500  family=<css font-family>
+//   clabels=auto|on|off       community names (semantic zoom), clevel=<hierarchy height>
 //   html=1                    the HTML labels of src/render/Labels.js instead (legibility reference)
 //   comp=scene|overlay|direct scene: labels.mesh inside app.scene (HDR pass, depth test, tone mapped
 //                             and bloomed with the rest); overlay: the overlay pass of app.gfx
@@ -93,6 +94,8 @@ try {
 
 		labels = app.use( new TextLabels( {
 			mode: P( 'labels', 'auto' ),
+			clusterLabels: P( 'clabels', 'auto' ),
+			clusterLevel: params.has( 'clevel' ) ? + P( 'clevel' ) : 'auto',
 			maxLabels: + P( 'max', 300 ),
 			maxNeighbors: + P( 'neighbors', 40 ),
 			fontSize: params.has( 'fs' ) ? + P( 'fs' ) : null,
