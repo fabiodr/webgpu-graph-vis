@@ -1,6 +1,7 @@
 // Application entry: wires the modules together.
 //
 //   ForceLayout (GPU compute, order 0) → EdgeRenderer (10) → NodeRenderer (11) → Environment (12)
+//   → ClusterField (13)
 //   → TextLabels (20) → Lens, Tools (25) → Interaction (30) → CameraRig (31) → NodeCard (41)
 //
 // Rendering (scene pass, quality tiers, post-processing, label overlay) belongs to app.gfx, the
@@ -21,6 +22,7 @@ import { NodeRenderer } from './render/NodeRenderer.js';
 import { EdgeRenderer } from './render/EdgeRenderer.js';
 import { TextLabels } from './render/TextLabels.js';
 import { Background } from './render/Background.js';
+import { ClusterField } from './render/ClusterField.js';
 import { CameraRig } from './interact/CameraRig.js';
 import { Interaction } from './interact/Interaction.js';
 import { Panel, DEFAULT_SETTINGS } from './ui/Panel.js';
@@ -78,6 +80,7 @@ async function main() {
 	const edges = app.use( new EdgeRenderer( { beta: settings.bundling, opacity: settings.edgeOpacity, width: settings.edgeWidth, blendMode: settings.edgeBlend } ) );
 	const nodes = app.use( new NodeRenderer( { size: settings.nodeSize } ) );
 	const env = app.use( new Background() ); // the Environment: sky, key light, shadows, fog
+	const field = app.use( new ClusterField() ); // soft glow volume per community
 	// GPU text in the overlay pass of the render graph: full resolution, after tone mapping, soft
 	// occlusion from the scene depth
 	const labels = app.use( new TextLabels( { mode: settings.labels } ) );
@@ -269,7 +272,7 @@ async function main() {
 	} );
 	rig.setInsets( panel.insets(), { animate: false } );
 	slots.setInsets( panel.insets() );
-	const explore = installExplore( { app, settings, set, data, layout, nodes, edges, labels, env, rig, interaction, card, lens, tools, panel, slots, gfx } );
+	const explore = installExplore( { app, settings, set, data, layout, nodes, edges, labels, env, rig, interaction, card, lens, tools, panel, slots, gfx, field } );
 	app.events.addEventListener( 'immersive', ( e ) => {
 
 		if ( settings.immersive !== e.detail.immersive ) panel.set( 'immersive', e.detail.immersive );
@@ -295,7 +298,7 @@ async function main() {
 
 	await loadDataset( settings.dataset );
 	if ( settings.layoutMode === 'sphere' ) panel.set( 'layoutMode', 'sphere' );
-	window.__ui = { app, settings, layout, rig, interaction, panel, card, nodes, edges, labels, gfx, data, env, lens, tools, explore, slots, set };
+	window.__ui = { app, settings, layout, rig, interaction, panel, card, nodes, edges, labels, gfx, data, env, field, lens, tools, explore, slots, set };
 	window.__ready = true;
 
 }
