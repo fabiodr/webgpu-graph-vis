@@ -45,7 +45,7 @@ export const DEFAULT_SETTINGS = {
 	dataset: 'imsv/lesmis', layoutMode: 'force', running: true, autoRotate: true, immersive: false,
 	bundling: 0.85, edgeOpacity: 1, edgeWidth: 1, edgeBlend: 'normal', nodeSize: 1, bloom: 0.8,
 	palette: 'paper', labels: 'auto',
-	charge: 1, linkDistance: 30, gravity: 1, theta: 0.8, damping: 0.4, quality: 'auto',
+	charge: 1, linkDistance: 30, gravity: 1, theta: 0.8, damping: 0.3, quality: 'auto',
 };
 
 export const SETTINGS_SCHEMA = [

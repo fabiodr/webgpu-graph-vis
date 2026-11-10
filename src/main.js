@@ -1,11 +1,13 @@
 // Application entry: wires the modules together.
 //
-//   ForceLayout (GPU compute, order 0) → EdgeRenderer (10) → NodeRenderer (11) → Background (12)
-//   → TextLabels (20) → Interaction (30) → CameraRig (31) → NodeCard (41)
+//   ForceLayout (GPU compute, order 0) → EdgeRenderer (10) → NodeRenderer (11) → Environment (12)
+//   → TextLabels (20) → Lens, Tools (25) → Interaction (30) → CameraRig (31) → NodeCard (41)
 //
 // Rendering (scene pass, quality tiers, post-processing, label overlay) belongs to app.gfx, the
 // render graph the App creates; the labels are drawn in its overlay pass after tone mapping.
-// Data is loaded, clustered (Louvain when needed) and prepared in a Web Worker (DataClient).
+// Data is loaded, clustered (Louvain when needed) and prepared in a Web Worker (DataClient); graph
+// metrics are computed in a second worker and mapped onto the picture by the Lens. The explore
+// layer (src/explore) adds the surfaces for reading the graph.
 // URL parameters: ?ds=<dataset id> (e.g. imsv/lesmis, generated/hsbm-5k), ?layout=sphere,
 // ?autorotate=0, and the graphics switches read by the App (parseGfxParams in app/Quality.js):
 // ?quality=auto|low|medium|high|ultra, ?governor=0|1, ?ao=0|1, ?dof=0|1, ?shadows=0|1, ?traa=0|1,
@@ -14,7 +16,6 @@ import './ui/ui.css';
 import { createApp } from './app/App.js';
 import { fetchManifest } from './data/load.js';
 import { DataClient } from './data/client.js';
-import { colorize } from './graph/prepare.js';
 import { ForceLayout } from './gpu/ForceLayout.js';
 import { NodeRenderer } from './render/NodeRenderer.js';
 import { EdgeRenderer } from './render/EdgeRenderer.js';
@@ -24,6 +25,9 @@ import { CameraRig } from './interact/CameraRig.js';
 import { Interaction } from './interact/Interaction.js';
 import { Panel, DEFAULT_SETTINGS } from './ui/Panel.js';
 import { NodeCard } from './ui/NodeCard.js';
+import { Lens } from './analysis/Lens.js';
+import { Tools } from './analysis/Tools.js';
+import { installExplore } from './explore/index.js';
 
 const params = new URLSearchParams( location.search );
 const boot = document.getElementById( 'boot' );
@@ -68,10 +72,11 @@ async function main() {
 	if ( rig.reducedMotion || params.get( 'autorotate' ) === '0' ) settings.autoRotate = false;
 	rig.autoRotate = settings.autoRotate;
 
-	const layout = app.use( new ForceLayout() );
+	const data = new DataClient();
+	const layout = app.use( new ForceLayout( { data } ) ); // stress layouts run in the data worker
 	const edges = app.use( new EdgeRenderer( { beta: settings.bundling, opacity: settings.edgeOpacity, width: settings.edgeWidth, blendMode: settings.edgeBlend } ) );
 	const nodes = app.use( new NodeRenderer( { size: settings.nodeSize } ) );
-	app.use( new Background() );
+	const env = app.use( new Background() ); // the Environment: sky, key light, shadows, fog
 	// GPU text in the overlay pass of the render graph: full resolution, after tone mapping, soft
 	// occlusion from the scene depth
 	const labels = app.use( new TextLabels( { mode: settings.labels } ) );
@@ -110,6 +115,14 @@ async function main() {
 	app.use( interaction );
 	app.use( rig );
 	const card = app.use( new NodeCard( { interaction, rig } ) );
+	// metric lens (size / colour / glow by a graph metric) and tools (ripple, k-hop, shortest path)
+	const lens = app.use( new Lens() );
+	const tools = app.use( new Tools() );
+	app.events.addEventListener( 'lens', ( e ) => {
+
+		if ( e.detail.reason !== 'progress' ) labels.setColors?.( lens.colors );
+
+	} );
 
 	function apply( key, v ) {
 
@@ -133,14 +146,7 @@ async function main() {
 			case 'quality': gfx.setQuality( v ); break;
 			case 'labels': labels.mode = v; break;
 			case 'palette':
-				if ( app.graph ) {
-
-					const colors = colorize( app.graph.leafRank, v );
-					app.buffers.setColors( colors );
-					labels.setColors?.( colors );
-
-				}
-
+				lens.setPalette( v ); // the lens owns the node colours (cluster palette or a metric ramp)
 				card.setPalette?.( v );
 				break;
 			case 'charge': case 'linkDistance': case 'gravity': case 'theta': case 'damping':
@@ -162,7 +168,6 @@ async function main() {
 	}
 
 	// ── data ──────────────────────────────────────────────────────────────────────────────
-	const data = new DataClient();
 	data.onProgress( ( { stage, fraction, message } ) => panel && panel.setLoading( stage === 'done' ? null : message, fraction ) );
 	const prepareOptions = () => ( { palette: settings.palette, linkDistance: settings.linkDistance } );
 	let manifest = { datasets: [] };
@@ -256,6 +261,7 @@ async function main() {
 		onInsets: ( insets ) => rig.setInsets( insets ),
 	} );
 	rig.setInsets( panel.insets(), { animate: false } );
+	const explore = installExplore( { app, settings, set, data, layout, nodes, edges, labels, env, rig, interaction, card, lens, tools, panel } );
 	app.events.addEventListener( 'immersive', ( e ) => {
 
 		if ( settings.immersive !== e.detail.immersive ) panel.set( 'immersive', e.detail.immersive );
@@ -281,7 +287,7 @@ async function main() {
 
 	await loadDataset( settings.dataset );
 	if ( settings.layoutMode === 'sphere' ) panel.set( 'layoutMode', 'sphere' );
-	window.__ui = { app, settings, layout, rig, interaction, panel, card, nodes, edges, labels, gfx, data, set };
+	window.__ui = { app, settings, layout, rig, interaction, panel, card, nodes, edges, labels, gfx, data, env, lens, tools, explore, set };
 	window.__ready = true;
 
 }

@@ -596,7 +596,7 @@ export class ForceLayout {
 		this._stampLog = 0;
 		this._scaleVersion = app ? app.positionsVersion : - 1;
 		// a readback of the positions we just replaced may be in flight: ignore it
-		this._scaleSkip = sameBuffers && app && app._readbackBusy === true ? 1 : 0;
+		this._scaleSkip = sameBuffers && app && app.readbackPending === true ? 1 : 0;
 		this._own.stamp = 0;
 		this._own.pos = null;
 
@@ -725,7 +725,7 @@ export class ForceLayout {
 
 		// scale bookkeeping for the readback the App requests after this frame's render
 		if ( app.options?.readback === false ) this._ownReadback( app, ticking && forces );
-		else if ( app._readbackBusy !== true ) this._stampLog = this.scale.logScale;
+		else if ( app.readbackPending !== true ) this._stampLog = this.scale.logScale;
 
 		const settled = this.settled;
 		if ( settled !== this._settledPrev ) {

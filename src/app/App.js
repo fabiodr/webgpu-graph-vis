@@ -280,6 +280,13 @@ export class App {
 
 	}
 
+	/** True while a position readback is in flight (`positions` then lags the GPU by that request). */
+	get readbackPending() {
+
+		return this._readbackBusy === true;
+
+	}
+
 	/** Asynchronously copies nodePos to `this.positions` (one readback in flight at a time). */
 	_readPositions() {
 
