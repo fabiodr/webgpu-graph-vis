@@ -71,10 +71,13 @@
 }
 
 /* bottom left of the free area: status chips (frame rate, quality tier, layout state). They sit
-   above whatever the bottom slot shows (--wgv-bottom-clear: its height and a gap, 0 when empty) */
+   above whatever the bottom slot shows (--wgv-bottom-clear: its height and a gap, 0 when empty)
+   and end where the right column begins while it shows a card or a drawer (--wgv-right-w): the
+   chips wrap into a second row rather than run under it */
 .wgv-slot-status {
 	bottom: calc(var(--wgv-pad-b) + var(--wgv-bottom-clear, 0px));
 	left: calc(var(--wgv-inset-left, 0px) + var(--wgv-pad-l));
+	right: calc(max(var(--wgv-inset-right, 0px), var(--wgv-right-w, 0px)) + var(--wgv-pad-r));
 	align-items: flex-end;
 	transition: bottom 0.3s cubic-bezier(0.22, 1, 0.36, 1);
 }

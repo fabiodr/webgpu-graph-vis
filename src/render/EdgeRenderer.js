@@ -9,21 +9,33 @@
 //  positions, the bundling strength, the path set or the sphere-layout parameters changed. The
 //  draws below only read samples: nothing per frame is O(E) on the CPU, and a graph at rest costs
 //  no curve evaluation. S comes from autoSegments( E, longest path, sphere scale ), capped by the
-//  cache's memory budget (64 MiB; 384k edges: S = 8, 55 MB). Small graphs reserve the room for
-//  the sphere layout's finer sampling up front (below 8 MiB), so the first morph rebuilds nothing.
+//  cache's memory budget (`memoryBudget`: 64 MiB; 384k edges: S = 8, 55 MB; 24 MiB on touch
+//  devices, where three's CPU copy of the buffer, as large again, is the largest single allocation
+//  of the page and a memory spike closes the tab: S = 3 there for 384k edges). Small graphs
+//  reserve the room for the sphere layout's finer sampling up front (below 8 MiB), so the first
+//  morph rebuilds nothing.
 //
 // ─── Strand layer (every edge, the default look) ────────────────────────────────────────────
-//  ONE instanced draw: a ribbon strip of S segments per edge ( attribute position = ( sample
-//  index, side ±1, 0 ) ), expanded in screen space perpendicular to the projected tangent (central
-//  difference of the neighbouring samples). Alpha-blended (normal or additive), no depth write,
-//  forceSinglePass. Vertex-stage storage reads: curve samples 4 (the sample, its two neighbours,
-//  the last one for the curve length), edgeInfo 1, edgeAttr 1, nodeColor 2, nodeState 2 = 5
+//  ONE instanced draw: a ribbon strip per edge ( attribute position = ( vertex index, side ±1,
+//  0 ) ), expanded in screen space perpendicular to the projected tangent. The strip is finer than
+//  the cache: `strandSub` vertex pairs per cached segment (about STRAND_SEGMENTS per edge, at most
+//  4 per segment, fewer when the draw would pass strandVertexLimit; 1 for very large graphs), put
+//  on the Catmull-Rom spline through the samples in the vertex stage, the same curve the tubes
+//  follow. A close-up therefore shows curves, not chords, at any cache resolution, and the cache
+//  (memory, compute) stays as small as it was. Alpha-blended (normal or additive), no depth write,
+//  forceSinglePass. Vertex-stage storage reads: curve samples 5 (the four spline points and the
+//  last sample for the curve length), edgeInfo 1, edgeAttr 1, nodeColor 2, nodeState 2 = 5
 //  bindings (7 with strandVelocity 'true': + nodePos, nodePrev), none in the fragment stage.
 //   · Width: world half width (scales with graph.layoutRadius) × the per-edge factors, clamped to
-//     [minPixelWidth, maxPixelWidth] CSS px × gfxUniforms.pxScale. Below 1 pass pixel the ribbon
-//     keeps 1 px and its alpha is scaled by the coverage ratio; the strip is padded by 0.5 px per
-//     side for the analytic edge profile (1 px box filter) in the fragment stage.
-//   · Colour: OKLab gradient source → target (cube-root LMS blend), HDR on purpose (bloom).
+//     [minPixelWidth, maxPixelWidth] CSS px × gfxUniforms.pxScale (highlighted and hovered strands
+//     up to 1.25 × that). Strands are silk: near the camera they stay thin lines (8 px at most)
+//     instead of growing into flat tapes; what should have body there is a tube. Below 1 pass
+//     pixel the ribbon keeps 1 px and its alpha is scaled by the coverage ratio; the strip is
+//     padded by 0.5 px per side for the analytic edge profile (1 px box filter) in the fragment stage.
+//   · Colour: OKLab gradient source → target (cube-root LMS blend) with the chroma restored: a
+//     straight line through OKLab between two hues far apart passes near the grey axis, so the
+//     blend is pushed back out to the mix of the two end chromas (gradientColor() in
+//     gfx/strandSurface.js; hue and lightness of the blend are kept). HDR on purpose (bloom).
 //   · Light (gfxState.lit): the analytic thin-strand model of gfx/strandSurface.js per fragment —
 //     Lambert averaged over the visible half cylinder and a Kajiya-Kay highlight around the
 //     tangent from gfxUniforms.keyDir / keyColor, hemisphere ambient — on top of an emissive
@@ -57,12 +69,19 @@
 //  the eased highlight while the strand of the same edge fades, and shrinks again before the
 //  edge leaves the list (it lingers there for `tubeLinger` seconds). Vertex-stage storage
 //  bindings: tube index, curve samples, edgeInfo, edgeAttr, nodeColor, nodeState = 6.
+//   · Ends: a tube tapers to look.tubeTaper of its radius between three node radii from an end
+//     point and that node's surface (arc length from the cache, node radius = the node renderer's
+//     base size × the node's radius factor), and its emission falls with it: the many tubes of a
+//     hub arrive as fine lines and the node, its ring and its label stay readable. The emission
+//     of highlighted edges is also scaled by 1 / √( edges of the selection / 8 ) (at least
+//     look.crowdFloor), so a hub's bundle does not add up to a white blob in the bloom.
+//   · Width: world radius, at least tubeMinPixelWidth and at most tubeMaxPixelWidth CSS px.
 //   · Smooth: the tube strip is finer than the cache (about 96 segments per tube: 2 to 8 vertex
 //     pairs per cached segment, fewer when the draw would pass tubeVertexLimit) and interpolates
-//     the samples with a Catmull-Rom spline in the vertex stage (4 sample reads, C1), so a tube
-//     has no corners where the strand of the same edge is a chain of 8 to 32 chords. Tube and
-//     strand agree at the samples; where they differ by about a tube radius in between, the
-//     strand's sheath fades.
+//     the samples with a Catmull-Rom spline in the vertex stage (4 sample reads, C1). Strands
+//     follow the same spline (see above), so tube and sheath coincide; only where the strand
+//     layer cannot afford the subdivision (strandSub = 1, very large graphs) the strand is a chain
+//     of chords, and its sheath fades where it leaves the tube by about a tube radius.
 //   · Shadows on demand: the shadow maps of the scene's lights (shadow.autoUpdate = false) are
 //     asked for a new frame whenever the tube list changes and in every frame while tubes ease
 //     in or out.
@@ -83,12 +102,14 @@
 //                      colorMode, visible, contextOpacity, highlightGlow, highlightLevel,
 //                      hoverBoost, brightness, sphereSegmentScale, sphereAxis, renderOrder,
 //                      style, flow, flowSpeed, flowSpacing, tubes, tubeLimit, tubeShadowLimit,
-//                      solidLimit, tubeLinger, tubeVertexLimit, defocusLimit, strandVelocity, look } )
+//                      solidLimit, tubeLinger, tubeVertexLimit, strandVertexLimit, defocusLimit,
+//                      strandVelocity, memoryBudget (bytes of the curve cache; null = auto, see
+//                      "Curves"), look } )
 //  App module (order 10): init( app ), setGraph( buffers, graph, app ), update( dt, app ), dispose()
 //  setBundling( beta ) / .bundling   Holten bundling strength in [0,1] (default 0.85; paper 0.9)
 //  .opacity                       multiplier on the automatic opacity (default 1)
 //  .width                         multiplier on the world-space width (default 1)
-//  .minPixelWidth / .maxPixelWidth   full ribbon width clamp, CSS pixels (defaults 0.75 / 24)
+//  .minPixelWidth / .maxPixelWidth   full strand width clamp, CSS pixels (defaults 0.75 / 8)
 //  .blendMode                     'normal' | 'additive' (glow; good for dense graphs)
 //  .segments                      null = auto from E, or an integer >= 1 (clamped to the budget)
 //  .sphereSegmentScale            auto segment multiplier while layoutBlend > 0 (default 2)
@@ -103,6 +124,9 @@
 //  .tubeLimit / .tubeShadowLimit / .solidLimit / .tubeLinger
 //  .tubeVertexLimit               most vertices of the tube draw (default 2 M): bounds the tubes'
 //                                 subdivision, never their number
+//  .strandVertexLimit             most vertices of the strand draw that subdivision may lead to
+//                                 (default 3 M; the cache resolution itself is never reduced by it)
+//  .animating                     true while the flow runs (the App keeps its full frame rate)
 //  .defocusLimit                  most strand defocus, CSS px of circle of confusion; null = auto
 //  .flow / .flowSpeed / .flowSpacing   'off' | 'selection' | 'all'; fractions of layoutRadius per
 //                                 second and between pulses (defaults 'off', 0.3, 0.5)
@@ -115,14 +139,15 @@
 //  setPaths( paths | null )       = curves.setPaths (control paths of src/graph/bundling.js)
 //  setLook( { … } ) / .look       strand / tube material parameters, see LOOK_DEFAULTS
 //  .curves                        the EdgeCurves cache
-//  .stats                         { edges, segments, vertices, triangles, autoOpacity, tubes,
-//                                   tubeSegments, tubeShadows, style, curveUpdates, curveSkipped,
-//                                   curveBytes, variant }
+//  .stats                         { edges, segments (of the cache), strandSegments (of the strip),
+//                                   vertices, triangles, autoOpacity, tubes, tubeSegments,
+//                                   tubeShadows, style, curveUpdates, curveSkipped, curveBytes, variant }
 //  .mesh / .tubeMesh              the THREE.Mesh of the strand layer (renderOrder −1: drawn before
 //                                 the nodes) and of the tube layer; world space, their own
 //                                 transform is ignored; raycast disabled
 //
 //  Also exported: autoSegments( E, maxPath, sphereScale ), autoOpacity( E ), autoDefocusLimit( E ),
+//  autoCurveMemory( coarsePointer ), strandSubdivision( S, E, vertexLimit ),
 //  EDGE_DEFAULTS, LOOK_DEFAULTS and evalEdgeCurveCPU( … ) (re-exported from gpu/EdgeCurves.js).
 
 import * as THREE from 'three/webgpu';
@@ -135,7 +160,7 @@ import { EdgeCurves, evalEdgeCurveCPU } from '../gpu/EdgeCurves.js';
 import { buildEdgeIndex } from '../graph/analytics.js';
 import { gfxUniforms, gfxState, motionVector, velocityOutput, skipVelocity, fogTransmittance, cocPixels } from './gfx/shared.js';
 import { isOrthographic, pixelsPerUnit, viewToDepth, viewToWorld, applySurface } from './gfx/impostor.js';
-import { lmsRoot, lmsRootToLinear, strandLight, tubeFrame, flowPulse } from './gfx/strandSurface.js';
+import { gradientColor, strandLight, tubeFrame, flowPulse } from './gfx/strandSurface.js';
 
 export { evalEdgeCurveCPU };
 
@@ -144,7 +169,7 @@ export const EDGE_DEFAULTS = {
 	opacity: 1,
 	width: 1,
 	minPixelWidth: 0.75, // CSS px (full width); thinner edges fade by coverage below 1 pass px
-	maxPixelWidth: 24, // CSS px (full width)
+	maxPixelWidth: 8, // CSS px (full width): strands stay lines near the camera (tubes have their own limit)
 	blendMode: 'normal',
 	segments: null,
 	colorMode: 'gradient',
@@ -164,12 +189,21 @@ export const EDGE_DEFAULTS = {
 	solidLimit: 50000, // style 'solid' applies to graphs with at most this many edges
 	tubeLinger: 1.2, // seconds an edge stays in the tube list after it left the highlight (ease-out)
 	tubeVertexLimit: 2e6, // most vertices of the tube draw: bounds its subdivision (see TUBE_SEGMENTS)
+	strandVertexLimit: 3e6, // most vertices of the strand draw that its subdivision may lead to (see STRAND_SEGMENTS)
 	defocusLimit: null, // most strand defocus (circle of confusion, CSS px); null = auto from E
 	flow: 'off',
 	flowSpeed: 0.3, // layout radii per second
 	flowSpacing: 0.5, // layout radii between pulses
 	strandVelocity: 'camera',
+	memoryBudget: null, // bytes of the curve cache; null = 64 MiB, 24 MiB on touch devices
 };
+
+/** Curve cache budget for a device (bytes): the buffer exists twice, on the GPU and as three's CPU copy. */
+export function autoCurveMemory( coarsePointer = typeof matchMedia === 'function' && matchMedia( '(pointer:coarse)' ).matches ) {
+
+	return ( coarsePointer ? 24 : 64 ) * 1024 * 1024;
+
+}
 
 /** Material parameters of the strand and tube layers (edges.setLook). */
 export const LOOK_DEFAULTS = {
@@ -185,11 +219,16 @@ export const LOOK_DEFAULTS = {
 	// tubes
 	tubeRadius: 2.1, // tube radius in strand half widths
 	tubeMinPixelWidth: 2.4, // CSS px (full width)
+	tubeMaxPixelWidth: 24, // CSS px (full width)
+	tubeTaper: 0.35, // share of its radius (and 0.3 + 0.7 × that of its emission) a tube keeps where it meets a node
+	crowdFloor: 0.35, // least emission factor of the tubes of a hub (1 / √( edges / 8 ) above it)
 	tubeRoughness: 0.34,
 	tubeMetalness: 0,
 	tubeAlbedo: 0.6, // diffuse colour = gradient × this
-	tubeGlow: 1.15, // emissive of highlighted tubes (× gradient colour × brightness)
-	solidGlow: 0.3, // emissive of the tubes of style 'solid'
+	tubeGlow: 0.7, // emissive of highlighted tubes (× gradient colour × brightness)
+	solidGlow: 0.55, // emissive of the tubes of style 'solid' …
+	solidGlowThin: 0.9, // … rising to this as a tube gets thinner than 3 CSS px (distant tubes stay luminous, close ones lit)
+	chroma: 0.85, // 0..1: how far the gradient's chroma is restored to the mix of the two end chromas
 	contextDim: 0.3, // style 'solid': colour factor of the context while a selection exists
 	// flow
 	flowGain: 1.6, // extra emission at a pulse head
@@ -200,6 +239,10 @@ export const LOOK_DEFAULTS = {
 // Tube strips are finer than the cache: about this many segments per tube (an integer number of
 // vertices per cached segment, at most 8), interpolated through the samples in the vertex stage.
 const TUBE_SEGMENTS = 96;
+// … and so are the strands: about this many segments per edge, at most STRAND_SUB_MAX vertices per
+// cached segment, bounded by strandVertexLimit.
+const STRAND_SEGMENTS = 96;
+const STRAND_SUB_MAX = 4;
 
 /**
  * Ribbon segments per edge. Base by E (<=2k: 32, <=20k: 20, <=100k: 12, else 8), scaled up for
@@ -210,6 +253,19 @@ export function autoSegments( E, maxPath = 6, sphereScale = 1 ) {
 
 	const base = E <= 2000 ? 32 : E <= 20000 ? 20 : E <= 100000 ? 12 : 8;
 	return Math.min( 96, Math.round( base * Math.max( 1, ( maxPath + 1 ) / 7 ) * sphereScale ) );
+
+}
+
+/**
+ * Vertex pairs per cached curve segment of the strand strip: about STRAND_SEGMENTS segments per
+ * edge (at most STRAND_SUB_MAX per cached segment), fewer while E edges would otherwise pass
+ * `vertexLimit` vertices, never less than 1 (the cache resolution itself is not reduced).
+ */
+export function strandSubdivision( S, E, vertexLimit = EDGE_DEFAULTS.strandVertexLimit ) {
+
+	const wanted = Math.max( 1, Math.min( STRAND_SUB_MAX, Math.round( STRAND_SEGMENTS / Math.max( 1, S ) ) ) );
+	const fits = Math.floor( ( vertexLimit / ( 2 * Math.max( 1, E ) ) - 1 ) / Math.max( 1, S ) );
+	return Math.max( 1, Math.min( wanted, fits ) );
 
 }
 
@@ -319,11 +375,12 @@ export class EdgeRenderer {
 		this.solidLimit = o.solidLimit;
 		this.tubeLinger = o.tubeLinger;
 		this.tubeVertexLimit = o.tubeVertexLimit;
+		this.strandVertexLimit = o.strandVertexLimit;
 		this._defocusLimit = o.defocusLimit;
 		this.look = { ...LOOK_DEFAULTS, ...( o.look || {} ) };
 
 		/** The curve cache. It survives graph changes (its buffers do not). */
-		this.curves = new EdgeCurves( { beta: o.beta, highlightLevel: o.highlightLevel, sphereAxis: o.sphereAxis } );
+		this.curves = new EdgeCurves( { beta: o.beta, highlightLevel: o.highlightLevel, sphereAxis: o.sphereAxis, memoryBudget: o.memoryBudget ?? autoCurveMemory() } );
 		this.curves.onRealloc = () => this._disposeMaterials();
 
 		// uniforms owned by the renderer (they survive graph changes)
@@ -354,13 +411,17 @@ export class EdgeRenderer {
 			flowSpacing: uniform( 1 ), // world units
 			defocusMax: uniform( 10 ), // most strand circle of confusion, CSS px
 			tubeSub: uniform( 1, 'uint' ), // tube vertices per cached curve segment
-			sheathFit: uniform( 0 ), // 1 while the tubes are smoother than the strands (tubeSub > 1)
+			strandSub: uniform( 1, 'uint' ), // strand vertices per cached curve segment
+			sheathFit: uniform( 0 ), // 1 while the tubes are smoother than the strands (tubeSub > 1, strandSub = 1)
+			nodeRadius: uniform( 1 ), // world radius of a node of radius factor 1 (tube ends taper toward the node surface)
+			crowd: uniform( 1 ), // emission factor of highlighted edges: falls with the size of the selection's bundle
 			// look
 			emissive: uniform( L.emissive ), diffuse: uniform( L.diffuse ), sheen: uniform( L.sheen ), gloss: uniform( L.gloss ),
 			sheenTint: uniform( L.sheenTint ), shift: uniform( L.shift ), sheath: uniform( L.sheath ), setContext: uniform( L.setContext ),
 			tubeRadius: uniform( L.tubeRadius ), tubeMinPixelWidth: uniform( L.tubeMinPixelWidth ), tubeRoughness: uniform( L.tubeRoughness ),
+			tubeMaxPixelWidth: uniform( L.tubeMaxPixelWidth ), tubeTaper: uniform( L.tubeTaper ), chroma: uniform( L.chroma ),
 			tubeMetalness: uniform( L.tubeMetalness ), tubeAlbedo: uniform( L.tubeAlbedo ), tubeGlow: uniform( L.tubeGlow ),
-			solidGlow: uniform( L.solidGlow ), contextDim: uniform( L.contextDim ),
+			solidGlow: uniform( L.solidGlow ), solidGlowThin: uniform( L.solidGlowThin ), contextDim: uniform( L.contextDim ),
 			flowGain: uniform( L.flowGain ), flowTail: uniform( L.flowTail ), flowJitter: uniform( L.flowJitter ),
 		};
 
@@ -369,6 +430,7 @@ export class EdgeRenderer {
 		this._tubeCapacity = 0;
 		this._tubeCount = 0;
 		this._tubeSegments = 0;
+		this._strandSegments = 0;
 		this._tubeDirty = true;
 		this._time = 0;
 		this._shadowUntil = - Infinity; // tubes are easing: the shadow map follows until then …
@@ -641,6 +703,13 @@ export class EdgeRenderer {
 
 	}
 
+	/** True while pulses travel along the edges: the App keeps rendering at the display rate. */
+	get animating() {
+
+		return this._visible && this._flow !== 'off' && ( this._flow === 'all' || this._tubeCount > 0 || this._selEdges !== null || this._hl.edges !== null );
+
+	}
+
 	get flowSpeed() {
 
 		return this._flowSpeed;
@@ -772,7 +841,7 @@ export class EdgeRenderer {
 
 		const c = this.curves.stats;
 		return {
-			edges: this._E, segments: this._S, vertices: this._E * ( this._S + 1 ) * 2, triangles: this._E * this._S * 2, autoOpacity: this._auto,
+			edges: this._E, segments: this._S, strandSegments: this._strandSegments, vertices: this._E * ( this._strandSegments + 1 ) * 2, triangles: this._E * this._strandSegments * 2, autoOpacity: this._auto,
 			tubes: this._tubeCount, tubeSegments: this._tubeSegments, tubeShadows: this._tubesCast(), style: this._solidOn ? 'solid' : 'luminous',
 			curveUpdates: c.updates, curveSkipped: c.skipped, curveBytes: c.bytes, variant: this._variant,
 		};
@@ -812,6 +881,7 @@ export class EdgeRenderer {
 		this._pathsSeen = this.curves.paths;
 		this._S = 0;
 		this._tubeSegments = 0;
+		this._strandSegments = 0;
 		this._shadowUntil = - Infinity;
 		this._shadowFrames = 0;
 		this._shadowsInvolved = false;
@@ -902,6 +972,11 @@ export class EdgeRenderer {
 
 		}
 
+		// tube ends taper toward the node surface: the node renderer's base radius (as it sizes them)
+		if ( this._nodes === undefined || ( this._nodes && ! app.modules.includes( this._nodes ) ) ) this._nodes = ( app.modules && app.modules.find( ( m ) => m && m.isNodeRenderer ) ) || null;
+		const g = this.graph;
+		this.u.nodeRadius.value = this._nodes && this._nodes.baseSize > 0 ? this._nodes.baseSize * ( this._nodes.size ?? 1 ) : 0.065 * g.layoutRadius / Math.cbrt( Math.max( 1, g.N ) );
+
 		this._time = time;
 		this._updateSelection( time );
 		if ( this._tubeDirty ) this._rebuildTubeList();
@@ -967,16 +1042,20 @@ export class EdgeRenderer {
 		const paths = this.curves.paths;
 		const maxPath = paths ? paths.maxInterior + 2 : this.graph.maxPath;
 		const S = this.curves.setSegments( this._wantedSegments( maxPath, sphere ) );
-		if ( S !== this._S || ! this.geometry ) {
+		// the strip is finer than the cache (see the header): vertex pairs per cached segment
+		const sub = strandSubdivision( S, this.graph.E, this.strandVertexLimit );
+		if ( S * sub !== this._strandSegments || ! this.geometry ) {
 
 			const old = this.geometry;
-			this.geometry = ribbonGeometry( S );
-			this._S = S;
+			this.geometry = ribbonGeometry( S * sub );
+			this._strandSegments = S * sub;
 			if ( this.mesh ) this.mesh.geometry = this.geometry;
 			if ( old ) old.dispose();
 
 		}
 
+		this._S = S;
+		this.u.strandSub.value = sub;
 		this.geometry.instanceCount = this.graph.E;
 		this._updateTubeGeometry();
 
@@ -1004,7 +1083,7 @@ export class EdgeRenderer {
 		}
 
 		this.u.tubeSub.value = sub;
-		this.u.sheathFit.value = sub > 1 ? 1 : 0;
+		this.u.sheathFit.value = sub > 1 && this.u.strandSub.value === 1 ? 1 : 0;
 		this.tubeGeometry.instanceCount = n;
 
 	}
@@ -1080,6 +1159,9 @@ export class EdgeRenderer {
 		if ( prev ) linger.push( { edges: prev, until: time + this.tubeLinger, frames: 24 } );
 		this._selEdges = edges;
 		this._selOverLimit = nodes.length > 0 && edges === null;
+		// a hub's bundle converges on one node: its emission is shared out, so it does not sum to white
+		// (kept while the old tubes ease out: the value of the last selection stays until the next one)
+		if ( edges ) this.u.crowd.value = Math.max( this.look.crowdFloor, 1 / Math.sqrt( Math.max( 1, edges.length / 8 ) ) );
 		this._tubeDirty = true;
 		this._easeShadows(); // the new tubes grow with the eased state, the old ones shrink
 
@@ -1280,6 +1362,7 @@ export class EdgeRenderer {
 		this.geometry = null;
 		this.tubeGeometry = null;
 		this._S = 0;
+		this._strandSegments = 0;
 		if ( this.tubeIndex ) this.tubeIndex.value.dispose();
 		this.tubeIndex = null;
 		this._tubeCapacity = 0;
@@ -1289,14 +1372,13 @@ export class EdgeRenderer {
 
 	/**
 	 * Shared vertex-stage reads of both layers: the curve point of this vertex, the tangent there
-	 * and the per-edge state. Call inside a Fn().
-	 *  · strands (sub = null): one vertex pair per cached sample; tangent = central difference of the
-	 *    neighbouring samples. Sample reads: the sample, its two neighbours, the last one (length).
-	 *  · tubes (sub = uint node): `sub` vertex pairs per cached segment, a Catmull-Rom spline through
-	 *    the samples k−1 … k+2 (C1: no corners where the strands' chords meet) with its derivative as
-	 *    tangent. It passes through the samples, so tube and strand agree there. Four sample reads.
+	 * and the per-edge state. Call inside a Fn(). `sub` (uint node) vertex pairs per cached segment
+	 * lie on the Catmull-Rom spline through the samples k−1 … k+2 (C1: no corners where the cached
+	 * chords meet), the tangent is its derivative. The spline passes through the samples, and with
+	 * sub = 1 the vertices are the samples and the tangent their central difference. Five sample
+	 * reads (the four spline points and the last sample for the curve length).
 	 */
-	_edgeVertex( e, sub = null ) {
+	_edgeVertex( e, sub ) {
 
 		const { buffers, curves } = this;
 		const u = this.u;
@@ -1306,38 +1388,25 @@ export class EdgeRenderer {
 		const S = stride.sub( uint( 1 ) ).toVar();
 		const base = e.mul( stride ).toVar();
 		const at = ( k ) => samples.element( base.add( k ) );
-		let position, tangent, t, arc, bend = null;
-		if ( sub === null ) {
 
-			const sample = at( i ).toVar();
-			const before = at( max( i, uint( 1 ) ).sub( uint( 1 ) ) ).xyz.toVar();
-			const after = at( min( i.add( uint( 1 ) ), S ) ).xyz.toVar();
-			position = sample.xyz;
-			tangent = after.sub( before ).toVar();
-			// second difference: 8 × the gap between a chord and the smooth curve through the samples
-			bend = before.add( after ).sub( position.mul( 2 ) );
-			t = float( i ).div( float( S ) ).toVar();
-			arc = sample.w;
-
-		} else {
-
-			// segment k and the fraction f along it, in integers (f = 1 only at the last vertex)
-			const k = min( i.div( sub ), S.sub( uint( 1 ) ) ).toVar();
-			const f = float( i.sub( k.mul( sub ) ) ).div( float( sub ) ).toVar();
-			const s1 = at( k ).toVar(), s2 = at( k.add( uint( 1 ) ) ).toVar();
-			// relative to sample k (precision); the neighbours are clamped at the two ends
-			const d0 = at( max( k, uint( 1 ) ).sub( uint( 1 ) ) ).xyz.sub( s1.xyz ).toVar();
-			const d2 = s2.xyz.sub( s1.xyz ).toVar();
-			const d3 = at( min( k.add( uint( 2 ) ), S ) ).xyz.sub( s1.xyz ).toVar();
-			const a = d2.sub( d0 ).toVar();
-			const b = d0.mul( 2 ).add( d2.mul( 4 ) ).sub( d3 ).toVar();
-			const c = d3.sub( d0 ).sub( d2.mul( 3 ) ).toVar();
-			position = s1.xyz.add( a.add( b.add( c.mul( f ) ).mul( f ) ).mul( f ).mul( 0.5 ) ).toVar();
-			tangent = a.add( b.mul( f.mul( 2 ) ) ).add( c.mul( f.mul( f ).mul( 3 ) ) ).toVar(); // 2 × d position / d f
-			t = float( k ).add( f ).div( float( S ) ).toVar();
-			arc = mix( s1.w, s2.w, f );
-
-		}
+		// segment k and the fraction f along it, in integers (f = 1 only at the last vertex)
+		const k = min( i.div( sub ), S.sub( uint( 1 ) ) ).toVar();
+		const f = float( i.sub( k.mul( sub ) ) ).div( float( sub ) ).toVar();
+		const s1 = at( k ).toVar(), s2 = at( k.add( uint( 1 ) ) ).toVar();
+		// relative to sample k (precision); the neighbours are clamped at the two ends
+		const d0 = at( max( k, uint( 1 ) ).sub( uint( 1 ) ) ).xyz.sub( s1.xyz ).toVar();
+		const d2 = s2.xyz.sub( s1.xyz ).toVar();
+		const d3 = at( min( k.add( uint( 2 ) ), S ) ).xyz.sub( s1.xyz ).toVar();
+		const a = d2.sub( d0 ).toVar();
+		const b = d0.mul( 2 ).add( d2.mul( 4 ) ).sub( d3 ).toVar();
+		const c = d3.sub( d0 ).sub( d2.mul( 3 ) ).toVar();
+		const position = s1.xyz.add( a.add( b.add( c.mul( f ) ).mul( f ) ).mul( f ).mul( 0.5 ) ).toVar();
+		const tangent = a.add( b.mul( f.mul( 2 ) ) ).add( c.mul( f.mul( f ).mul( 3 ) ) ).toVar(); // 2 × d position / d f
+		const t = float( k ).add( f ).div( float( S ) ).toVar();
+		const arc = mix( s1.w, s2.w, f );
+		// second difference at sample k: 8 × the gap between a chord and the smooth curve (used where sub = 1)
+		const bend = d0.add( d2 );
+		const first = i.equal( uint( 0 ) ), last = i.greaterThanEqual( S.mul( sub ) );
 
 		const total = at( S ).w; // arc length of the whole curve
 
@@ -1349,14 +1418,17 @@ export class EdgeRenderer {
 		const hl = clamp( max( max( stS.x, stT.x ), attr.y.mul( u.hlFade ) ), 0, 1 ).toVar();
 		const hov = max( stS.w, stT.w ).toVar();
 
-		// colour: OKLab gradient (cube-root LMS blend) or the source colour
-		const cS = buffers.nodeColor.element( edge.x ).xyz.toVar();
-		const cT = buffers.nodeColor.element( edge.y ).xyz.toVar();
-		const grad = lmsRootToLinear( mix( lmsRoot( cS ), lmsRoot( cT ), t ) );
+		// colour: OKLab gradient with restored chroma, or the source colour
+		const nS = buffers.nodeColor.element( edge.x ).toVar();
+		const nT = buffers.nodeColor.element( edge.y ).toVar();
+		const cS = nS.xyz;
+		const grad = gradientColor( cS, nT.xyz, t, u.chroma );
 		const color = mix( grad, cS, u.sourceColor ).toVar();
+		// world radii of the two end nodes as the node renderer draws them (selected ones are larger)
+		const radii = vec2( nS.w.mul( stS.x.mul( 0.5 ).add( 1 ) ), nT.w.mul( stT.x.mul( 0.5 ).add( 1 ) ) ).mul( u.nodeRadius );
 
 		const widthFactor = attr.x.mul( mix( u.metricWidth.x, u.metricWidth.y, attr.z ) ).toVar();
-		return { i, S, t, position, tangent, bend, arc, total, edge, attr, hl, hov, color, widthFactor };
+		return { i, S, t, position, tangent, bend, arc, total, edge, attr, hl, hov, color, widthFactor, first, last, radii };
 
 	}
 
@@ -1387,7 +1459,7 @@ export class EdgeRenderer {
 		material.vertexNode = Fn( () => {
 
 			const side = positionGeometry.y;
-			const v = this._edgeVertex( instanceIndex );
+			const v = this._edgeVertex( instanceIndex, u.strandSub );
 			const { position, tangent, hl, hov } = v;
 
 			// opacity and brightness (focus fades the context, highlight / hover boost, metric)
@@ -1397,7 +1469,8 @@ export class EdgeRenderer {
 			const a0 = u.opacity.mul( ctx ).mul( mix( u.metricOpacity.x, u.metricOpacity.y, v.attr.z ) );
 			const a1 = mix( a0, max( a0, u.highlightOpacity ), hl );
 			const alpha = min( a1.mul( hov.mul( u.hoverBoost ).add( 1 ) ), 1 ).toVar();
-			const bright = u.brightness.mul( hl.mul( u.highlightGlow ).add( hov.mul( u.hoverBoost ).mul( 0.5 ) ).add( 1 ) );
+			// (the glow of a selection's bundle is shared out between its edges, see uniforms.crowd)
+			const bright = u.brightness.mul( hl.mul( u.highlightGlow ).mul( u.crowd ).add( hov.mul( u.hoverBoost ).mul( 0.5 ) ).add( 1 ) );
 
 			// projection and screen-space expansion (the buffers are world space; the mesh transform
 			// is ignored, which also saves a per-vertex mat4 × mat4)
@@ -1413,15 +1486,17 @@ export class EdgeRenderer {
 			const projected = u.halfWidth.mul( v.widthFactor ).mul( projScale ).div( max( clip.w, 1e-5 ) );
 			const px = G.pxScale;
 			const widthBoost = hl.mul( 0.5 ).add( hov.mul( 0.25 ) ).add( 1 );
-			const half0 = clamp( projected, u.minPx.mul( px ).mul( 0.5 ), u.maxPx.mul( px ).mul( 0.5 ) ).mul( widthBoost ).toVar();
+			// emphasis widens a strand, but only a quarter past the limit: near the camera strands stay lines
+			const maxHalf = u.maxPx.mul( px ).mul( 0.5 );
+			const half0 = min( clamp( projected, u.minPx.mul( px ).mul( 0.5 ), maxHalf ).mul( widthBoost ), maxHalf.mul( max( hl, hov ).mul( 0.25 ).add( 1 ) ) ).toVar();
 			const coverage = clamp( half0.mul( 2 ), 0, 1 );
 			const halfSharp = max( half0, 0.5 ).toVar();
-			const first = v.i.equal( uint( 0 ) ), last = v.i.equal( v.S );
+			const { first, last } = v;
 
 			// hand-over: where the edge is drawn as a tube (highlight, style 'solid') the strand fades;
-			// a highlighted strand keeps a soft sheath around its tube. The tube is a smooth curve
-			// through the samples; where the strand's chords leave it by about a tube radius (coarse
-			// sampling, tight bends, close-ups) the sheath would show as a second line: it goes there
+			// a highlighted strand keeps a soft sheath around its tube. Both follow the same spline;
+			// only a strand that cannot be subdivided (sheathFit) is a chain of chords, and where those
+			// leave the tube by about a tube radius the sheath would show as a second line: it goes there
 			const tubeHalf = max( projected.mul( u.tubeRadius ), u.tubeMinPixelWidth.mul( px ).mul( 0.5 ) );
 			const gap = select( first.or( last ), float( 0 ), length( v.bend ).mul( 0.125 ) ).mul( projScale ).div( max( clip.w, 1e-5 ) );
 			const sheath = u.sheath.mul( smoothstep( 0.4, 1.2, gap.div( tubeHalf ) ).mul( u.sheathFit ).oneMinus() );
@@ -1559,7 +1634,14 @@ export class EdgeRenderer {
 			const px = G.pxScale;
 			const radius = u.halfWidth.mul( v.widthFactor ).mul( u.tubeRadius ).mul( hov.mul( 0.25 ).add( 1 ) );
 			const minHalf = select( isOrthographic(), float( 0 ), u.tubeMinPixelWidth.mul( px ).mul( 0.5 ) );
-			const half0 = clamp( radius.mul( ppu ), minHalf, max( u.maxPx.mul( px ).mul( 0.5 ), minHalf ) ).mul( grow ).toVar();
+			// ends: from three node radii out down to the node's surface the tube thins to tubeTaper of
+			// its radius, so the tubes of a hub arrive as fine lines instead of covering the node
+			const nearS = smoothstep( v.radii.x, v.radii.x.mul( 3 ), v.arc );
+			const nearT = smoothstep( v.radii.y, v.radii.y.mul( 3 ), v.total.sub( v.arc ) );
+			const ends = min( nearS, nearT ).toVar();
+			const taper = mix( u.tubeTaper, float( 1 ), ends );
+			const full = clamp( radius.mul( ppu ), minHalf, max( u.tubeMaxPixelWidth.mul( px ).mul( 0.5 ), minHalf ) ).toVar();
+			const half0 = full.mul( taper ).mul( grow ).toVar();
 			const halfPx = max( half0, 0.5 );
 			// an edge that is no tube (yet) collapses to nothing
 			const geomHalf = select( grow.greaterThan( 0.01 ), halfPx.add( 0.5 ), float( 0 ) );
@@ -1569,7 +1651,12 @@ export class EdgeRenderer {
 			// colours: context dimming (style 'solid' with a selection), emission by highlight
 			const focus = clamp( max( U.focus, u.hlFade.mul( u.setContext ) ), 0, 1 );
 			const dim = mix( float( 1 ), u.contextDim, focus.mul( hl.oneMinus() ) );
-			const glow = mix( u.solidGlow, u.tubeGlow, hl ).mul( hov.mul( u.hoverBoost ).add( 1 ) );
+			// emission: highlighted tubes share the glow of their bundle (crowd) and lose most of it at
+			// their ends; a 'solid' tube glows more the thinner it is on screen, so an overview keeps the
+			// luminous look and a close-up shows lit surfaces
+			const thin = clamp( float( 1 ).sub( full.mul( 2 ).div( px ).div( 3 ) ), 0, 1 );
+			const glowHl = u.tubeGlow.mul( u.crowd ).mul( mix( u.tubeTaper.mul( 0.7 ).add( 0.3 ), float( 1 ), ends ) );
+			const glow = mix( mix( u.solidGlow, u.solidGlowThin, thin ), glowHl, hl ).mul( hov.mul( u.hoverBoost ).add( 1 ) );
 
 			vViewPos.assign( viewPos );
 			vTangent.assign( Tv );

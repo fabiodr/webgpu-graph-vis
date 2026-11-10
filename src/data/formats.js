@@ -11,8 +11,20 @@
 //   [strict] (di)graph … {     DOT
 //   graph [                    GML
 //   anything else              the format of the extension when that names one, else an edge list
-// (comment lines of the respective format are skipped before the test). A file that starts
-// with binary data is rejected with a message that says so.
+// (comment lines of the respective format are skipped before the test).
+//
+// What is not a graph is refused with a message that says why, instead of being read as an edge
+// list of whatever its bytes look like (a file dialog set to "All files" hands over anything):
+//   binary data      a NUL in the first 8 KB, or control characters in the first kilobyte
+//                    (two, or one among bytes that are not UTF-8: a picture cut short of its
+//                    first NUL)
+//   not UTF-8        UTF-16 that arrives undecoded (some browsers decode it by its byte order
+//                    mark) is named as such; any other text of which more than a third of the
+//                    first kilobyte does not decode (a file in a legacy 8-bit encoding with
+//                    some accented letters is still read, with U+FFFD in their place)
+//   a PDF            %PDF- would otherwise pass for comment lines
+//   no graph at all  content and extension name no format, and the edge list read from it has
+//                    no edge and fewer than two nodes
 //
 // API
 //   FORMATS                    [ { id, name, extensions: [ '.graphml', … ], description } ]
@@ -125,11 +137,58 @@ function skipComments( head, style ) {
 
 }
 
+/** "Supported: GraphML, …." for the messages that turn a file away. */
+function supported() {
+
+	return `Supported: ${FORMATS.map( ( f ) => f.name ).join( ', ' )}.`;
+
+}
+
+/**
+ * Whether the head of a decoded file is something other than UTF-8 text:
+ *   'binary'    a NUL anywhere in it, or, in its first kilobyte, two control characters, or one
+ *               when control characters and undecodable bytes (U+FFFD after UTF-8 decoding)
+ *               together make up more than a tenth of it
+ *   'encoding'  more than a third of the first kilobyte is undecodable: text in another
+ *               encoding (or binary data that happens to hold no control character)
+ *   null        text. A file in a legacy 8-bit encoding has one U+FFFD per accented letter and
+ *               passes; tab, line feed, vertical tab, form feed, carriage return and escape
+ *               are not counted as control characters.
+ */
+function notText( head ) {
+
+	if ( head.indexOf( '\u0000' ) >= 0 ) return 'binary';
+	const n = Math.min( head.length, 1024 );
+	let control = 0, undecodable = 0;
+	for ( let i = 0; i < n; i ++ ) {
+
+		const c = head.charCodeAt( i );
+		if ( c === 0xfffd ) undecodable ++;
+		else if ( ( c < 32 && ( c < 9 || c > 13 ) && c !== 27 ) || c === 127 ) control ++;
+
+	}
+
+	if ( control > 1 || ( control === 1 && ( control + undecodable ) * 10 > n ) ) return 'binary';
+	return undecodable * 3 > n ? 'encoding' : null;
+
+}
+
 export function detectFormat( text, name = '' ) {
 
 	const start = text.charCodeAt( 0 ) === 0xfeff ? 1 : 0;
 	const head = text.slice( start, start + 8192 );
-	if ( head.indexOf( '\u0000' ) >= 0 ) throw new GraphError( `${cleanName( name ) || 'This file'} is not a text file (it contains binary data). Supported: ${FORMATS.map( ( f ) => f.name ).join( ', ' )}.`, 'format' );
+	const odd = notText( head );
+	if ( odd ) {
+
+		const file = cleanName( name ) || 'This file';
+		// UTF-16 read as UTF-8: a byte order mark became two U+FFFD, every other byte is a NUL
+		if ( /^(?:\ufffd\ufffd)?(?:(?:\u0000[\t\n\r\x20-\x7e]){4}|(?:[\t\n\r\x20-\x7e]\u0000){4})/.test( head ) ) throw new GraphError( `${file} is UTF-16 text, which is not read here: save it as UTF-8. ${supported()}`, 'format' );
+		if ( odd === 'encoding' ) throw new GraphError( `${file} is not UTF-8 text (it is in another encoding, or it is binary data). ${supported()}`, 'format' );
+		throw new GraphError( `${file} is not a text file (it contains binary data). ${supported()}`, 'format' );
+
+	}
+
+	if ( head.startsWith( '%PDF-' ) ) throw new GraphError( `${cleanName( name ) || 'This file'} is a PDF document, not a graph file. ${supported()}`, 'format' );
 	const ext = extensionOf( name );
 	const byExt = BY_EXTENSION.get( ext ) || null;
 	const first = /\S/.exec( head );
@@ -270,7 +329,7 @@ export function parseGraph( text, name = 'graph', context = {} ) {
 	if ( typeof text !== 'string' ) throw new GraphError( 'parseGraph: expected text', 'format' );
 	if ( text.charCodeAt( 0 ) === 0xfeff ) text = text.slice( 1 ); // a byte order mark (files and downloads lose it in the decoder)
 	const ctx = { ...context, name: context.name || baseName( name ) };
-	const { id } = detectFormat( text, name );
+	const { id, by } = detectFormat( text, name );
 	if ( id === 'json' ) {
 
 		const { graph, format } = parseJson( text, name, ctx );
@@ -279,6 +338,9 @@ export function parseGraph( text, name = 'graph', context = {} ) {
 	}
 
 	const graph = PARSERS[ id ]( text, ctx );
+	// neither the content nor the name said what this is, and read as an edge list it is a
+	// single word: some other kind of file, not a graph of one node
+	if ( by === 'default' && graph.nodeCount < 2 && graph.edges.length === 0 ) throw new GraphError( `${cleanName( name ) || 'This file'} does not look like a graph file: no edges were found in it. ${supported()}`, 'format' );
 	return { graph, format: graph.meta.format, id };
 
 }

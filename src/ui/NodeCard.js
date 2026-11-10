@@ -647,7 +647,9 @@ export class NodeCard {
 		} );
 		this._explain = h( 'p.wgx-card-explain' );
 		this._explainRow = h( 'div.wgx-card-block', { hidden: true }, this._explain );
-		this._scroll = h( 'div.wgx-card-scroll', null, this._explainRow, this._pathRow, this._metricRow, this._nbRow );
+		// the neighbours come before the metrics: in a short card (a small window, the drawer open above)
+		// walking on must not need a scroll
+		this._scroll = h( 'div.wgx-card-scroll', null, this._explainRow, this._pathRow, this._nbRow, this._metricRow );
 		this.el = h( 'div.wgx.wgx-card.wgv-glass.is-floating', { role: 'region', 'aria-label': 'Selected node', inert: true, hidden: true },
 			h( 'div.wgx-card-head', null, this._swatch,
 				h( 'div.wgx-card-titles', null, this._title,

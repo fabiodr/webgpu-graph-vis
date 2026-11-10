@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import * as GA from '../src/graph/analytics.js';
 import { planTour, argmax, betweennessShare } from '../src/explore/tourPlan.js';
-import { communityList, usefulLevel, labelOf, communityOf } from '../src/explore/communities.js';
+import { communityList, usefulLevel, labelOf, communityOf, communitySummary, communityCount } from '../src/explore/communities.js';
 import { parseGraphJson } from '../src/data/format.js';
 import { prepareGraph } from '../src/graph/prepare.js';
 
@@ -176,5 +176,28 @@ test( 'usefulLevel: prefers a level a person can read', () => {
 	for ( let l = level + 1; l < big.D; l ++ ) assert.ok( communityList( big, l ).length < 2 );
 	assert.equal( usefulLevel( { D: 0 } ), - 1 );
 	assert.equal( usefulLevel( null ), - 1 );
+
+} );
+
+test( 'communitySummary: one count for every surface, the main level of the data layer first', () => {
+
+	const g = load( 'imsv/lesmis' );
+	const s = communitySummary( g );
+	assert.equal( s.level, usefulLevel( g ) );
+	assert.equal( s.count, communityCount( g, s.level ) );
+	assert.equal( s.finest, communityCount( g, 0 ) );
+	assert.ok( s.count < g.stats.clusters, 'not the sum of all levels' );
+	// the data layer names the level that carries the communities, and their number without dust
+	if ( g.D > 1 ) {
+
+		const main = { ...g, clustering: { mainLevel: 0, communities: communityCount( g, 0 ) - 1 } };
+		assert.equal( usefulLevel( main ), 0 );
+		assert.deepEqual( communitySummary( main ), { level: 0, count: communityCount( g, 0 ) - 1, finest: communityCount( g, 0 ) } );
+
+	}
+
+	assert.equal( usefulLevel( { ...g, clustering: { mainLevel: 99 } } ), usefulLevel( g ), 'a level the graph does not have is ignored' );
+	assert.deepEqual( communitySummary( null ), { level: - 1, count: 0, finest: 0 } );
+	assert.deepEqual( communitySummary( { stats: { clusters: 5 } } ), { level: - 1, count: 5, finest: 5 } );
 
 } );

@@ -6,7 +6,8 @@
 // (running with its progress, settled, paused, computing) and the size of the graph. Texts are
 // refreshed four times a second and only when they changed; nothing is read back from the DOM.
 // Tool buttons (slots.topRight): small glass buttons, arranged with CSS `order` (the explore layer
-// uses 0…9, the shell 10 and up).
+// uses 0…9, the shell 10 and up) and inserted into the DOM in that order, so the Tab order is
+// the order on screen.
 //
 // API
 //   const hud = app.use( new Hud( { slots, layout, visible = true } ) )
@@ -60,7 +61,8 @@ export function layoutState( layout ) {
 
 }
 
-const LAYOUT_LABEL = { running: 'Layout running', settled: 'Layout settled', paused: 'Layout paused', computing: 'Computing layout', moving: 'Layout moving' };
+// one word for a layout in motion: 'moving' (a blend to fixed targets) reads "running" too, without the progress bar
+const LAYOUT_LABEL = { running: 'Layout running', settled: 'Layout settled', paused: 'Layout paused', computing: 'Computing layout', moving: 'Layout running' };
 
 export class Hud {
 
@@ -133,7 +135,9 @@ export class Hud {
 		} );
 		this._tools.get( id )?.el.remove();
 		this._tools.set( id, { el: b, shortcut } );
-		this.slots.topRight.append( b );
+		// in the DOM in the order shown, so the Tab order follows the screen
+		const after = Array.from( this.slots.topRight.children ).find( ( el ) => ( parseFloat( el.style.order ) || 0 ) > order );
+		this.slots.topRight.insertBefore( b, after || null );
 		return b;
 
 	}

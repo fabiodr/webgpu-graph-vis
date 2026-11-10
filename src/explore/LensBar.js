@@ -11,7 +11,7 @@
 //    for categories; the size range; the number of glowing nodes and the value they start at;
 //    how many nodes have no value of a file attribute (drawn grey, or smallest). The community
 //    palette counts the communities at the level the insights drawer and the tour use
-//    ( usefulLevel ), with the finest level as a second number when that is another.
+//    ( communitySummary ), with the finest level as a second number when that is another.
 //    While a slow metric refines, a quiet bar shows pivots done / total and the numbers carry an
 //    "estimate" mark until they are exact.
 //  · The edge channel asks the lens for a per-edge channel ( lens.edgeChannel ), hands every
@@ -32,7 +32,7 @@ import { h, xicon, iconEl, cssOfLinear, isPhone } from './ui.js';
 import { formatMetric, formatCount, formatPercent, formatNumber } from './format.js';
 import { LENS_PRESETS, applyPreset, matchPreset, applyChannels } from './presets.js';
 import { openPopover, closePopover } from './popover.js';
-import { usefulLevel, communityCount } from './communities.js';
+import { communitySummary } from './communities.js';
 import { paletteCss } from '../ui/Panel.js';
 
 const CHANNELS = [
@@ -44,7 +44,9 @@ const CHANNELS = [
 const GROUPS = { degree: 'Structure', core: 'Structure', clustering: 'Structure', triangles: 'Structure', component: 'Structure' };
 const groupOf = ( m ) => ( m.attribute !== undefined ? 'Attributes of the file' : GROUPS[ m.id ] || 'Centrality' );
 const GROUP_ORDER = [ 'Centrality', 'Structure', 'Attributes of the file' ];
-const SCALE_NOTE = { linear: 'linear scale', log: 'logarithmic scale', rank: 'by rank: equal steps hold equal numbers of nodes', robust: 'linear between the 2nd and 98th percentile' };
+const SCALE_NOTE = { linear: 'linear scale', log: 'logarithmic scale', rank: 'by rank: equal steps hold equal numbers of nodes', robust: 'linear between the 2nd and 98th percentile; the few values beyond take the end of the scale' };
+/** The word shown for a scale ( lens legends call the percentile scale 'robust' ). */
+const scaleWord = ( scale ) => ( scale === 'robust' ? 'outliers clipped' : scale );
 const TOPS = [ 0.01, 0.05, 0.1 ];
 
 export class LensBar {
@@ -354,9 +356,9 @@ export class LensBar {
 			// the community palette: one strip across the leaf order, as the nodes are coloured
 			const stops = [];
 			for ( let k = 0; k <= 12; k ++ ) stops.push( paletteCss( s.palette, k / 12 ) );
-			// the same count as the drawer and the tour (the coarsest useful level); the finest level
-			// of the hierarchy is a second number, never the same word for another one
-			const main = communityCount( g, usefulLevel( g ) ), finest = communityCount( g, 0 );
+			// the same count as the panel, the drawer and the tour ( communitySummary ); the finest
+			// level of the hierarchy is a second number, never the same word for another one
+			const { count: main, finest } = communitySummary( g );
 			const text = main > 0 ? `${formatCount( main )} communities${finest > main ? ` (${formatCount( finest )} at the finest level)` : ''}; similar colours belong together`
 				: finest > 0 ? 'A single community' : 'One colour: this graph has no communities';
 			box.append( h( 'div.wgx-legend-bar', { style: { background: `linear-gradient(90deg, ${stops.join( ', ' )})` } } ),
@@ -397,7 +399,7 @@ export class LensBar {
 		const ticks = h( 'div.wgx-legend-ticks' );
 		for ( const t of L.ticks ) ticks.append( h( 'span', { 'data-at': t.t === 0 ? 'start' : t.t === 1 ? 'end' : 'mid' }, this._tick( L.metric, t, estimate ) ) );
 		box.append( h( 'div.wgx-legend-bar', { style: { background: L.css }, title: `${L.label}: ${SCALE_NOTE[ L.scale ] || L.scale}` } ), ticks );
-		box.append( h( 'span.wgx-legend-scale', { title: SCALE_NOTE[ L.scale ] || '' }, L.scale === 'robust' ? 'clipped' : L.scale ) );
+		box.append( h( 'span.wgx-legend-scale', { title: SCALE_NOTE[ L.scale ] || '' }, scaleWord( L.scale ) ) );
 		return box;
 
 	}
@@ -431,7 +433,7 @@ export class LensBar {
 				note.append( ` · ${formatCount( L.missing )} with no value: smallest` );
 				note.title = `Size: ${SCALE_NOTE[ L.scale ] || L.scale}; ${formatCount( L.missing )} ${L.missing === 1 ? 'node has' : 'nodes have'} no value of ${L.label} and ${L.missing === 1 ? 'is' : 'are'} drawn at the smallest size`;
 
-			} else note.append( ` ${L.scale === 'robust' ? 'clipped' : L.scale}` );
+			} else note.append( ` ${scaleWord( L.scale )}` );
 
 		}
 
@@ -584,8 +586,9 @@ export class LensBar {
 		}
 
 		// what else the channel can be told
-		if ( channel.id === 'color' ) {
+		if ( channel.id === 'color' && s.color ) {
 
+			// the ramp belongs to a metric: the community palette has none (it is a setting of the panel)
 			const ramps = h( 'div.wgx-menu-ramps', { role: 'group', 'aria-label': 'Colour ramp' } );
 			const active = this._ramp || s.ramp;
 			for ( const r of lens.ramps ) {
@@ -603,7 +606,6 @@ export class LensBar {
 			}
 
 			const rev = h( 'button.wgx-toggle', { type: 'button', 'aria-pressed': String( !! s.reverse ) }, iconEl( 'swap', 14 ), 'Reverse' );
-			rev.disabled = ! s.color;
 			rev.addEventListener( 'click', () => {
 
 				lens.setColor( lens.state.color, { reverse: ! lens.state.reverse } );

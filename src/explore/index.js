@@ -19,6 +19,11 @@
 //   path strip         slots.bottom      PathStrip.js
 //   tour caption       slots.bottom      Tour.js
 //
+// A new path whose nodes are not all inside the free part of the view is framed by the camera
+// ( rig.flyTo over the path's bounding sphere ); a path that is in view, and one that comes back
+// with explore.restore(), leave the camera alone. While photo mode hides the surfaces
+// ( <html class="wgv-ui-hidden"> ) the search and open menus close and the layer's keys rest.
+//
 // The highlight (selection, neighbourhood, path, community focus, search preview) is one model
 // owned by the Interaction module ( src/interact/Interaction.js, highlight.js ); this layer only
 // asks it for things.
@@ -66,6 +71,11 @@ import { Tour } from './Tour.js';
 import { LENS_PRESETS } from './presets.js';
 import { normalizeState, STATE_VERSION } from './state.js';
 import { isPhone } from './ui.js';
+import { closePopover } from './popover.js';
+import { Vector3 } from 'three/webgpu';
+
+const _p = new Vector3();
+const _c = new Vector3();
 
 export function installExplore( ctx ) {
 
@@ -131,10 +141,82 @@ export function installExplore( ctx ) {
 
 	}
 
+	// photo mode ( <html class="wgv-ui-hidden"> ) hides every surface of this layer: the search and
+	// an open menu close, and the layer's own keys rest until it is over
+	const uiHidden = () => document.documentElement.classList.contains( 'wgv-ui-hidden' );
+	on( 'photo', ( e ) => {
+
+		if ( ! e.detail || ! e.detail.active ) return;
+		closePopover( { focus: false } );
+		if ( search.isOpen ) search.close();
+		compare( false );
+
+	} );
+
+	// ── a path is shown where it can be seen ──────────────────────────────────────────────
+	// The target of a path is often picked through the search, so it may lie off screen or under
+	// the right column. When any node of a new path is outside the free part of the view, the
+	// camera frames the whole path; a path that is in view already leaves the camera alone.
+	let restoring = false, frameTimer = 0;
+	function freeRect() {
+
+		const own = insets(), p = panel && typeof panel.insets === 'function' ? panel.insets() || {} : {};
+		const side = ( k ) => Math.max( + p[ k ] || 0, own[ k ] || 0 );
+		return { left: side( 'left' ), right: window.innerWidth - side( 'right' ), top: side( 'top' ), bottom: window.innerHeight - side( 'bottom' ) };
+
+	}
+
+	function framePath( nodes ) {
+
+		const g = app.graph, pos = app.positions, cam = app.camera;
+		if ( ! g || ! pos || ! cam || ! nodes || ! nodes.length || rig.immersive || tour.running || uiHidden() ) return false;
+		const r = freeRect(), W = window.innerWidth, H = window.innerHeight, margin = 28;
+		let outside = false;
+		_c.set( 0, 0, 0 );
+		for ( let k = 0; k < nodes.length; k ++ ) {
+
+			const i = 4 * nodes[ k ];
+			_p.set( pos[ i ], pos[ i + 1 ], pos[ i + 2 ] );
+			_c.add( _p );
+			_p.project( cam ); // the projection carries the view offset of the rig's insets
+			const x = ( _p.x * 0.5 + 0.5 ) * W, y = ( 0.5 - _p.y * 0.5 ) * H;
+			if ( ! ( _p.z > - 1 && _p.z < 1 ) || x < r.left + margin || x > r.right - margin || y < r.top + margin || y > r.bottom - margin ) outside = true;
+
+		}
+
+		if ( ! outside ) return false;
+		_c.multiplyScalar( 1 / nodes.length );
+		let r2 = 0;
+		for ( let k = 0; k < nodes.length; k ++ ) {
+
+			const i = 4 * nodes[ k ];
+			r2 = Math.max( r2, ( pos[ i ] - _c.x ) ** 2 + ( pos[ i + 1 ] - _c.y ) ** 2 + ( pos[ i + 2 ] - _c.z ) ** 2 );
+
+		}
+
+		const radius = Math.max( Math.sqrt( r2 ) * 1.3, ( g.layoutRadius || 1 ) * 0.1 );
+		const half = cam.fov ? Math.atan( Math.tan( cam.fov * Math.PI / 360 ) * Math.min( 1, cam.aspect || 1 ) ) : 0.35;
+		rig.flyTo( _c, rig.fitDistance ? rig.fitDistance( radius ) : radius / Math.sin( half ) );
+		return true;
+
+	}
+
+	on( 'path', ( e ) => {
+
+		clearTimeout( frameTimer );
+		const nodes = e.detail && e.detail.nodes;
+		// a moment later: the strip has appeared (and, on a phone, the card has folded), so the free
+		// part of the view is the one the path will be seen in. A restored view keeps its camera.
+		if ( nodes && nodes.length && ! restoring ) frameTimer = setTimeout( () => framePath( nodes ), 460 );
+
+	} );
+	on( 'graph', () => clearTimeout( frameTimer ) );
+	disposers.push( () => clearTimeout( frameTimer ) );
+
 	const typing = ( t ) => !! ( t && t.closest && t.closest( 'input, textarea, select, [contenteditable=""], [contenteditable="true"]' ) );
 	const onKeyDown = ( e ) => {
 
-		if ( e.repeat || e.ctrlKey || e.metaKey || e.altKey || typing( e.target ) ) return;
+		if ( e.repeat || e.ctrlKey || e.metaKey || e.altKey || typing( e.target ) || uiHidden() ) return;
 		if ( e.key === 'c' || e.key === 'C' ) compare( true );
 
 	};
@@ -198,6 +280,7 @@ export function installExplore( ctx ) {
 	commands.register( { id: 'explore.ripple', title: 'Send a ripple from the selection', group: 'Selection', icon: 'ripple', keywords: 'wave spread distance', enabled: hasSelection, run: () => tools.ripple( interaction.selectedIndex ) } );
 	commands.register( { id: 'explore.radial', title: 'Radial layout from the selection', group: 'Selection', icon: 'radial', keywords: 'rings shells distance tree', enabled: () => hasSelection() && !! layout?.setLayoutMode, run: () => {
 
+		// the shell hears the 'layout' event and writes the mode into its settings (panel, share link)
 		layout.setLayoutMode( 'radial', { root: interaction.selectedIndex } );
 		rig.keepFramed?.( 4 );
 
@@ -304,11 +387,20 @@ export function installExplore( ctx ) {
 		insights.toggle( s.insights );
 		if ( g ) {
 
-			interaction.clearAll();
-			if ( s.cluster !== null ) interaction.focusCluster( s.cluster );
-			if ( s.selection !== null ) interaction.select( s.selection );
-			if ( s.hops > 0 ) interaction.showNeighborhood( s.hops );
-			if ( s.path ) interaction.showPath( s.path.from, s.path.to, { all: s.path.all } );
+			restoring = true; // the view that is restored has its own camera: a path does not reframe it
+			try {
+
+				interaction.clearAll();
+				if ( s.cluster !== null ) interaction.focusCluster( s.cluster );
+				if ( s.selection !== null ) interaction.select( s.selection );
+				if ( s.hops > 0 ) interaction.showNeighborhood( s.hops );
+				if ( s.path ) interaction.showPath( s.path.from, s.path.to, { all: s.path.all } );
+
+			} finally {
+
+				restoring = false;
+
+			}
 
 		}
 

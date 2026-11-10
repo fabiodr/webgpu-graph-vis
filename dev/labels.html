@@ -15,7 +15,7 @@ html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui
 <div id="app"></div><canvas id="atlas"></canvas><div id="hud"></div>
 <script type="module">
 // Dev page for src/render/TextLabels.js (GPU SDF labels) on the real modules: ForceLayout,
-// EdgeRenderer, NodeRenderer, Background, PostFX, Interaction, CameraRig.
+// EdgeRenderer, NodeRenderer, Environment, Interaction, CameraRig.
 //
 // Query:
 //   ds=imsv/lesmis            any id of public/data/manifest.json (files and generate specs)
@@ -48,8 +48,7 @@ import { DataClient } from '../src/data/client.js';
 import { ForceLayout } from '../src/gpu/ForceLayout.js';
 import { NodeRenderer } from '../src/render/NodeRenderer.js';
 import { EdgeRenderer } from '../src/render/EdgeRenderer.js';
-import { Background } from '../src/render/Background.js';
-import { PostFX } from '../src/render/PostFX.js';
+import { Environment } from '../src/render/gfx/Environment.js';
 import { Labels } from '../src/render/Labels.js';
 import { TextLabels } from '../src/render/TextLabels.js';
 import { CameraRig } from '../src/interact/CameraRig.js';
@@ -75,9 +74,9 @@ try {
 	const layout = app.use( new ForceLayout() );
 	const edges = app.use( new EdgeRenderer() );
 	const nodes = app.use( new NodeRenderer( { size: + P( 'size', 1 ) } ) );
-	app.use( new Background() );
-	// post=0 and quality=… are read by the App (parseGfxParams); the adapter only forwards the bloom strength
-	const post = app.use( new PostFX( { bloom: + P( 'bloom', 0.8 ) } ) );
+	app.use( new Environment() );
+	// post=0 and quality=… are read by the App (parseGfxParams); the bloom strength goes to the render graph
+	app.gfx.set( 'bloom', + P( 'bloom', 0.8 ) );
 	const interaction = new Interaction( { layout, rig } );
 	interaction.picking.setRadiusFunction( ( i ) => nodes.worldRadius( i ) );
 	app.use( interaction );
@@ -156,7 +155,7 @@ try {
 
 	}
 
-	Object.assign( window, { __labels: labels, __layout: layout, __nodes: nodes, __edges: edges, __post: post, __rig: rig, __interaction: interaction } );
+	Object.assign( window, { __labels: labels, __layout: layout, __nodes: nodes, __edges: edges, __gfx: app.gfx, __rig: rig, __interaction: interaction } );
 
 	// dataset
 	const ds = P( 'ds', 'imsv/lesmis' );

@@ -559,7 +559,9 @@ button.wgx-crumb:hover { background: var(--wgx-raise-2); color: var(--wgv-text, 
 	.wgx-card-x { margin: -8px -8px 0 0; }
 	.wgx-seg button { min-width: 44px; }
 	/* the card as a sheet: neighbours first (walking is the touch gesture), the actions in two rows */
-	.wgx-card-scroll { display: flex; flex-direction: column; }
+	/* the sheet is short: what is cut at its lower edge fades out over a row's height, so a
+	   half-shown row reads as "more below", and the last row can be scrolled clear of the fade */
+	.wgx-card-scroll { display: flex; flex-direction: column; padding-bottom: 26px; -webkit-mask-image: linear-gradient(#000 calc(100% - 30px), transparent); mask-image: linear-gradient(#000 calc(100% - 30px), transparent); }
 	.wgx-card-scroll > * { flex: none; }
 	.wgx-card-scroll > .wgx-card-nb { order: -1; }
 	.wgx-lbl-long { display: none; }

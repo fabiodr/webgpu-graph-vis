@@ -13,7 +13,7 @@ html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui
 <body>
 <div id="app"></div><div id="hud"></div>
 <script type="module">
-// Dev page for the visual modules (NodeRenderer, Labels, PostFX, Background).
+// Dev page for the visual modules (NodeRenderer, Labels, Environment, the render graph).
 // The real ForceLayout / EdgeRenderer are built in parallel, so this page uses stand-ins:
 //  - StubLayout: static positions (a quick CPU spring layout for small graphs, the paper sphere
 //    layout with ?layout=sphere), GPU easing of nodeState toward nodeStateTarget, ForceLayout API
@@ -33,8 +33,7 @@ import { DebugNodes } from '../src/debug/DebugNodes.js';
 import { synthGraph } from '../src/debug/synth.js';
 import { NodeRenderer } from '../src/render/NodeRenderer.js';
 import { Labels } from '../src/render/Labels.js';
-import { PostFX } from '../src/render/PostFX.js';
-import { Background } from '../src/render/Background.js';
+import { Environment } from '../src/render/gfx/Environment.js';
 
 const params = new URLSearchParams( location.search );
 const P = ( k, d ) => ( params.has( k ) ? params.get( k ) : d );
@@ -297,12 +296,13 @@ try {
 
 	}
 
-	const bg = app.use( new Background() );
+	const bg = app.use( new Environment() );
 	const nodes = P( 'nodes', 'renderer' ) === 'debug' ? app.use( new DebugNodes() ) : app.use( new NodeRenderer( { size: + P( 'size', 1 ) } ) );
 	const labels = app.use( new Labels( { mode: P( 'labels', 'auto' ) } ) );
-	// post=0 and quality=… are read by the App itself (parseGfxParams); PostFX is the adapter over app.gfx
-	const post = app.use( new PostFX( { bloom: + P( 'bloom', 0.8 ), toneMapping: P( 'tone', 'neutral' ) } ) );
-	Object.assign( window, { __layout: layout, __bg: bg, __nodes: nodes, __labels: labels, __post: post } );
+	// post=0 and quality=… are read by the App itself (parseGfxParams); bloom and tone mapping go to the render graph
+	app.gfx.set( 'bloom', + P( 'bloom', 0.8 ) );
+	if ( P( 'tone', 'neutral' ) !== app.gfx.get( 'toneMapping' ) ) app.gfx.set( 'toneMapping', P( 'tone', 'neutral' ) );
+	Object.assign( window, { __layout: layout, __bg: bg, __nodes: nodes, __labels: labels, __gfx: app.gfx } );
 
 	const ds = P( 'ds', 'imsv/lesmis' );
 	const t0 = performance.now();

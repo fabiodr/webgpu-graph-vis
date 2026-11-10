@@ -20,10 +20,11 @@
 //  barChart( bins, { width = 304, height = 104, name, unit = 'nodes', total, describe, idle } )
 //      -> HTMLElement (a <figure>): the SVG, a readout line under it and a visually hidden table.
 //      One series, one colour: columns at most 24 px wide with a 2 px gap, round at the data end
-//      and square on the baseline, hairline grid, labels in text colours. Every bar is a focusable
-//      hit target as tall as the plot; hovering, focusing or tapping it writes its range, count
-//      and share into the readout ( describe( bin ) -> "degree 3–4" names the range ), which shows
-//      `idle` otherwise. The largest bar carries its value.
+//      and square on the baseline, hairline grid, labels in text colours. Every bar is a hit
+//      target as tall as the plot; hovering, focusing or tapping it writes its range, count and
+//      share into the readout ( describe( bin ) -> "degree 3–4" names the range ), which shows
+//      `idle` otherwise. The chart is ONE tab stop (roving tabindex): ← / → / Home / End move
+//      between its bars. The largest bar carries its value.
 
 import { formatRange, formatCount, compactCount, formatPercent } from './format.js';
 
@@ -187,7 +188,7 @@ export function barChart( bins, options = {} ) {
 	bins.forEach( ( b, k ) => {
 
 		const x0 = left + k * slot, bx = x0 + ( slot - barW ) / 2;
-		const g = svg( 'g', { class: 'wgx-chart-bar', tabindex: '0', role: 'listitem', 'aria-label': `${describe( b )}: ${formatCount( b.count )} ${unit}` } );
+		const g = svg( 'g', { class: 'wgx-chart-bar', tabindex: k === Math.max( 0, peak ) ? '0' : '-1', role: 'listitem', 'aria-label': `${describe( b )}: ${formatCount( b.count )} ${unit}` } );
 		const h = b.count > 0 ? Math.max( 1.5, plotH * b.count / top ) : 0;
 		if ( h > 0 ) g.append( svg( 'path', { class: 'wgx-chart-col', d: columnPath( bx, padTop + plotH - h, barW, h, 4 ) } ) );
 		g.append( svg( 'rect', { class: 'wgx-chart-hit', x: x0, y: 0, width: slot, height: height - bottom + 2 } ) );
@@ -198,6 +199,17 @@ export function barChart( bins, options = {} ) {
 		g.addEventListener( 'focus', () => show( k ) );
 		g.addEventListener( 'blur', () => show( - 1 ) );
 		g.addEventListener( 'click', () => show( k ) );
+		g.addEventListener( 'keydown', ( e ) => {
+
+			const to = e.key === 'ArrowRight' || e.key === 'ArrowUp' ? k + 1 : e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? k - 1 : e.key === 'Home' ? 0 : e.key === 'End' ? marks.length - 1 : - 1;
+			if ( to < 0 || to >= marks.length || to === k || e.ctrlKey || e.metaKey || e.altKey ) return;
+			e.preventDefault();
+			e.stopPropagation(); // the arrows belong to the chart here, not to the camera
+			g.setAttribute( 'tabindex', '-1' );
+			marks[ to ].setAttribute( 'tabindex', '0' );
+			marks[ to ].focus( { preventScroll: true } );
+
+		} );
 		marks.push( g );
 		root.append( g );
 

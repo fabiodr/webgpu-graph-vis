@@ -3,10 +3,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
 	TIERS, TIER_ORDER, MSAA_MAX_EDGES, resolveQuality, structureKey, autoTier, pixelCapScale, isSoftwareAdapter,
-	normalizeSetting, parseGfxParams, Governor,
+	normalizeSetting, parseGfxParams, Governor, gpuClass, autoCeiling,
 } from '../src/app/Quality.js';
 
-const DESKTOP = { coarsePointer: false, smallScreen: false, softwareAdapter: false, edges: 254, dpr: 1, cssWidth: 1280, cssHeight: 800 };
+const DESKTOP = { coarsePointer: false, smallScreen: false, softwareAdapter: false, gpuClass: 'discrete', edges: 254, dpr: 1, cssWidth: 1280, cssHeight: 800 };
 const PHONE = { coarsePointer: true, smallScreen: true, softwareAdapter: false, edges: 254, dpr: 2, cssWidth: 412, cssHeight: 915 };
 
 test( 'tier table: the brief', () => {
@@ -51,6 +51,39 @@ test( 'autoTier and software adapters', () => {
 	assert.equal( autoTier( { ...DESKTOP, coarsePointer: true } ), 'medium' ); // tablet
 	assert.equal( autoTier( { ...DESKTOP, smallScreen: true } ), 'medium' ); // small window
 	assert.equal( autoTier( { ...DESKTOP, softwareAdapter: true } ), 'low' );
+	// the adapter decides before the first frame: only known discrete GPUs and Apple silicon start at high
+	assert.equal( autoTier( { ...DESKTOP, gpuClass: 'apple' } ), 'high' );
+	for ( const gpu of [ 'integrated', 'mobile', 'unknown', undefined ] ) assert.equal( autoTier( { ...DESKTOP, gpuClass: gpu } ), 'medium', String( gpu ) );
+	assert.equal( autoTier( { ...DESKTOP, gpuClass: 'software' } ), 'low' );
+	assert.equal( autoTier( { ...DESKTOP, compat: true } ), 'low' );
+	// … and the governor may lift a desktop to high, never to ultra, and nothing else above its start
+	assert.equal( autoCeiling( { ...DESKTOP, gpuClass: 'integrated' } ), 'high' );
+	assert.equal( autoCeiling( { ...DESKTOP, gpuClass: 'unknown' } ), 'high' );
+	assert.equal( autoCeiling( DESKTOP ), 'high' );
+	assert.equal( autoCeiling( PHONE ), 'low' );
+	assert.equal( autoCeiling( { ...DESKTOP, coarsePointer: true } ), 'medium' );
+	assert.equal( autoCeiling( { ...DESKTOP, softwareAdapter: true } ), 'low' );
+	assert.equal( autoCeiling( { ...DESKTOP, compat: true } ), 'low' );
+	// GPUAdapterInfo → class
+	assert.equal( gpuClass( { vendor: 'nvidia', architecture: 'lovelace' } ), 'discrete' );
+	assert.equal( gpuClass( { vendor: 'apple', architecture: 'metal-3' } ), 'apple' );
+	assert.equal( gpuClass( { vendor: 'intel', architecture: 'gen-12lp' } ), 'integrated' );
+	assert.equal( gpuClass( { vendor: 'intel', architecture: 'xe-lpg' } ), 'integrated' );
+	assert.equal( gpuClass( { vendor: 'intel', architecture: 'xe-hpg' } ), 'discrete' );
+	assert.equal( gpuClass( { vendor: 'intel', description: 'Intel(R) Arc(TM) A770 Graphics' } ), 'discrete' );
+	assert.equal( gpuClass( { vendor: 'amd', architecture: 'rdna-3' } ), 'discrete' );
+	assert.equal( gpuClass( { vendor: 'amd', architecture: 'gcn-5' } ), 'integrated' );
+	assert.equal( gpuClass( { vendor: 'amd', architecture: 'rdna-2', description: 'AMD Radeon(TM) Graphics' } ), 'integrated' );
+	assert.equal( gpuClass( { vendor: 'amd', description: 'AMD Radeon 680M' } ), 'integrated' );
+	assert.equal( gpuClass( { vendor: 'qualcomm', architecture: 'adreno-7xx' } ), 'mobile' );
+	assert.equal( gpuClass( { vendor: 'arm', architecture: 'valhall' } ), 'mobile' );
+	assert.equal( gpuClass( { vendor: 'img-tec' } ), 'mobile' );
+	assert.equal( gpuClass( { vendor: 'acme' } ), 'unknown' );
+	assert.equal( gpuClass( { vendor: 'imagination technologies' } ), 'mobile' );
+	assert.equal( gpuClass( { vendor: 'google', architecture: 'swiftshader' } ), 'software' );
+	assert.equal( gpuClass( { vendor: '', architecture: '' } ), 'unknown' );
+	assert.equal( gpuClass( {} ), 'unknown' );
+	assert.equal( gpuClass( null ), 'unknown' );
 	assert.equal( isSoftwareAdapter( { vendor: 'google', architecture: 'swiftshader' } ), true );
 	assert.equal( isSoftwareAdapter( { vendor: 'mesa', description: 'llvmpipe (LLVM 15)' } ), true );
 	assert.equal( isSoftwareAdapter( { vendor: 'nvidia', architecture: 'lovelace', isFallbackAdapter: false } ), false );
@@ -72,6 +105,20 @@ test( 'resolveQuality: auto, explicit tiers and the per-graph rules', () => {
 	// an explicit tier is taken as it is, whatever the device
 	const u = resolveQuality( 'ultra', { ...PHONE, softwareAdapter: true } );
 	assert.deepEqual( [ u.tier, u.explicit, u.aa, u.velocity, u.dof, u.sharpen ], [ 'ultra', true, 'traa', true, true, true ] );
+	// an integrated or masked GPU starts 'auto' at medium
+	assert.equal( resolveQuality( 'auto', { ...DESKTOP, gpuClass: 'integrated' } ).tier, 'medium' );
+	assert.equal( resolveQuality( 'auto', { ...DESKTOP, gpuClass: undefined } ).tier, 'medium' );
+	// compatibility mode: 'low' is the only valid chain, whatever is asked for or forced
+	for ( const setting of [ 'auto', 'medium', 'high', 'ultra' ] ) {
+
+		const c = resolveQuality( setting, { ...DESKTOP, compat: true }, { ao: true, traa: true, dof: true, shadows: true, debug: 'ao', tier: 'high' } );
+		assert.deepEqual( [ c.tier, c.compat, c.samples, c.velocity, c.ao, c.dof, c.shadows, c.debug ], [ 'low', true, 1, false, false, false, false, null ], setting );
+		assert.ok( c.aa === 'fxaa' || c.aa === 'none' );
+		assert.equal( c.requested, setting === 'auto' ? 'high' : setting );
+
+	}
+
+	assert.deepEqual( [ a.compat, a.requested ], [ false, 'high' ] );
 	// the governor's tier only applies to 'auto'
 	assert.equal( resolveQuality( 'auto', DESKTOP, { tier: 'medium' } ).tier, 'medium' );
 	assert.equal( resolveQuality( 'ultra', DESKTOP, { tier: 'medium' } ).tier, 'ultra' );
@@ -189,8 +236,9 @@ test( 'structureKey: what needs a rebuild', () => {
  *   hz = 0   no grid: every frame takes exactly 1000 / fps (a loop locked to a divisor of the
  *            display rate, or a variable-rate display)
  *   gpuMsOf( state, fps ) → GPU time per frame (timestamp queries), or leave it out
+ *   infoOf( state, now ) → the fourth argument of sample(): { transient, renderMs }
  */
-function simulate( gov, state, fpsOf, seconds, { gpuMsOf = null, maxScaleOf = () => state.maxScale, hz = 60 } = {} ) {
+function simulate( gov, state, fpsOf, seconds, { gpuMsOf = null, infoOf = null, maxScaleOf = () => state.maxScale, hz = 60 } = {} ) {
 
 	const actions = [];
 	let now = state.now || 0;
@@ -212,7 +260,7 @@ function simulate( gov, state, fpsOf, seconds, { gpuMsOf = null, maxScaleOf = ()
 
 		} else now += ms;
 
-		const a = gov.sample( ms, now, gpuMsOf ? gpuMsOf( state, fps ) : null );
+		const a = gov.sample( ms, now, gpuMsOf ? gpuMsOf( state, fps ) : null, infoOf ? infoOf( state, now ) : null );
 		if ( ! a ) continue;
 		actions.push( { t: now, ...a } );
 		if ( a.type === 'scale' ) state.scale = a.scale;
@@ -326,13 +374,13 @@ test( 'governor: no thrash between two scales', () => {
 
 } );
 
-test( 'governor: at the floor the tier steps down (auto only), and never comes back', () => {
+test( 'governor: at the floor the tier steps down (auto only); the way back is tried with doubling pauses', () => {
 
 	const gov = new Governor();
 	const state = fresh();
 	// even a quarter of the pixels is too slow in 'high'; 'medium' at full scale is fine
 	const device = fillBound( 9, { low: 0.1, medium: 0.12, high: 1, ultra: 2 } );
-	const actions = simulate( gov, state, device, 300 );
+	const actions = simulate( gov, state, device, 60 );
 	assert.deepEqual( tiers( actions ), [ 'medium' ] );
 	assert.equal( state.tier, 'medium' );
 	assert.equal( gov.downgraded, true );
@@ -341,9 +389,111 @@ test( 'governor: at the floor the tier steps down (auto only), and never comes b
 	const before = actions.slice( 0, actions.findIndex( ( a ) => a.type === 'tier' ) );
 	assert.ok( before.length >= 3 && Math.abs( before[ before.length - 1 ].scale - 0.5 ) < 1e-3 );
 	for ( let i = 1; i < before.length; i ++ ) assert.ok( before[ i ].scale < before[ i - 1 ].scale );
-	// plenty of headroom afterwards, even with GPU timings: no way back up
-	const later = simulate( gov, state, () => 60, 600, { gpuMsOf: () => 1 } );
-	assert.deepEqual( tiers( later ), [] );
+	// the device stays what it is: 'high' is tried again and taken back within a few seconds, each
+	// time after twice the pause. A handful of short trials in an hour, and it ends in 'medium'
+	const later = simulate( gov, state, device, 3600 );
+	const ups = later.filter( ( a ) => a.type === 'tier' && a.tier === 'high' );
+	const downs = later.filter( ( a ) => a.type === 'tier' && a.tier === 'medium' );
+	assert.ok( ups.length >= 2 && ups.length <= 6, `trials in an hour: ${ups.length}` );
+	assert.equal( downs.length, ups.length );
+	assert.equal( state.tier, 'medium' );
+	assert.ok( later.every( ( a ) => a.type === 'tier' ), 'a trial is taken back before the scale moves' );
+	let inHigh = 0;
+	for ( let i = 0; i < ups.length; i ++ ) inHigh += downs[ i ].t - ups[ i ].t;
+	assert.ok( inHigh / ups.length < 6000, `ms per failed trial: ${inHigh / ups.length}` );
+	for ( let i = 2; i < ups.length; i ++ ) assert.ok( ups[ i ].t - ups[ i - 1 ].t > 1.7 * ( ups[ i - 1 ].t - ups[ i - 2 ].t ) - 20000, 'the pauses double' );
+	// the first try waits for the pause after the step down
+	assert.ok( ups[ 0 ].t - actions[ actions.length - 1 ].t >= 60000 );
+
+} );
+
+test( 'governor: a demotion by a load that went away is undone', () => {
+
+	// the reviewer's case: no GPU timings, a thermal dip (or a load nobody flagged) long enough to
+	// reach the floor and the tier below, then a device that is fast again
+	for ( const timings of [ false, true ] ) {
+
+		const gov = new Governor();
+		const state = fresh();
+		const device = ( s, now ) => ( now < 40000 ? fillBound( 9 )( s ) : 60 );
+		const gpuMsOf = timings ? ( s, fps ) => ( fps < 59 ? 950 / fps : 3 ) : null;
+		const actions = simulate( gov, state, device, 240, { gpuMsOf } );
+		assert.ok( tiers( actions ).includes( 'medium' ), 'demoted during the dip' );
+		assert.equal( state.tier, 'high', `back in high (timings ${timings})` );
+		assert.equal( state.scale, 1 );
+		assert.equal( gov.downgraded, false );
+		const back = actions.filter( ( a ) => a.type === 'tier' && a.tier === 'high' );
+		assert.equal( back.length, 1 );
+		assert.ok( back[ 0 ].t < 150000, `back after ${back[ 0 ].t / 1000} s` );
+		// and it stays: nothing more happens
+		assert.deepEqual( simulate( gov, state, () => 60, 600, { gpuMsOf } ), [] );
+
+	}
+
+	// with GPU timings a GPU without headroom in the lower tier is not sent up to fail
+	const gov = new Governor();
+	const state = fresh( { tier: 'medium' } );
+	assert.deepEqual( simulate( gov, state, () => 60, 600, { gpuMsOf: () => 9 } ), [] );
+	// … where the headroom test looks at the render passes, not at the layout's compute passes
+	const g2 = new Governor();
+	const s2 = fresh( { tier: 'medium' } );
+	const a2 = simulate( g2, s2, () => 60, 60, { gpuMsOf: () => 9, infoOf: () => ( { renderMs: 3 } ) } );
+	assert.deepEqual( tiers( a2 ), [ 'high' ] );
+
+} );
+
+test( 'governor: a masked adapter starts at medium and is lifted to the ceiling, never above', () => {
+
+	// no GPU timings (the browsers that mask the adapter have none either)
+	const gov = new Governor();
+	const state = fresh( { tier: 'medium', ceiling: 'high' } );
+	const actions = simulate( gov, state, () => 60, 600 );
+	assert.deepEqual( actions.map( ( a ) => [ a.type, a.tier ] ), [ [ 'tier', 'high' ] ] );
+	assert.ok( actions[ 0 ].t < 15000, `lifted after ${actions[ 0 ].t / 1000} s` );
+	assert.equal( gov.upgraded, true );
+	// 'high' is the default ceiling: 'ultra' is a look the user chooses
+	assert.deepEqual( simulate( new Governor(), fresh(), () => 60, 600, { gpuMsOf: () => 1 } ), [] );
+	// a tablet or phone keeps its starting tier
+	assert.deepEqual( simulate( new Governor(), fresh( { tier: 'medium', ceiling: 'medium' } ), () => 60, 600, { gpuMsOf: () => 1 } ), [] );
+	assert.deepEqual( simulate( new Governor(), fresh( { tier: 'low', ceiling: 'low' } ), () => 60, 600 ), [] );
+	// a device that cannot hold the tier above: one short trial, then the pause
+	const g2 = new Governor();
+	const s2 = fresh( { tier: 'medium' } );
+	const device = ( s ) => ( s.tier === 'medium' ? 60 : 25 );
+	const a2 = simulate( g2, s2, device, 60 );
+	assert.deepEqual( tiers( a2 ), [ 'high', 'medium' ] );
+	assert.equal( a2[ 1 ].reason, 'the tier above is too slow' );
+	assert.ok( a2[ 1 ].t - a2[ 0 ].t < 5000 );
+
+} );
+
+test( 'governor: a transient load moves the scale, not the tier', () => {
+
+	// the layout of a large graph: 20 ms on top of every frame for 40 s, flagged by the caller
+	const cost = { low: 4, medium: 8, high: 14, ultra: 22 };
+	const layoutUntil = 40000;
+	const device = ( s, now ) => 1000 / Math.max( 16.7, ( now < layoutUntil ? 20 : 0 ) + cost[ s.tier ] * s.scale * s.scale );
+	const gov = new Governor();
+	const state = fresh();
+	const actions = simulate( gov, state, device, 100, { infoOf: ( s, now ) => ( { transient: now < layoutUntil } ) } );
+	assert.deepEqual( tiers( actions ), [], 'the tier is left alone' );
+	assert.equal( state.tier, 'high' );
+	assert.ok( actions.some( ( a ) => a.type === 'scale' && a.scale < 1 ), 'the scale did react' );
+	// … and is back at full resolution soon after the layout came to rest
+	const full = actions.filter( ( a ) => a.t > layoutUntil && a.scale === 1 );
+	assert.ok( full.length >= 1 && full[ 0 ].t < layoutUntil + 30000, `full resolution ${full.length ? ( full[ 0 ].t - layoutUntil ) / 1000 : '∞'} s after the layout` );
+	assert.equal( state.scale, 1 );
+	// without the flag the same load costs the tier (and the retry rule brings it back)
+	const g2 = new Governor();
+	const s2 = fresh();
+	const a2 = simulate( g2, s2, device, 60 );
+	assert.ok( tiers( a2 ).includes( 'medium' ) );
+	// a "transient" that never ends is a slow device: after transientMs the tier may step down
+	const g3 = new Governor();
+	const s3 = fresh();
+	const a3 = simulate( g3, s3, fillBound( 9, { low: 0.1, medium: 0.12, high: 1, ultra: 2 } ), 90, { infoOf: () => ( { transient: true } ) } );
+	assert.deepEqual( tiers( a3 ), [ 'medium' ] );
+	assert.ok( a3.find( ( a ) => a.type === 'tier' ).t > 45000 );
 
 } );
 
@@ -378,8 +528,7 @@ test( 'governor: a loop capped at 30 fps is not slow', () => {
 		assert.ok( Math.abs( gov.displayFps - 30 ) < 0.5 );
 		assert.ok( Math.abs( gov.targetFps - 30 ) < 0.5 );
 		assert.equal( state.scale, 1 );
-		// 'auto' may use its one upgrade (the GPU idles), nothing else
-		assert.deepEqual( tiers( actions ), explicit ? [] : [ 'ultra' ] );
+		assert.deepEqual( tiers( actions ), [] );
 
 	}
 
@@ -584,29 +733,6 @@ test( 'governor: stalls and the settle time are ignored', () => {
 
 } );
 
-test( 'governor: one tier upgrade on measured headroom, at most once', () => {
-
-	const gov = new Governor();
-	const state = fresh();
-	// without GPU timings there is no evidence of headroom: nothing happens at 60 fps
-	assert.deepEqual( simulate( gov, state, () => 60, 300 ), [] );
-	// with an idle GPU: high → ultra after a long good stretch
-	const up = simulate( gov, state, () => 60, 300, { gpuMsOf: () => 2 } );
-	assert.deepEqual( up.map( ( a ) => [ a.type, a.tier ] ), [ [ 'tier', 'ultra' ] ] );
-	assert.equal( gov.upgraded, true );
-	// a busy GPU would not have triggered it
-	const g2 = new Governor();
-	assert.deepEqual( simulate( g2, fresh(), () => 60, 300, { gpuMsOf: () => 12 } ), [] );
-	// ultra turns out too slow: back down, and then never up again
-	const device = fillBound( 100, { low: 0.2, medium: 0.4, high: 1, ultra: 12 } );
-	const down = simulate( gov, state, device, 600, { gpuMsOf: ( s, fps ) => 950 / fps } );
-	assert.deepEqual( tiers( down ), [ 'high' ] );
-	const after = simulate( gov, state, () => 60, 1200, { gpuMsOf: () => 2 } );
-	assert.deepEqual( tiers( after ), [] );
-	assert.equal( state.tier, 'high' );
-
-} );
-
 test( 'governor: the scale climbs back when the load goes away', () => {
 
 	const gov = new Governor();
@@ -616,9 +742,18 @@ test( 'governor: the scale climbs back when the load goes away', () => {
 	simulate( gov, state, device, 60 );
 	assert.ok( state.scale < 0.9 );
 	heavy = false;
+	const t0 = state.now;
 	const actions = simulate( gov, state, device, 300 );
 	assert.equal( state.scale, 1 );
 	for ( let i = 1; i < actions.length; i ++ ) assert.ok( actions[ i ].scale > actions[ i - 1 ].scale );
+	// quickly: the pace is pinned at the display rate, so the steps are large and soon
+	assert.ok( actions[ actions.length - 1 ].t - t0 < 25000, `back at full scale after ${( actions[ actions.length - 1 ].t - t0 ) / 1000} s` );
+	// from the floor as well (the reviewer's case: 0.5 after a layout, 60-70 s with the slow climb)
+	const g2 = new Governor();
+	const s2 = fresh( { scale: 0.5 } );
+	const a2 = simulate( g2, s2, () => 60, 60 );
+	assert.equal( s2.scale, 1 );
+	assert.ok( a2[ a2.length - 1 ].t < 25000, `0.5 → 1 in ${a2[ a2.length - 1 ].t / 1000} s` );
 
 } );
 

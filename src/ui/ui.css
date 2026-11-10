@@ -639,6 +639,7 @@ label.wgv-l { cursor: default; }
 .wgv-toast[data-type='error'] { border-color: rgb(255 120 112 / 0.35); }
 .wgv-toast[data-type='error'] .wgv-toast-dot { background: var(--wgv-danger); box-shadow: 0 0 8px rgb(255 120 112 / 0.7); }
 .wgv-toast-x { width: 26px; height: 26px; }
+.wgv-toast-act { flex: none; padding: 4px 6px; font-weight: 500; color: var(--wgv-accent); }
 
 /* ── tool buttons (top right) and status chips (bottom left) ───────────────────────────── */
 .wgv-tool {
@@ -658,7 +659,7 @@ label.wgv-l { cursor: default; }
 .wgv-tool[aria-pressed='true'] { color: var(--wgv-accent); border-color: rgb(var(--wgv-accent-rgb) / 0.45); }
 .wgv-ui.wgv-tool:focus-visible { outline: none; box-shadow: var(--wgv-focus); border-radius: 10px; }
 
-.wgv-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; max-width: min(560px, calc(100vw - var(--wgv-inset-left, 0px) - 32px)); pointer-events: none; }
+.wgv-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; max-width: min(560px, 100%); pointer-events: none; }
 
 .wgv-chip {
 	display: inline-flex;
@@ -740,9 +741,11 @@ label.wgv-l { cursor: default; }
 /* ── first-run hint ────────────────────────────────────────────────────────────────────── */
 .wgv-hint {
 	position: fixed;
-	z-index: 30;
-	left: calc(50% + var(--wgv-inset-left, 0px) / 2);
-	bottom: calc(max(12px, env(safe-area-inset-bottom)) + var(--wgv-sheet-h, 0px) + var(--wgv-bottom-h, 0px) + 44px);
+	z-index: 14; /* under the slots: a menu that opens over it wins */
+	/* centred in what the panel and the right column (card, drawer) leave free */
+	left: calc(50% + var(--wgv-inset-left, 0px) / 2 - var(--wgv-right-w, 0px) / 2);
+	/* above the bars of the bottom slot and the status chips (one row or two) */
+	bottom: calc(max(12px, env(safe-area-inset-bottom)) + var(--wgv-sheet-h, 0px) + var(--wgv-bottom-h, 0px) + var(--wgv-status-h, 24px) + 20px);
 	transform: translate(-50%, 8px);
 	display: flex;
 	align-items: center;
@@ -750,7 +753,7 @@ label.wgv-l { cursor: default; }
 	flex-wrap: wrap;
 	justify-content: center;
 	width: max-content;
-	max-width: min(720px, calc(100vw - var(--wgv-inset-left, 0px) - 32px));
+	max-width: min(720px, calc(100vw - var(--wgv-inset-left, 0px) - var(--wgv-right-w, 0px) - 32px));
 	padding: 9px 8px 9px 16px;
 	border-radius: 14px;
 	color: var(--wgv-text-2);

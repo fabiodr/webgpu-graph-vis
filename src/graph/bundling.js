@@ -13,6 +13,9 @@
 //  ref - N (cluster ids as in prepare.js). The full control polygon of edge e is
 //  [ s, ...interior, t ]; the renderer applies Holten straightening (beta) and a uniform cubic
 //  B-spline with tripled end points to it. An edge without interior points is a straight line.
+//  In the force layout the renderer first pulls a centroid that lies behind an end point of its
+//  edge back to that end point (EdgeCurves.js, "Unhooking"), so no curve hooks around its node;
+//  the path set itself stays free of positions.
 //  Because the refs are indices, not coordinates, a path set stays valid while the layout
 //  moves, nodes are dragged, or the view morphs to the sphere layout. Only the *choice* of
 //  paths of the position-dependent algorithms goes stale; recompute it when the layout settles.

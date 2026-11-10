@@ -15,7 +15,8 @@
 //    and, with such a rig, offers the way back for a few seconds ( "Back to my view" ).
 //  · Betweenness for the broker stop is requested when the tour starts and planned when the stop
 //    is reached, with whatever estimate the worker has by then (said as "about" until exact).
-//  · A new graph stops it.
+//  · A new graph stops it: the viewer's lens channels come back there too (the lens drops what
+//    the new graph does not have); the camera and the highlight belong to the new graph.
 //
 //   const tour = new Tour( { app, lens, interaction, rig, slots, insights, touch } )
 //   tour.start() -> Promise<boolean>   true when it ran to the end, false when it was stopped
@@ -213,7 +214,15 @@ export class Tour {
 		this.el.hidden = true;
 		document.documentElement.classList.remove( 'wgx-tour-on' );
 		this.step = - 1;
-		if ( this.app.graph === this._graph ) {
+		if ( this.app.graph !== this._graph ) {
+
+			// the graph changed under the tour: the lens of its stop is not the viewer's choice, so
+			// the channels from before come back on the new graph (those it has no values for stay off)
+			const b = this._before, have = new Set( this.lens.metrics.map( ( m ) => m.id ) );
+			const keep = ( id ) => ( id && have.has( id ) ? id : null );
+			if ( b ) applyChannels( this.lens, { color: keep( b.color ), size: keep( b.size ), glow: keep( b.glow ), ramp: b.ramp, reverse: b.reverse, top: b.top } ).catch( () => {} );
+
+		} else {
 
 			// the lens of a stop was the tour's, not the viewer's: back to what it was, unless the
 			// viewer has set another one since

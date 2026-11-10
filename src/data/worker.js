@@ -352,7 +352,7 @@ function cluster( graph, opts, progress, timings ) {
 
 	const method = opts.method || CLUSTER_DEFAULTS.method;
 	const title = method === 'louvain' ? 'Louvain' : 'Leiden';
-	progress.stage( 'cluster', `Clustering ${count( graph.nodeCount )} nodes (${title})…` );
+	progress.stage( 'cluster', `Clustering ${count( graph.nodeCount )} ${graph.nodeCount === 1 ? 'node' : 'nodes'} (${title})…` );
 	let level = 0;
 	const out = applyClustering( graph, {
 		method,

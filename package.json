@@ -2,7 +2,7 @@
   "name": "webgpu-graph-vis",
   "version": "0.1.0",
   "private": true,
-  "description": "3D graph visualization in the browser with three.js WebGPU/TSL: GPU force-directed layout, hierarchical edge bundling, glow rendering. Visual style after ImsvGraphVis (Kwon et al., TVCG 2016).",
+  "description": "3D graph viewer in the browser with three.js WebGPU/TSL: GPU force layout, hierarchical and edge-path edge bundling, lit impostor nodes with quality tiers, a metric lens, search, shortest paths and community detection. Visual style after ImsvGraphVis (Kwon et al., TVCG 2016).",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,7 +13,7 @@
     "test": "node --test \"test/**/*.test.js\"",
     "shot": "node scripts/shot.mjs"
   },
-  "keywords": ["webgpu", "three.js", "tsl", "graph", "force-directed", "edge-bundling", "visualization"],
+  "keywords": ["webgpu", "three.js", "tsl", "graph", "network", "force-directed", "graph-layout", "edge-bundling", "community-detection", "graph-analytics", "visualization"],
   "license": "MIT",
   "dependencies": {
     "three": "0.187.0"

@@ -626,8 +626,17 @@ test( 'graphs without a hierarchy have no community names and behave as before',
 
 // ── names fit what they name; the zoom's budget ──────────────────────────────────────────────
 
-/** Width in CSS px of the name of slot j as it is shown. */
+/** Width in CSS px of the name of slot j at its largest size (a community that is large on screen). */
 const nameWidth = ( L, j ) => L._cl.slots[ j ].widthEm * L.fontSize * L.uniforms.clusterScale.value * L._cl.slots[ j ].shown;
+/** … and as it is shown above a community whose ball has a radius of ballPx: 0.22 radii, at least 11 px. */
+const shownWidth = ( L, j, ballPx ) => Math.min( nameWidth( L, j ), L._cl.slots[ j ].widthEm * Math.max( 11, 0.22 * ballPx ) );
+/** The rules of the first version: every name at its largest size, whatever the size of its community. */
+const fullSize = ( sc ) => {
+
+	sc.L.uniforms.clusterNameMin.value = 1e3;
+	return sc;
+
+};
 
 test( 'a name sits on its community: from afar only the largest communities are named, a dot gets none', () => {
 
@@ -645,45 +654,77 @@ test( 'a name sits on its community: from afar only the largest communities are 
 	assert.equal( cl.loose, 0 );
 	for ( let j = 0; j < cl.K; j ++ ) close( cl.radius[ cl.slots[ j ].k ], ball * pxPerUnit( 1700 ), 2.5, 'projected radius' );
 
-	// farther: no name fits its community any more (not even with the hysteresis of a shown name), the
-	// names would still have room next to each other: the largest few keep theirs
+	// a name is sized by its community (0.22 projected radii, at least 11 px) and sits above its ball,
+	// not on the centroid, where the hub and its label are
+	for ( let j = 0; j < cl.K; j ++ ) {
+
+		const slot = cl.slots[ j ], box = L.clusterBox( slot.cluster ), r = ball * pxPerUnit( 1700 );
+		close( box.font, Math.max( 11, 0.22 * r ), 0.3, 'font size' );
+		assert.ok( box.font < L.fontSize * L.uniforms.clusterScale.value, 'smaller than a name on a large community' );
+		close( ( box.x0 + box.x1 ) / 2, cl.sx[ slot.k ], 1e-3, 'centred over the centroid' );
+		assert.ok( box.y1 <= cl.sy[ slot.k ] - r + 0.5 * box.font, `the text is above the ball: ${box.y1} vs ${cl.sy[ slot.k ] - r}` );
+		assert.ok( box.y0 > cl.sy[ slot.k ] - r - 3 * box.font, 'and close to it' );
+
+	}
+
+	assert.equal( L.clusterBox( 99 ), null );
+	// from here on a name is 11 px: it still fits a ball that the full-size name is far too wide for
 	moveCamera( 2600 );
 	L._decide( app, 1, - 1, - 1 );
-	cl = L._cl;
 	for ( let j = 0; j < cl.K; j ++ ) assert.equal( nameFits( nameWidth( L, j ), ball * pxPerUnit( 2600 ), 1.1 ), false );
+	for ( let j = 0; j < cl.K; j ++ ) assert.equal( nameFits( shownWidth( L, j, ball * pxPerUnit( 2600 ) ), ball * pxPerUnit( 2600 ) ), true );
+	assert.deepEqual( nameAlpha( L ), [ 1, 1, 1, 1, 1, 1 ] );
+	assert.equal( L._cl.loose, 0 );
+
+	// farther: no name fits its community any more (not even with the hysteresis of a shown name), the
+	// names would still have room next to each other: the largest few keep theirs
+	moveCamera( 4000 );
+	L._decide( app, 1, - 1, - 1 );
+	cl = L._cl;
+	for ( let j = 0; j < cl.K; j ++ ) assert.equal( nameFits( shownWidth( L, j, ball * pxPerUnit( 4000 ) ), ball * pxPerUnit( 4000 ), 1.1 ), false );
 	close( cl.looseRoom, looseNameArea( cl.graphPx ), 1e-6 );
 	assert.equal( L.options.maxLooseNames, 4 );
 	assert.deepEqual( nameAlpha( L ), [ 1, 1, 1, 1, 0, 0 ], 'the largest communities, in order of size' );
 	assert.equal( cl.loose, 4 );
 	assert.equal( L.stats.clusters, 4 );
 
-	// from so far that the graph is the size of a name: no names
+	// a community that shrinks to a dot loses its name gradually (clusterMinRadius = [ 10, 18 ] px) …
+	moveCamera( 6000 );
+	L._decide( app, 2, - 1, - 1 );
+	assert.ok( ball * pxPerUnit( 6000 ) > 10 && ball * pxPerUnit( 6000 ) < 18 );
+	assert.ok( nameAlpha( L ).slice( 0, 4 ).every( ( a ) => a > 0 && a < 1 ), `fading: ${nameAlpha( L )}` );
+	moveCamera( 12000 );
+	L._decide( app, 2, - 1, - 1 );
+	assert.ok( nameAlpha( L ).every( ( a ) => a === 0 ), 'dots have no names' );
+	// … and from so far that the graph is the size of a name there are none either
 	moveCamera( 40000 );
 	L._decide( app, 2, - 1, - 1 );
 	assert.ok( L._cl.graphPx < 60 );
 	assert.ok( nameAlpha( L ).every( ( a ) => a === 0 ) );
 	assert.equal( L.stats.clusters, 0 );
 
-	// 'on' means every name that finds room; clusterFit 0 switches the rule off
+	// 'on' means every name that finds room, also for dots; clusterFit 0 switches the fit rule off
 	L.clusterLabels = 'on';
-	moveCamera( 2600 );
+	moveCamera( 4000 );
 	L._decide( app, 3, - 1, - 1 );
 	assert.deepEqual( nameAlpha( L ), [ 1, 1, 1, 1, 1, 1 ] );
 	const free = fakeScene( { clusterFit: 0 }, { sizes, gap: 330, spread: 80 } );
-	free.moveCamera( 2600 );
+	free.moveCamera( 4000 );
 	free.L._decide( free.app, 0, - 1, - 1 );
 	assert.deepEqual( nameAlpha( free.L ), [ 1, 1, 1, 1, 1, 1 ] );
 
 	// a small projection: the names that do not fit share a part of the graph's disc. Three
 	// communities seen from afar have room for one name; the third community, whose name would not
 	// touch the first one's, gets none because of that (with the rule off it does)
-	const small = fakeScene( {}, { sizes: [ 30, 26, 22 ], gap: 330, spread: 80 } );
+	// (shown with names at their full size and without the fade of small communities: with the
+	// defaults a view like this has no names at all)
+	const small = fullSize( fakeScene( { clusterMinRadius: [ 0, 0 ] }, { sizes: [ 30, 26, 22 ], gap: 330, spread: 80 } ) );
 	small.moveCamera( 6000 );
 	small.L._decide( small.app, 0, - 1, - 1 );
 	const F = small.L.fontSize * small.L.uniforms.clusterScale.value * 1.4, box = nameWidth( small.L, 0 ) * 2 * 0.66 * F;
 	assert.ok( small.L._cl.looseRoom >= box && small.L._cl.looseRoom < 2 * box * 0.95, `room for one: ${small.L._cl.looseRoom} / ${box}` );
 	assert.deepEqual( nameAlpha( small.L ), [ 1, 0, 0 ] );
-	const off = fakeScene( { clusterFit: 0 }, { sizes: [ 30, 26, 22 ], gap: 330, spread: 80 } );
+	const off = fullSize( fakeScene( { clusterFit: 0, clusterMinRadius: [ 0, 0 ] }, { sizes: [ 30, 26, 22 ], gap: 330, spread: 80 } ) );
 	off.moveCamera( 6000 );
 	off.L._decide( off.app, 0, - 1, - 1 );
 	assert.deepEqual( nameAlpha( off.L ), [ 1, 0, 1 ], 'the middle one collides, the third does not' );
@@ -710,7 +751,7 @@ test( 'names: a view carries a limited number of them, and they keep air between
 	// air: two names whose boxes are 4 px apart are not both placed, without the margin they are
 	const pair = ( options ) => {
 
-		const sc = fakeScene( { clusterFit: 0, ...options }, { sizes: [ 30, 28 ], gap: 100, spread: 20 } );
+		const sc = fullSize( fakeScene( { clusterFit: 0, clusterMinRadius: [ 0, 0 ], ...options }, { sizes: [ 30, 28 ], gap: 100, spread: 20 } ) );
 		const slots = sc.L._ensureClusters().slots, fontPx = sc.L.fontSize * sc.L.uniforms.clusterScale.value;
 		const half = ( slots[ 0 ].widthEm * slots[ 0 ].scale + slots[ 1 ].widthEm * slots[ 1 ].scale ) * fontPx / 2 + 6; // two half boxes
 		sc.moveCamera( ( 1 / Math.tan( Math.PI / 8 ) ) * 500 * 100 / ( half + 4 ) );

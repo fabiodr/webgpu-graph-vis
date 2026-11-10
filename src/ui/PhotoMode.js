@@ -1,4 +1,4 @@
-// Photo mode: the picture alone, a lens to set, and a capture.
+// Photo mode: the picture alone, focus, blur and exposure to set, and a capture.
 //
 // Entering adds `wgv-ui-hidden` to <html> (every surface steps aside: the panel, the slots, the
 // node card), centres the graph in the whole window, holds the automatic rotation and turns
@@ -148,6 +148,13 @@ export class PhotoMode {
 		this._onResize = () => this._sync(); // the sizes on offer follow the window
 		this._onDown = ( e ) => this._pointer( e, true );
 		this._onUp = ( e ) => this._pointer( e, false );
+		this._onGraph = () => {
+
+			// the node in focus belonged to the graph that left
+			this._focusNode = - 1;
+			if ( this.active ) this.gfx.setFocus( null );
+
+		};
 
 	}
 
@@ -190,6 +197,7 @@ export class PhotoMode {
 		window.addEventListener( 'keydown', this._onKey, true );
 		window.addEventListener( 'resize', this._onResize );
 		app.events.addEventListener( 'frame', this._onFrame );
+		app.events.addEventListener( 'graph', this._onGraph );
 		const el = app.renderer.domElement;
 		el.addEventListener( 'pointerdown', this._onDown );
 		el.addEventListener( 'pointerup', this._onUp );
@@ -207,6 +215,7 @@ export class PhotoMode {
 		window.removeEventListener( 'keydown', this._onKey, true );
 		window.removeEventListener( 'resize', this._onResize );
 		app.events.removeEventListener( 'frame', this._onFrame );
+		app.events.removeEventListener( 'graph', this._onGraph );
 		const el = app.renderer.domElement;
 		el.removeEventListener( 'pointerdown', this._onDown );
 		el.removeEventListener( 'pointerup', this._onUp );

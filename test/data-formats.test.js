@@ -312,6 +312,39 @@ test( 'detection: content first, extension second, friendly rejections', () => {
 	assert.deepEqual( detectFormat( 'a b\n', 'edges.gz' ), { id: 'edgelist', by: 'default' } );
 	assert.deepEqual( detectFormat( '<graphml/>', 'https://example.org/data/g.graphml.gz?x=1' ).id, 'graphml' );
 	fails( () => detectFormat( '\u0000\u0001\u0002PNG', 'pic.png' ), /pic\.png is not a text file/, 'format' );
+	// binary data without a NUL (a picture cut short, as a file dialog set to "All files" hands it
+	// over): the 8 bytes of the PNG signature, the head of a JPEG, random bytes, all decoded as UTF-8
+	const utf8 = ( bytes ) => new TextDecoder().decode( Uint8Array.from( bytes ) );
+	fails( () => detectFormat( utf8( [ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a ] ), 'photo.png' ), /photo\.png is not a text file \(it contains binary data\)\. Supported: GraphML/, 'format' );
+	fails( () => parseGraph( utf8( [ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x49, 0x48, 0x44, 0x52, 0x20, 0x41, 0x0a, 0x42, 0x20, 0x43 ] ), 'photo.png' ), /not a text file/, 'format' );
+	fails( () => detectFormat( utf8( [ 0xff, 0xd8, 0xff, 0xe0, 0x01, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x01 ] ), 'photo' ), /^photo is not a text file/, 'format' );
+	{
+
+		const bytes = [];
+		for ( let x = 7; bytes.length < 4096; ) bytes.push( 1 + ( ( x = ( Math.imul( x, 1664525 ) + 1013904223 ) >>> 0 ) >>> 8 ) % 255 ); // 1..255: no NUL
+		fails( () => detectFormat( utf8( bytes ), 'data.bin' ), /data\.bin is not a text file/, 'format' );
+		fails( () => detectFormat( utf8( bytes ), 'data.csv' ), /data\.csv is not a text file/, 'format' ); // whatever the name says
+
+	}
+
+	// UTF-16 with a byte order mark, either byte order; a legacy code page that is mostly letters above 127
+	fails( () => detectFormat( utf8( [ 0xff, 0xfe, 0x61, 0x00, 0x20, 0x00, 0x62, 0x00, 0x0a, 0x00 ] ), 'edges.txt' ), /edges\.txt is UTF-16 text.*save it as UTF-8/, 'format' );
+	fails( () => detectFormat( utf8( [ 0xfe, 0xff, 0x00, 0x61, 0x00, 0x20, 0x00, 0x62, 0x00, 0x0a ] ), 'edges.txt' ), /UTF-16/, 'format' );
+	fails( () => detectFormat( 'a\u0000 \u0000b\u0000\n\u0000', 'edges.txt' ), /UTF-16/, 'format' ); // no byte order mark
+	fails( () => detectFormat( '\u0001\u0000\u0002\u0000\u0003\u0000\u0004\u0000', 'edges.txt' ), /not a text file/, 'format' ); // 16-bit numbers, not text
+	fails( () => detectFormat( utf8( [ 0xc0, 0xed, 0xed, 0xe0, 0x20, 0xc2, 0xf0, 0xee, 0xed, 0xf1, 0xea, 0xe8, 0xe9, 0x0a ] ), 'names.csv' ), /names\.csv is not UTF-8 text/, 'format' );
+	// … but a few accented letters in Latin-1 do not turn a text file away, nor do a tab-separated
+	// file, a form feed, an escape or a lone stray control character in a longer text
+	assert.deepEqual( detectFormat( utf8( [ ...Buffer.from( 'Zo' ), 0xe9, ...Buffer.from( ',Am' ), 0xe9, ...Buffer.from( 'lie\nAm' ), 0xe9, ...Buffer.from( 'lie,Ren' ), 0xe9, 0x0a ] ), 'names.csv' ), { id: 'edgelist', by: 'extension' } );
+	assert.deepEqual( detectFormat( 'a\tb\r\n\fb\tc\u001b[0m\n', 'x.tsv' ), { id: 'edgelist', by: 'extension' } );
+	assert.deepEqual( detectFormat( 'alpha beta\nbeta gamma\ngamma delta\u0001\n', 'x' ), { id: 'edgelist', by: 'default' } );
+	assert.deepEqual( detectFormat( 'Привет Мир\nМир Земля\n日本 東京\n', 'x.txt' ), { id: 'edgelist', by: 'extension' } ); // UTF-8 beyond ASCII is text
+	fails( () => detectFormat( '%PDF-1.7\n%\u00e2\u00e3\u00cf\u00d3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n', 'paper.pdf' ), /paper\.pdf is a PDF document/, 'format' );
+	// nothing names a format and the "edge list" is one word: not a graph of one node
+	fails( () => parseGraph( 'hello\n', 'notes' ), /notes does not look like a graph file: no edges were found/, 'format' );
+	fails( () => parseGraph( 'hello\n', 'notes.xyz' ), /notes\.xyz does not look like a graph file/, 'format' );
+	assert.equal( parseGraph( 'hello\n', 'notes.txt' ).graph.nodeCount, 1 ); // an edge list by its name: taken at its word
+	assert.equal( parseGraph( 'a b\n', 'notes' ).graph.edges.length, 2 );
 	fails( () => detectFormat( '<svg xmlns="x">', 'pic.svg' ), /root element <svg>.*GraphML.*GEXF/, 'format' );
 	fails( () => detectFormat( ' \n\t ', 'empty.txt' ), /empty/, 'empty' );
 	// a graph called "graph" in an edge list is not DOT

@@ -3,9 +3,15 @@
 // arrays of src/graph/prepare.js (anc, levelOffset, clusterMass, clusterRankRange, edges, degree).
 //
 //   usefulLevel( graph, { min = 2, max = 40 } ) -> level | −1
-//        The coarsest level (D − 1 = coarsest, 0 = finest) that has at least `min` communities; when
-//        every level has more than `max`, the coarsest one. −1 when the graph has no hierarchy or
-//        no level splits it.
+//        The level to show (D − 1 = coarsest, 0 = finest): graph.clustering.mainLevel where the data
+//        layer names one that splits the graph, else the coarsest level that has at least `min`
+//        communities (when every level has more than `max`, the coarsest one). −1 when the graph
+//        has no hierarchy or no level splits it.
+//   communitySummary( graph ) -> { level, count, finest }
+//        THE number of communities, for every surface that says one (panel, legend, drawer,
+//        status): graph.clustering.communities of the data layer where it is given (the clusters
+//        of the main level without the dust clusters), else the clusters of usefulLevel, else
+//        graph.stats.clusters. `finest` is the cluster count of level 0.
 //   communityList( graph, level ) -> [ { cluster, level, size, hub, hubDegree, name, internal, cut,
 //        share, rank } ], largest first
 //        cluster   index in the prepared graph's cluster space (what 'cluster' events carry)
@@ -48,6 +54,8 @@ export function communityCount( graph, level ) {
 export function usefulLevel( graph, { min = 2, max = 40 } = {} ) {
 
 	if ( ! graph || ! graph.D ) return - 1;
+	const main = graph.clustering ? graph.clustering.mainLevel : undefined;
+	if ( Number.isInteger( main ) && main >= 0 && main < graph.D && graph.levelOffset && countAt( graph, main ) >= min ) return main;
 	let fallback = - 1;
 	for ( let level = graph.D - 1; level >= 0; level -- ) {
 
@@ -59,6 +67,18 @@ export function usefulLevel( graph, { min = 2, max = 40 } = {} ) {
 	}
 
 	return fallback;
+
+}
+
+export function communitySummary( graph ) {
+
+	if ( ! graph ) return { level: - 1, count: 0, finest: 0 };
+	const c = graph.clustering || null;
+	const level = graph.levelOffset ? usefulLevel( graph ) : - 1;
+	const given = c && Number.isFinite( c.communities ) && c.communities >= 0 && ( level < 0 || level === c.mainLevel );
+	const count = given ? c.communities : level >= 0 ? countAt( graph, level ) : graph.levelOffset ? 0 : ( graph.stats && graph.stats.clusters ) | 0;
+	const finest = graph.levelOffset && graph.D ? countAt( graph, 0 ) : c && Array.isArray( c.clustersPerLevel ) && c.clustersPerLevel.length ? c.clustersPerLevel[ 0 ] | 0 : count;
+	return { level, count, finest };
 
 }
 

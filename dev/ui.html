@@ -363,7 +363,7 @@ try {
 	app.events.addEventListener( 'frame', () => {
 
 		const g = app.graph;
-		if ( g ) panel.update( { nodes: g.N, edges: g.E, clusters: g.stats.clusters, levels: g.D } );
+		if ( g ) panel.update( { nodes: g.N, edges: g.E, communities: g.stats.clusters, levels: g.D } );
 
 	} );
 

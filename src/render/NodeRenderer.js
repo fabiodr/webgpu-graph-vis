@@ -30,7 +30,9 @@
 //  (+ nodePrev); shadow pass vertex 3; halo vertex 4, 5 with 'mv'; fragment 0 in every variant.
 //
 // ─── Size ───────────────────────────────────────────────────────────────────────────────────
-//  radius = baseSize · nodeColor.w · size · (1 + 0.5·selected + 0.25·hovered)
+//  radius = baseSize · nodeColor.w · size · (1 + 0.5·selected + 0.25·hovered) · (1 − 0.4·context)
+//  (context = the eased dimming of nodes outside a selection's neighbourhood, lifted by hovering;
+//  the shadow pass and worldRadius() keep the rest size)
 //  baseSize = 0.065 · graph.layoutRadius / ∛N. A node whose radius falls below `minPixelRadius`
 //  (CSS px) is not shrunk into sub-pixel flicker; it turns into a POINT with an energy-conserving
 //  response: with f = true radius / minimum radius, the true disc covers f² of the minimum dot, so
@@ -91,14 +93,19 @@
 //  look roughness, smaller ones get a wider, dimmer sheen. Same floor for the unlit highlight and
 //  the clearcoat.
 //  nodeState (eased on the GPU) drives emphasis: selected / hovered / neighbour nodes glow
-//  stronger, context nodes (state.z, gated by uniforms.focus) recede into dark, cool glass beads
-//  (their own glow goes out, hue almost gone, a little gloss and a cool rim keep the form).
+//  stronger, context nodes (state.z, gated by uniforms.focus) recede into small, dark, matte beads
+//  (60 % of their radius, their own glow goes out, hue almost gone, no gloss and no clearcoat: a
+//  full-size glossy black marble in front of a highlighted tube or a label reads as an object of
+//  its own; a cool rim keeps the form). They stay opaque and depth writing.
 //  nodeFx: x = hop distance of the ripple (gain = rippleGain·exp(−((x−front)/width)²), a flash of
 //  the node's OWN core colour plus the scale-up, so clusters stay distinguishable on the front),
 //  z = glow weight (extra emissive). Fog (gfx/shared.js) is applied to the final colour, emissive
 //  included.
 //  A second, blended pass draws the "halo": a crisp ring plus a faint corona around the selected
-//  node (strong), the hovered node and the neighbours of the selection (mild); the point sprites
+//  node (strong), the hovered node and the neighbours of the selection (mild). The halo of the
+//  SELECTED node is drawn in front of everything (its quad is pulled to the near plane along the
+//  view rays, which keeps its place and size on screen): the ring marks the selection and must not
+//  be cut by the tubes that run into the node or by a node in front of it. Also the point sprites
 //  of the single-sample variants (see "Size"); and the point glow: a small Gaussian in the node's
 //  hue around nodes that are IMPORTANT (radius factor above the average: degree, or the size
 //  lens; or the glow lens, nodeFx.z) and SMALL on screen (it is gone once the bead is 7 CSS px in
@@ -124,12 +131,12 @@
 //  nodes.setGraph( buffers, graph ), nodes.dispose()
 import * as THREE from 'three/webgpu';
 import {
-	Fn, instanceIndex, vec2, vec3, vec4, float, uniform, varyingProperty, property, positionGeometry, cameraViewMatrix,
+	Fn, instanceIndex, vec2, vec3, vec4, float, uniform, varyingProperty, property, positionGeometry, cameraViewMatrix, cameraNear,
 	normalize, length, dot, max, min, clamp, pow, mix, smoothstep, select, abs, luminance, exp, sin, sqrt, step, mrt, output,
 } from 'three/tsl';
 import { gfxUniforms, gfxState, motionVector, velocityOutput, applyFog, fogTransmittance, cocPixels } from './gfx/shared.js';
 import {
-	pixelsPerUnit, viewToDepth, viewToWorld, applySurface, sphereBillboard, raySphere, discCoverage,
+	pixelsPerUnit, viewToDepth, viewToWorld, applySurface, sphereBillboard, raySphere, discCoverage, isOrthographic,
 	SurfaceStandardMaterial, SurfacePhysicalMaterial, quadGeometry,
 } from './gfx/impostor.js';
 
@@ -153,6 +160,9 @@ export const NODE_LOOK = {
 
 /** Share of the emissive core's peak that a bead averages to over its disc (point sprites). */
 export const POINT_CORE = 0.35;
+
+/** Share of its radius a context node loses at full dimming. */
+export const CONTEXT_SHRINK = 0.4;
 
 /** Emissive gain and overall boost of the selected node (hovered and neighbour nodes get less). */
 const SEL_GAIN = 0.25, SEL_BOOST = 0.12;
@@ -423,7 +433,8 @@ export class NodeRenderer {
 
 		const center = cameraViewMatrix.mul( vec4( pos.xyz, 1 ) ).xyz.toVar( 'nCenter' );
 		let scale = st.x.mul( 0.5 ).add( 1 );
-		if ( ! shadow ) scale = scale.add( st.w.mul( 0.25 ) );
+		// hover grows a node; context nodes (outside a selection's neighbourhood) shrink out of the way
+		if ( ! shadow ) scale = scale.add( st.w.mul( 0.25 ) ).mul( min( st.z, S.focus ).mul( st.w.oneMinus() ).mul( CONTEXT_SHRINK ).oneMinus() );
 		let ripple = float( 0 ), glow = float( 0 );
 		if ( fx && ! shadow ) {
 
@@ -550,7 +561,8 @@ export class NodeRenderer {
 		const roughFloor = sqrt( clamp( float( 0.6 ).div( max( rTarget, 1e-3 ) ), 0, 0.6 ) ).toVar( 'nodeRoughFloor' );
 		// larger (higher-degree) nodes are a little glossier, small ones more matte; context keeps a little gloss
 		const rough = clamp( U.roughness.add( U.variation.mul( float( 1.1 ).sub( vColor.w ) ).mul( 0.3 ) ), 0.08, 1 );
-		const roughness = max( mix( rough, float( 0.5 ), dim.mul( 0.8 ) ), roughFloor );
+		// context nodes lose their gloss with the dimming (a dark glossy bead still catches the eye)
+		const roughness = max( mix( rough, float( 1 ), dim ), roughFloor );
 
 		const ndv = clamp( dot( normal, viewDir ), 0, 1 ).toVar( 'nodeNdV' );
 		// the core sits opposite the key light, where light that entered a glass bead would leave it again:
@@ -618,7 +630,7 @@ export class NodeRenderer {
 			material.finishKey = 'node';
 			if ( shading === 'phys' ) {
 
-				material.clearcoatNode = U.clearcoat.mul( dim.mul( 0.8 ).oneMinus() );
+				material.clearcoatNode = U.clearcoat.mul( dim.oneMinus() );
 				material.clearcoatRoughnessNode = max( U.clearcoatRoughness, roughFloor );
 				material.clearcoatNormalNode = normal; // the default reads the geometry normal attribute (there is none)
 
@@ -730,7 +742,11 @@ export class NodeRenderer {
 			vCover.assign( select( sprite, cover, float( 0 ) ) );
 			if ( velocity ) vMotion.assign( motionVector( I.pos.xyz, buffers.nodePrev.element( instanceIndex ).xyz ) );
 			const off = I.inside.or( extent.lessThan( 0.5 ) );
-			return viewToWorld( select( off, I.center, viewPos ) );
+			// the selected node's halo goes in front of everything: scaled along the view rays to just
+			// behind the near plane (same place and size on screen; perspective cameras only)
+			const front = clamp( cameraNear.mul( 1.02 ).div( max( viewPos.z.negate(), 1e-6 ) ), 0, 1 );
+			const pull = select( I.st.x.greaterThan( 0.02 ).and( isOrthographic().not() ), front, float( 1 ) );
+			return viewToWorld( select( off, I.center, viewPos.mul( pull ) ) );
 
 		} )();
 

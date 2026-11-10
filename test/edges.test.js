@@ -11,7 +11,7 @@ import { prepareGraph } from '../src/graph/prepare.js';
 import { hierarchicalPaths, straightPaths } from '../src/graph/bundling.js';
 import { GraphBuffers } from '../src/gpu/GraphBuffers.js';
 import { EdgeCurves, encodePathRefs, maxSegmentsForBudget } from '../src/gpu/EdgeCurves.js';
-import { evalEdgeCurveCPU, autoSegments, autoOpacity, autoDefocusLimit } from '../src/render/EdgeRenderer.js';
+import { evalEdgeCurveCPU, autoSegments, autoOpacity, autoDefocusLimit, strandSubdivision, autoCurveMemory, EDGE_DEFAULTS, LOOK_DEFAULTS } from '../src/render/EdgeRenderer.js';
 
 const load = ( id, flat = false ) => {
 
@@ -176,10 +176,10 @@ for ( const id of [ 'karate', 'lesmis', 'football', 'celegansneural' ] ) {
 		let worst = 0;
 		for ( let e = 0; e < g.E; e ++ ) {
 
-			const ref = evalEdgeCurveCPU( g, e, 0, g.initPos, cp, { beta: 1 } );
+			const ref = evalEdgeCurveCPU( g, e, 0, g.initPos, cp, { beta: 1, unhook: 0 } );
 			const P = ref.controlPoints;
 			const pts = [];
-			for ( let k = 0; k <= 200; k ++ ) pts.push( evalEdgeCurveCPU( g, e, k / 200, g.initPos, cp, { beta: 1 } ).position );
+			for ( let k = 0; k <= 200; k ++ ) pts.push( evalEdgeCurveCPU( g, e, k / 200, g.initPos, cp, { beta: 1, unhook: 0 } ).position );
 			// convex hull property (checked with the bounding box of the control polygon)
 			for ( const p of pts ) for ( let q = 0; q < 3; q ++ ) {
 
@@ -231,6 +231,57 @@ for ( const id of [ 'karate', 'lesmis', 'football', 'celegansneural' ] ) {
 		}
 
 		assert.ok( maxOut > 1.05 );
+
+	} );
+
+}
+
+for ( const id of [ 'karate', 'lesmis', 'football', 'celegansneural' ] ) {
+
+	test( `${id} force: no curve passes behind its end points (unhook); edges without a centroid behind them are untouched`, () => {
+
+		const g = load( id );
+		// a layout in which many centroids lie behind a node: the seed with every node pushed outward
+		const pos = g.initPos.map( ( v, i ) => ( i % 4 === 3 ? v : v * ( 1 + 0.6 * Math.sin( 12.9898 * ( i >> 2 ) ) ) ) );
+		const cp = centroids( g, pos );
+		let hooked = 0, kept = 0;
+		for ( let e = 0; e < g.E; e ++ ) {
+
+			const s = nodeAt( pos, g.edges[ 2 * e ] ), t = nodeAt( pos, g.edges[ 2 * e + 1 ] );
+			const d = [ t[ 0 ] - s[ 0 ], t[ 1 ] - s[ 1 ], t[ 2 ] - s[ 2 ] ], len = Math.hypot( ...d );
+			const along = ( p ) => ( ( p[ 0 ] - s[ 0 ] ) * d[ 0 ] + ( p[ 1 ] - s[ 1 ] ) * d[ 1 ] + ( p[ 2 ] - s[ 2 ] ) * d[ 2 ] ) / len;
+			const P = evalEdgeCurveCPU( g, e, 0, pos, cp ).controlPoints;
+			const inside = P.every( ( p ) => along( p ) >= 0 && along( p ) <= len );
+			let back0 = 0, back1 = 0, diff = 0;
+			for ( let k = 0; k <= 64; k ++ ) {
+
+				const p0 = evalEdgeCurveCPU( g, e, k / 64, pos, cp, { unhook: 0 } ).position;
+				const p1 = evalEdgeCurveCPU( g, e, k / 64, pos, cp ).position; // unhook = 1 is the default
+				back0 = Math.max( back0, - along( p0 ), along( p0 ) - len );
+				back1 = Math.max( back1, - along( p1 ), along( p1 ) - len );
+				diff = Math.max( diff, dist( p0, p1 ) );
+
+			}
+
+			assert.ok( back1 <= 1e-6 * g.layoutRadius, `edge ${e} passes ${back1} behind an end point` );
+			if ( back0 > 0.01 * g.layoutRadius ) {
+
+				hooked ++;
+				assert.ok( diff > 0, `edge ${e} hooks without unhooking, and with it is the same curve` );
+
+			}
+
+			if ( inside ) {
+
+				kept ++;
+				assert.ok( diff <= 1e-9 * g.layoutRadius, `edge ${e} has no centroid behind its ends but moved by ${diff}` );
+
+			}
+
+		}
+
+		assert.ok( hooked > 0, 'the test layout has hooks without unhooking' );
+		assert.ok( kept > 0, 'the test layout has edges that unhooking leaves alone' );
 
 	} );
 
@@ -388,8 +439,8 @@ for ( const id of [ 'karate', 'lesmis', 'football', 'celegansneural' ] ) {
 			for ( let e = 0; e < g.E; e ++ ) for ( const beta of [ 0.3, 0.85, 1 ] ) for ( const tt of [ 0, 0.07, 0.25, 0.5, 0.81, 1 ] ) {
 
 				const want = legacyCurve( g, e, tt, pos, cp, { ...o, beta } );
-				const implicit = evalEdgeCurveCPU( g, e, tt, pos, cp, { ...o, beta } ); // default path set
-				const explicit = evalEdgeCurveCPU( g, e, tt, pos, cp, { ...o, beta, paths } );
+				const implicit = evalEdgeCurveCPU( g, e, tt, pos, cp, { ...o, beta, unhook: 0 } ); // default path set
+				const explicit = evalEdgeCurveCPU( g, e, tt, pos, cp, { ...o, beta, unhook: 0, paths } );
 				worst = Math.max( worst, dist( want, implicit.position ), dist( want, explicit.position ) );
 
 			}
@@ -670,5 +721,38 @@ test( 'curve cache: the kernel runs only when something changed', () => {
 	const forced = step( 100 );
 	assert.ok( forced >= 29 && forced <= 32, `${forced}` );
 	curves.dispose();
+
+} );
+
+test( 'strands: subdivided in the vertex stage, bounded by a vertex budget; close-up widths; device memory', () => {
+
+	// small graphs: 96 segments per edge from 32 cached ones, 80 from 20
+	assert.equal( strandSubdivision( 32, 254 ), 3 );
+	assert.equal( strandSubdivision( 20, 2492 ), 4 );
+	assert.equal( strandSubdivision( 40, 2492 ), 2, 'the sphere layout caches twice the samples' );
+	assert.equal( strandSubdivision( 96, 254 ), 1 );
+	// the draw stays below the vertex limit …
+	for ( const [ S, E ] of [ [ 20, 20000 ], [ 15, 40000 ], [ 12, 100000 ], [ 8, 384444 ], [ 32, 2000 ] ] ) {
+
+		const sub = strandSubdivision( S, E );
+		assert.ok( sub >= 1 && sub <= 4 );
+		if ( sub > 1 ) assert.ok( 2 * E * ( S * sub + 1 ) <= EDGE_DEFAULTS.strandVertexLimit, `${E} edges: ${2 * E * ( S * sub + 1 )} vertices` );
+
+	}
+
+	assert.equal( strandSubdivision( 20, 20000 ), 3 );
+	assert.equal( strandSubdivision( 15, 40000 ), 2 );
+	// … and never reduces what the cache has
+	assert.equal( strandSubdivision( 8, 384444 ), 1 );
+	assert.equal( strandSubdivision( 20, 2492, 1000 ), 1 );
+	// strands stay lines near the camera, tubes keep their body, hubs do not burn out
+	assert.equal( EDGE_DEFAULTS.maxPixelWidth, 8 );
+	assert.ok( LOOK_DEFAULTS.tubeMaxPixelWidth >= 16 );
+	assert.ok( LOOK_DEFAULTS.tubeGlow <= 0.8 && LOOK_DEFAULTS.tubeTaper > 0 && LOOK_DEFAULTS.tubeTaper < 1 );
+	assert.ok( LOOK_DEFAULTS.solidGlowThin > LOOK_DEFAULTS.solidGlow && LOOK_DEFAULTS.solidGlow >= 0.5 );
+	// the curve cache exists twice (GPU + three's CPU copy): a smaller budget on touch devices
+	assert.equal( autoCurveMemory( false ), 64 * 1024 * 1024 );
+	assert.equal( autoCurveMemory( true ), 24 * 1024 * 1024 );
+	assert.equal( EDGE_DEFAULTS.memoryBudget, null );
 
 } );

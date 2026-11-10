@@ -186,6 +186,12 @@ test( 'describeClustering: method, communities, levels, resolution, modularity',
 	assert.equal( describeClustering( { stats: { clusters: 1 }, D: 1, clustering: { method: 'leiden', resolution: 2, levels: 1, modularity: 0.4321 } } ), 'Leiden · 1 community · resolution 2 · modularity 0.43' );
 	assert.equal( describeClustering( { stats: { clusters: 1200 }, D: 3, meta: { hierarchy: { method: 'planted' } } } ), 'Planted communities · 1,200 communities · 3 levels' );
 	assert.equal( describeClustering( { stats: {}, D: 0 } ), '' );
+	// the data layer's count of the main level wins over the sum of all levels (stats.clusters),
+	// and the resolution it really used over the one that was asked for
+	assert.equal( describeClustering( { stats: { clusters: 18 }, D: 2, clustering: { method: 'file', communities: 6, mainLevel: 1, clustersPerLevel: [ 12, 6 ], modularity: 0.556 } } ),
+		'From the file · 6 communities (12 at the finest level) · 2 levels · modularity 0.56' );
+	assert.equal( describeClustering( { stats: { clusters: 14 }, D: 2, clustering: { method: 'leiden', communities: 8, mainLevel: 0, clustersPerLevel: [ 8, 6 ], resolution: 2.5, resolutionUsed: 2.378 } } ),
+		'Leiden · 8 communities · 2 levels · resolution 2.38' );
 
 } );
 
@@ -461,7 +467,7 @@ test( 'isTypingTarget: shortcuts stay quiet in text fields only', () => {
 
 test( 'looks: every look names known settings with valid values, and is recognised again', () => {
 
-	assert.deepEqual( LOOKS.map( ( l ) => l.label ), [ 'Aurora', 'Paper', 'Blueprint' ] );
+	assert.deepEqual( LOOKS.map( ( l ) => l.label ), [ 'Aurora', 'Classic', 'Blueprint' ] );
 	const d = settingDefaults();
 	for ( const key of LOOK_KEYS ) assert.ok( settingSpec( key ), key );
 	for ( const look of LOOKS ) {

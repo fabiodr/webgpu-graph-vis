@@ -47,7 +47,10 @@
 //    scene pass is smaller than the drawing buffer
 //
 // ─── Public API ─────────────────────────────────────────────────────────────────────────────
-//  app.gfx.config                 resolved configuration (see Quality.js), read only
+//  app.gfx.config                 resolved configuration (see Quality.js), read only. config.compat:
+//                                 the device runs three's compatibility mode, where only the 'low'
+//                                 chain is valid: every setting resolves to it (config.requested is
+//                                 what was asked for; gfxState.compat for the UI)
 //  app.gfx.tier / .setting        'low' | 'medium' | 'high' | 'ultra'  /  the setting incl. 'auto'
 //  app.gfx.setQuality( setting )  'auto' | tier name
 //  app.gfx.set( key, value )      effect switches and strengths; null = back to the tier default
@@ -104,7 +107,7 @@ import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { chromaticAberration } from 'three/addons/tsl/display/ChromaticAberrationNode.js';
 import { gfxUniforms, gfxState } from './shared.js';
 import { graphDof, normalizedDistance, sceneCoc } from './graphDof.js';
-import { resolveQuality, structureKey, autoTier, isSoftwareAdapter, normalizeSetting, Governor } from '../../app/Quality.js';
+import { TIER_ORDER, resolveQuality, structureKey, autoTier, autoCeiling, gpuClass, isSoftwareAdapter, normalizeSetting, Governor } from '../../app/Quality.js';
 
 /** settings.bloom → BloomNode strength. */
 const BLOOM_SCALE = 0.9;
@@ -392,6 +395,9 @@ export class RenderGraph {
 		this._autoTier = null;
 		this._values = { bloom: 0.8, aoStrength: 1, aoRadius: 3.5, bloomRadius: 0.4, toneMapping: 'neutral', ...( options.values || {} ) };
 		this._dynamic = 1; // governor factor on top of the cap
+		this._ceiling = 'high'; // the highest tier the governor may lift 'auto' to (autoCeiling)
+		this._demotedLoad = 0; // graph size ( N + E ) under which the governor last stepped the tier down
+		this._graphTime = - 1e9; // this._time at the last setGraph
 		const automated = typeof navigator !== 'undefined' && navigator.webdriver === true; // screenshots must not adapt
 		this.governor = new Governor( typeof options.governor === 'object' && options.governor ? options.governor : {} );
 		this.governor.enabled = options.governor === undefined || options.governor === null ? ! automated : !! options.governor;
@@ -439,6 +445,7 @@ export class RenderGraph {
 		setting = normalizeSetting( setting );
 		this._setting = setting;
 		this._autoTier = null; // 'auto' starts from the device again
+		this._demotedLoad = 0;
 		this._dynamic = 1;
 		this.governor.reset();
 		this.refresh();
@@ -514,6 +521,9 @@ export class RenderGraph {
 			coarsePointer: typeof matchMedia === 'function' && matchMedia( '(pointer:coarse)' ).matches,
 			smallScreen: Math.min( w, h ) < 600,
 			softwareAdapter: isSoftwareAdapter( app.adapterInfo ),
+			gpuClass: gpuClass( app.adapterInfo ),
+			// three's compatibility mode (a device without 'core-features-and-limits'): only 'low' is valid
+			compat: this.renderer.backend.compatibilityMode === true,
 			edges: app.graph ? app.graph.E : 0,
 			dpr: this.renderer.getPixelRatio(),
 			deviceDpr: hasWindow && window.devicePixelRatio > 0 ? window.devicePixelRatio : this.renderer.getPixelRatio(),
@@ -528,6 +538,7 @@ export class RenderGraph {
 		const env = this._env();
 		// 'auto' is decided once (and by the governor afterwards), not on every resize
 		if ( this._setting === 'auto' && this._autoTier === null ) this._autoTier = autoTier( env );
+		this._ceiling = autoCeiling( env );
 		return resolveQuality( this._setting, env, { ...this._overrides, tier: this._autoTier } );
 
 	}
@@ -615,6 +626,7 @@ export class RenderGraph {
 		gfxState.edgeLit = config.edges.lit;
 		gfxState.edgeTubes = config.edges.tubes;
 		gfxState.edgeDefocus = config.edges.defocus;
+		gfxState.compat = config.compat;
 
 		const S = this.stats;
 		S.tier = config.tier; S.setting = config.setting; S.renderScale = scale; S.capScale = config.capScale;
@@ -627,7 +639,8 @@ export class RenderGraph {
 	_configureGovernor() {
 
 		const c = this.config;
-		this.governor.configure( { tier: c.tier, explicit: c.explicit, scale: this.renderScale, maxScale: c.renderScale, dynamicResolution: c.dynamicResolution } );
+		// compatibility mode: 'low' is not a choice there, so nothing may be stepped
+		this.governor.configure( { tier: c.tier, explicit: c.explicit || c.compat, ceiling: this._ceiling, scale: this.renderScale, maxScale: c.renderScale, dynamicResolution: c.dynamicResolution } );
 
 	}
 
@@ -1047,7 +1060,12 @@ export class RenderGraph {
 		S.fps = app.fps; S.frameMs = app.frameMs; S.displayFps = this.governor.displayFps;
 		if ( this._capture && ! this._capture.started ) this._beginCapture( this._capture );
 
-		const action = this.governor.sample( frameMs, performance.now(), S.gpuMs );
+		// A load that will go away is not charged to the tier: the layout is moving nodes (its compute
+		// passes run inside the frame), or a graph was loaded a moment ago (pipelines compile, the
+		// layout starts hot). With GPU timings the headroom test looks at the render passes alone.
+		const buffers = app.buffers;
+		const transient = !! buffers && ( app.frame - buffers.moveFrame <= 2 || this._time - this._graphTime < 5 );
+		const action = this.governor.sample( frameMs, performance.now(), S.gpuMs, { transient, renderMs: S.gpuRenderMs } );
 		if ( action ) this._applyGovernor( action );
 
 		this._fitClipPlanes();
@@ -1103,6 +1121,8 @@ export class RenderGraph {
 
 		} else if ( action.type === 'tier' && this._setting === 'auto' ) {
 
+			// the load a step down was measured with: a much smaller graph starts from the device again
+			if ( TIER_ORDER.indexOf( action.tier ) < TIER_ORDER.indexOf( this.config.tier ) ) this._demotedLoad = this._load();
 			this._autoTier = action.tier;
 			this._dynamic = 1;
 			this.refresh();
@@ -1184,7 +1204,7 @@ export class RenderGraph {
 		// The readback follows the GPU by a few frames. Where there is none (App option readback:
 		// false) or it stopped coming, the sphere is that of the seed positions and says nothing
 		// about where the layout has gone since.
-		s.live = app.options.readback !== false && app.frame - s.latestFrame <= 60;
+		s.live = app.options.readback !== false && ( app.frame - s.latestFrame <= 60 || app.positionsCurrent === true ); // (the readback rests with the layout)
 		return s;
 
 	}
@@ -1333,12 +1353,31 @@ export class RenderGraph {
 
 	}
 
+	/** Size of the loaded graph as the governor sees it (nodes + edges). */
+	_load() {
+
+		const g = this.app.graph;
+		return g ? g.N + g.E : 0;
+
+	}
+
 	setGraph() {
 
 		this._sphere.graph = null;
 		this._focus.valid = false;
 		this._liveUntil = this.app.frame + 90;
-		this.governor.reset( false ); // another load: what was measured does not apply (the tier history does)
+		this._graphTime = this._time;
+		if ( this._demotedLoad > 0 && this._load() < 0.5 * this._demotedLoad ) {
+
+			// 'auto' was stepped down under a graph more than twice this size: that says nothing about
+			// this one. The device's own tier again, at full resolution, with a clean record
+			this._demotedLoad = 0;
+			this._autoTier = null;
+			this._dynamic = 1;
+			this.governor.reset();
+
+		} else this.governor.reset( false ); // another load: what was measured does not apply (the tier history does)
+
 		this.refresh(); // the medium tier depends on the edge count
 
 	}
@@ -1352,6 +1391,13 @@ export class RenderGraph {
 	 *   history converges, else 2), type = 'image/png', quality }
 	 * @returns {Promise<Blob>}
 	 */
+	/** True while a capture is pending or running (the drawing buffer is the capture's then). */
+	get capturing() {
+
+		return this._capture !== null;
+
+	}
+
 	capture( { scale = 2, maxSize = 4096, frames = null, type = 'image/png', quality } = {} ) {
 
 		if ( this._capture ) return this._capture.promise;
@@ -1362,6 +1408,7 @@ export class RenderGraph {
 
 		} );
 		this._capture = job;
+		this.app.wake?.();
 		return job.promise;
 
 	}
@@ -1393,13 +1440,15 @@ export class RenderGraph {
 
 	_finishCapture( job ) {
 
+		const app = this.app;
 		this._capture = null;
 		// same task as the render: the canvas still holds the frame
 		this.renderer.domElement.toBlob( ( blob ) => ( blob ? job.resolve( blob ) : job.reject( new Error( 'capture failed' ) ) ), job.type, job.quality );
 		this._overrides.scale = job.saved.scale;
 		this._dynamic = job.saved.dynamic;
 		this.governor.enabled = job.saved.governor;
-		this._setDrawingBuffer( job.ratio );
+		// the display's ratio as it is now (the window may have changed monitors meanwhile)
+		this._setDrawingBuffer( typeof app.pixelRatio === 'function' ? app.pixelRatio() : job.ratio );
 		// the resized canvas is empty: put the picture back before this frame is presented (the passes
 		// have run for this frame, so this only draws the output again, from the enlarged targets)
 		this.pipeline.render();

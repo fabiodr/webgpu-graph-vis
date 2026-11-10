@@ -16,9 +16,14 @@
 // links. The store is the only writer of that object: the panel, set( key, value ), the automatic
 // rules, a reset and the values that follow a module (follow) all go through it, so its listeners
 // hear every change. Every change ends in apply( key, value ), the one place that talks to the
-// modules. Modules that other
-// packages are still building are feature-detected (features()); their controls stay hidden
-// until the module is there.
+// modules. What a module offers is feature-detected (features()), so a dev page can run the shell
+// with stand-ins; a control stays hidden while its feature is missing.
+//
+// A setting also follows what happens outside the panel: the layout mode ("Radial from here" of
+// the node card and the palette call the layout directly; the 'layout' listener writes the mode
+// back, leaves the immersive view outside the sphere and weakens the bundling in the radial
+// layout), the paused state and the immersive view. A lost graphics device stops the frame loop
+// and puts a blocking message with a reload over the page (deviceLost).
 //
 // URL: ?ds=<dataset id> or #<dataset id>, ?layout=<mode>, ?autorotate=0|1, ?hint=0|1 (never /
 // always show the first-run hint), a share link's members (?s= settings, ?c= camera pose, ?x=
@@ -30,7 +35,8 @@
 //
 // window.__ui: { app, settings, store, set, layout, rig, interaction, panel, card, nodes, edges,
 // labels, gfx, data, env, field, lens, tools, explore, slots, hud, photo, help, share(),
-// features, refreshFeatures(), registerCommands() } for the dev pages and the console.
+// features, refreshFeatures(), registerCommands(), reset(), resetAll(), setLook(), deviceLost( info ) }
+// for the dev pages and the console.
 import './ui/ui.css';
 import { createApp } from './app/App.js';
 import { fetchManifest } from './data/load.js';
@@ -39,7 +45,7 @@ import { ForceLayout, LAYOUT_MODES } from './gpu/ForceLayout.js';
 import { NodeRenderer, NODE_LOOK } from './render/NodeRenderer.js';
 import { EdgeRenderer } from './render/EdgeRenderer.js';
 import { TextLabels } from './render/TextLabels.js';
-import { Background, ENV_PRESETS } from './render/Background.js';
+import { Environment, ENV_PRESETS } from './render/gfx/Environment.js';
 import { ClusterField } from './render/ClusterField.js';
 import { CameraRig } from './interact/CameraRig.js';
 import { Interaction } from './interact/Interaction.js';
@@ -56,6 +62,7 @@ import {
 import { Lens } from './analysis/Lens.js';
 import { Tools } from './analysis/Tools.js';
 import { installExplore } from './explore/index.js';
+import { communitySummary } from './explore/communities.js';
 import { hierarchicalPaths } from './graph/bundling.js';
 
 const params = new URLSearchParams( location.search );
@@ -70,6 +77,10 @@ const BASE_FORMATS = [
 ];
 const LAYOUT_PARAMS = [ 'clusterSeparation', 'cohesion', 'hubSpacing', 'layoutSize', 'repulsion', 'damping' ];
 const SHARE_KEYS = [ 'ds', 's', 'c', 'x' ]; // members of the address that name a view
+// In the radial layout the community centres all lie near the middle, so hierarchy bundles would
+// all cross there: the bundling strength is capped while that layout is on (the setting stays).
+const RADIAL_BUNDLING = 0.3;
+const LOST_KEY = 'wgv:lost'; // sessionStorage: automatic reloads after a lost graphics device
 
 function fail( title, detail ) {
 
@@ -150,13 +161,15 @@ async function main() {
 
 	const data = new DataClient();
 	const layout = app.use( new ForceLayout( { data, mode: settings.layoutMode, ...Object.fromEntries( LAYOUT_PARAMS.map( ( k ) => [ k, settings[ k ] ] ) ) } ) );
+	/** The bundling strength the edges get: none for straight edges, a weak one in the radial layout. */
+	const bundling = ( mode = settings.layoutMode ) => ( settings.bundleMode === 'straight' ? 0 : mode === 'radial' ? Math.min( settings.bundling, RADIAL_BUNDLING ) : settings.bundling );
 	const edges = app.use( new EdgeRenderer( {
-		beta: settings.bundleMode === 'straight' ? 0 : settings.bundling,
-		opacity: settings.edgeOpacity, width: settings.edgeWidth,
+		beta: bundling(),
+		opacity: settings.edgeOpacity, width: settings.edgeWidth, flow: settings.edgeFlow,
 		blendMode: settings.edgeBlend === 'auto' ? 'normal' : settings.edgeBlend, // 'auto' is decided per graph (applyEdgeBlend)
 	} ) );
 	const nodes = app.use( new NodeRenderer( { size: settings.nodeSize } ) );
-	const env = app.use( new Background( { preset: settings.theme } ) ); // the Environment: sky, key light, shadows, fog
+	const env = app.use( new Environment( { preset: settings.theme } ) ); // the Environment: sky, key light, shadows, fog
 	const field = app.use( new ClusterField( { strength: settings.fieldStrength } ) ); // soft glow volume per community
 	// GPU text in the overlay pass of the render graph: full resolution, after tone mapping, soft
 	// occlusion from the scene depth
@@ -328,8 +341,9 @@ async function main() {
 
 			case 'dataset': loadDataset( v, { user: true } ); break;
 			case 'layoutMode':
-				layout.setLayoutMode( v ); // the camera refits by itself (the rig listens to 'layout')
-				if ( v !== 'sphere' && settings.immersive ) set( 'immersive', false );
+				// the camera refits by itself (the rig listens to 'layout'); the 'layout' listener below
+				// leaves the immersive view and adapts the bundling, whoever changed the mode
+				layout.setLayoutMode( v );
 				break;
 			case 'running': v ? layout.resume() : layout.pause(); break;
 			case 'immersive': rig.setImmersive( v ); break;
@@ -340,7 +354,7 @@ async function main() {
 			case 'fieldStrength': if ( F.field ) field.strength = v; break;
 			case 'clusterLabels': if ( F.clusterLabels ) labels.clusterLabels = v; break;
 			case 'bundleMode': applyBundle(); break;
-			case 'bundling': if ( settings.bundleMode !== 'straight' ) edges.setBundling( v ); break;
+			case 'bundling': edges.setBundling( bundling() ); break;
 			case 'edgeStyle': applyEdgeStyle(); break;
 			case 'edgeFlow': if ( F.edgeFlow ) edges.flow = v; break;
 			case 'edgeOpacity': edges.opacity = v; break;
@@ -421,6 +435,24 @@ async function main() {
 
 	}
 
+	/** "Reset all settings", with a way back: the toast offers to undo it for a few seconds. */
+	function resetAll() {
+
+		const before = { ...settings }, chosen = [ ...store.touched ];
+		const changed = reset();
+		if ( ! changed.length && ! chosen.length ) return panel.toast( 'All settings are at their defaults already.', { type: 'info', duration: 3200 } );
+		panel.toast( 'All settings are back to their defaults.', {
+			type: 'info', duration: 8000,
+			action: { label: 'Undo', run: () => {
+
+				// what the person had chosen is chosen again; everything else follows by itself
+				for ( const key of chosen ) if ( key !== 'dataset' ) set( key, before[ key ] );
+
+			} },
+		} );
+
+	}
+
 	/** A whole look (LOOKS): every setting it names becomes the user's choice; what it leaves open goes back to the default, and to the automatic per-graph choice where there is one. */
 	function setLook( id ) {
 
@@ -438,17 +470,23 @@ async function main() {
 
 	}
 
-	/** Startup: the modules got most values through their constructors. The rest is applied only where it differs from what a module starts with, so the App's URL switches (?dof=0 …) survive. */
+	/**
+	 * Startup: the modules got most values through their constructors. The graphics values are
+	 * applied only where they differ from the schema default, so the App's URL switches (?dof=0 …)
+	 * survive; the others are applied whatever they are (a module's own default need not be ours).
+	 */
 	function applyInitial() {
 
 		const d = store.defaults;
 		if ( settings.theme !== d.theme || settings.nodeGloss !== d.nodeGloss || settings.nodeGlow !== d.nodeGlow ) applyLook();
 		if ( settings.keyLight !== d.keyLight || settings.envLight !== d.envLight || settings.fog !== d.fog ) applyLight();
-		for ( const key of [ 'exposure', 'aoStrength', 'grain', 'vignette', 'dynamicResolution', 'dof', 'edgeFlow', 'clusterLabels' ] ) {
+		for ( const key of [ 'exposure', 'aoStrength', 'grain', 'vignette', 'dynamicResolution', 'dof' ] ) {
 
 			if ( settings[ key ] !== d[ key ] ) apply( key, settings[ key ] );
 
 		}
+
+		for ( const key of [ 'edgeFlow', 'clusterLabels' ] ) apply( key, settings[ key ] );
 
 		gfx.set( 'bloom', settings.bloom );
 		if ( F.dust ) syncDust();
@@ -479,8 +517,10 @@ async function main() {
 
 	function describeGraph( g ) {
 
-		panel.setInfo( { clustering: { count: g.stats ? g.stats.clusters : 0, text: describeClustering( g ) } } );
-		panel.update( { nodes: g.N, edges: g.E, clusters: g.stats ? g.stats.clusters : undefined, levels: g.D }, { force: true } );
+		// one number everywhere: the communities of the level the legend, the drawer and the tour show
+		const { count } = communitySummary( g );
+		panel.setInfo( { clustering: { count, text: describeClustering( g ) } } );
+		panel.update( { nodes: g.N, edges: g.E, communities: g.D ? count : undefined, levels: g.D }, { force: true } );
 
 	}
 
@@ -653,7 +693,6 @@ async function main() {
 		const job = ++ reclusterJob;
 		reclusterPending = true;
 		const method = settings.clusterMethod;
-		const selected = interaction.selectedIndex;
 		const positions = app.positions ? app.positions.slice() : undefined; // the layout morphs from where the nodes are
 		try {
 
@@ -671,8 +710,23 @@ async function main() {
 			}
 
 			if ( job !== reclusterJob || ! r || r.cancelled ) return false;
+			// the nodes and the edges are the same: the selection, its neighbourhood and the path come
+			// back. A community focus does not (cluster indices belong to the old hierarchy).
+			const selected = interaction.selectedIndex;
+			let before = null;
+			try {
+
+				before = typeof explore.state === 'function' && typeof explore.restore === 'function' ? explore.state() : null;
+
+			} catch ( e ) {
+
+				console.warn( 'recluster: the explore state is not available', e );
+
+			}
+
 			showGraph( r.graph, {}, { keepView: true } );
-			if ( selected >= 0 && selected < r.graph.N ) interaction.select( selected );
+			if ( before ) explore.restore( { ...before, cluster: null } ).catch( ( e ) => console.warn( 'recluster: the explore state could not be restored', e ) );
+			else if ( selected >= 0 && selected < r.graph.N ) interaction.select( selected );
 			panel.setInfo( { recluster: null } );
 			app.events.dispatchEvent( new CustomEvent( 'recluster', { detail: { method, resolution: settings.clusterResolution, clustering: r.graph.clustering || null } } ) );
 			return true;
@@ -727,7 +781,7 @@ async function main() {
 		bundle.cancel();
 		bundle.waiting = false;
 		clearTimeout( bundle.timer );
-		edges.setBundling( mode === 'straight' ? 0 : settings.bundling );
+		edges.setBundling( bundling() );
 		if ( ! F.bundlePaths || ! app.graph ) return;
 		if ( mode !== 'paths' ) {
 
@@ -932,10 +986,7 @@ async function main() {
 				case 'open-file': openFile( payload ); break;
 				case 'look': setLook( payload ); break;
 				case 'reset-setting': reset( payload ); break;
-				case 'reset-all':
-					reset();
-					panel.toast( 'All settings are back to their defaults.', { type: 'info', duration: 3200 } );
-					break;
+				case 'reset-all': resetAll(); break;
 				case 'bundle-now': applyBundle( { now: true } ); break;
 				case 'bundle-cancel':
 					bundle.cancel();
@@ -954,6 +1005,8 @@ async function main() {
 
 		},
 	} );
+	// the panel comes first on screen (top left), so it comes first in the DOM and in the Tab order
+	slots.root.before( panel.root );
 	applyInsets( { animate: false } );
 	slots.setInsets( panel.insets() );
 	applyInitial();
@@ -1049,7 +1102,7 @@ async function main() {
 		add( 'status', 'Status chips on or off', () => set( 'showStatus', ! settings.showStatus ), { shortcut: 'H', keywords: 'fps frame rate hud' } );
 		if ( document.fullscreenEnabled ) add( 'fullscreen', 'Full screen on or off', fullscreen );
 		add( 'help', 'Shortcuts and gestures', () => help.show( true ), { shortcut: '?', keywords: 'keys keyboard' } );
-		add( 'reset', 'Reset all settings', () => reset(), { keywords: 'defaults' } );
+		add( 'reset', 'Reset all settings', () => resetAll(), { keywords: 'defaults' } );
 		return n;
 
 	}
@@ -1067,6 +1120,7 @@ async function main() {
 
 	};
 
+	let bundledFor = layout.layoutMode;
 	E.addEventListener( 'immersive', ( e ) => {
 
 		if ( settings.immersive !== e.detail.immersive ) follow( 'immersive', e.detail.immersive );
@@ -1075,6 +1129,24 @@ async function main() {
 	E.addEventListener( 'select', ( e ) => panel.setInfo( { selection: e.detail.index >= 0 } ) );
 	E.addEventListener( 'gfx', () => panel.setInfo( { quality: qualityInfo() } ) );
 	E.addEventListener( 'layout', ( e ) => {
+
+		// the mode can change without the panel (the card's and the palette's "Radial from here"):
+		// the setting follows, so the panel and a share link say what is on screen
+		const mode = e.detail.mode;
+		if ( mode && mode !== settings.layoutMode && settingSpec( 'layoutMode' ).options.some( ( o ) => o.value === mode ) ) {
+
+			follow( 'layoutMode', mode );
+			dropLink();
+
+		}
+
+		if ( mode && mode !== 'sphere' && settings.immersive ) set( 'immersive', false ); // only the sphere has an inside
+		if ( mode !== bundledFor ) {
+
+			bundledFor = mode;
+			edges.setBundling( bundling( mode ) );
+
+		}
 
 		panel.setInfo( { layout: layoutInfo() } );
 		// edge paths belong to one settled layout: route them again when it rests in a new place
@@ -1122,16 +1194,101 @@ async function main() {
 
 	} );
 	panel.setInfo( { quality: qualityInfo(), layout: layoutInfo() } );
-	app.renderer.backend?.device?.lost?.then( ( info ) => {
+	// ── a lost graphics device ────────────────────────────────────────────────────────────
+	// Routine on phones (a tab in the background under memory pressure), rare on desktops (driver
+	// update, GPU process crash, sleep). Nothing can be drawn or computed any more: the frame loop
+	// stops, and the page says so over everything with a way back. The way back is a reload into
+	// the same view (the share link of the moment; a file or a generated graph cannot be carried).
+	// A device lost while the tab was hidden is reloaded when the person returns, at most twice
+	// in a row (LOST_KEY in sessionStorage), so a device that keeps failing ends in the message.
+	let lost = false, shownAt = - Infinity;
+	document.addEventListener( 'visibilitychange', () => {
 
-		if ( info && info.reason === 'destroyed' ) return;
-		panel.toast( 'The graphics device was lost. Reload the page to continue.', { type: 'error', duration: 0 } );
+		if ( ! document.hidden ) shownAt = performance.now();
 
 	} );
+	const lostCount = () => {
+
+		try {
+
+			const c = JSON.parse( sessionStorage.getItem( LOST_KEY ) || 'null' );
+			return c && Date.now() - c.t < 120000 ? c.n | 0 : 0;
+
+		} catch ( _ ) {
+
+			return 0;
+
+		}
+
+	};
+
+	function deviceLost( info ) {
+
+		if ( lost || ( info && info.reason === 'destroyed' ) ) return false;
+		lost = true;
+		console.warn( 'the graphics device was lost', info && info.message ? info.message : '' );
+		let url = null;
+		try {
+
+			url = shareUrl();
+
+		} catch ( _ ) { /* the view cannot be described: a plain reload */ }
+
+		app.renderer.setAnimationLoop( null ); // no ticks, compute passes or readbacks against a dead device
+		if ( photo.active ) photo.exit();
+		const reload = ( automatic = false ) => {
+
+			if ( automatic ) {
+
+				try {
+
+					sessionStorage.setItem( LOST_KEY, JSON.stringify( { n: lostCount() + 1, t: Date.now() } ) );
+
+				} catch ( _ ) { /* no session storage: the reload still happens, once per return */ }
+
+			}
+
+			if ( url && url !== location.href ) location.replace( url );
+			else location.reload();
+
+		};
+
+		boot.classList.remove( 'hidden' );
+		boot.classList.add( 'blocking' );
+		boot.setAttribute( 'role', 'alertdialog' );
+		boot.setAttribute( 'aria-label', 'The graphics device was lost' );
+		boot.innerHTML = `<div class="msg"><h1>The graphics device was lost</h1><p>The browser took the GPU away from this page${document.hidden ? ' while it was in the background' : ''}. ${url ? 'Reloading brings this view back.' : 'Reloading starts the viewer again; a graph from a file or from the generator has to be opened again.'}</p><button type="button">Reload</button></div>`;
+		const button = boot.querySelector( 'button' );
+		button.addEventListener( 'click', () => reload() );
+		button.focus( { preventScroll: true } );
+		// lost in the background (browsers often report it only on the way back): nobody was looking,
+		// so the view comes back by itself
+		if ( lostCount() < 2 ) {
+
+			if ( document.hidden ) document.addEventListener( 'visibilitychange', () => ! document.hidden && reload( true ) );
+			else if ( performance.now() - shownAt < 3000 ) reload( true );
+
+		}
+
+		return true;
+
+	}
+
+	app.renderer.backend?.device?.lost?.then( deviceLost );
+	// a session that has run for a while is a healthy one: the next loss may reload by itself again
+	setTimeout( () => {
+
+		try {
+
+			if ( ! lost ) sessionStorage.removeItem( LOST_KEY );
+
+		} catch ( _ ) { /* no session storage */ }
+
+	}, 30000 );
 
 	window.__ui = {
 		app, settings, store, set, layout, rig, interaction, panel, card, nodes, edges, labels, gfx, data, env, field, lens, tools, explore, slots,
-		hud, photo, help, share, shareUrl, features: F, refreshFeatures, registerCommands, reset, setLook,
+		hud, photo, help, share, shareUrl, features: F, refreshFeatures, registerCommands, reset, resetAll, setLook, deviceLost,
 	};
 
 	// ── first graph ───────────────────────────────────────────────────────────────────────
@@ -1185,7 +1342,11 @@ async function main() {
 
 		}
 
-		if ( params.get( 'hint' ) !== '0' ) help.showHint( { force: params.get( 'hint' ) === '1' } );
+		// the hint is for an empty first view: a link that opens with a card, a path or the drawer
+		// has those where the hint would sit, and the visitor is already looking at something
+		const x = link.explore, busy = !! x && ( ( x.selection !== null && x.selection !== undefined ) || !! x.path || !! x.insights );
+		const hint = params.get( 'hint' );
+		if ( hint === '1' || ( hint !== '0' && ! busy ) ) help.showHint( { force: hint === '1' } );
 
 	}
 

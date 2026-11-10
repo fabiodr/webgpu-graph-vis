@@ -60,6 +60,7 @@ export const gfxState = {
 	edgeLit: false, // strands: analytic key-light shading
 	edgeTubes: false, // strands: real tubes for the highlighted ego network
 	edgeDefocus: false, // strands: analytic defocus (widen + fade by cocPixels)
+	compat: false, // WebGPU compatibility mode: every quality setting resolves to 'low' (Quality.js)
 };
 
 const _vp = /*@__PURE__*/ new Matrix4();

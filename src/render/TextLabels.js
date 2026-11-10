@@ -14,7 +14,8 @@
 //                     shrunken box, a hidden one with an inflated box, so labels do not flicker at
 //                     the overlap threshold). A decision runs every `interval` seconds while the
 //                     camera, the canvas size or the CONTENT of app.positions changes (a checksum:
-//                     the App reads back every frame, so positionsVersion alone never rests), and at
+//                     a readback can deliver the same positions again, e.g. the last ones before the
+//                     App lets the readback rest, so positionsVersion alone says too much), and at
 //                     once when the selection / hover / a setting changes. It only writes per-label
 //                     alpha end points; nothing is written or uploaded while nothing changes.
 //                     Text work is lazy: a candidate is first only MEASURED (segmentation + advance
@@ -78,12 +79,21 @@
 //   text     the data's name when it has one ( graph.clusterNames[ cluster ] ), else derived: the
 //            label of the member with the highest degree, followed by the member count in a lighter
 //            weight and opacity: "Valjean · 17" (communityNames() in Labels.js)
-//   place    centred on the LIVE centroid (buffers.clusterPos, read in the vertex stage; pushed out
-//            onto the sphere in the sphere layout), always on top: a name belongs to a region, not
-//            to a point in depth
-//   look     larger than node labels (clusterScale × 1…1.4 with the community's size), wider letter
-//            spacing, a light tint of the community's colour (the mean colour of its members, so it
-//            follows a colour lens), calmer opacity; fades back while a selection exists
+//   place    ABOVE its community, centred over the LIVE centroid (buffers.clusterPos, read in the
+//            vertex stage; pushed out onto the sphere in the sphere layout): the text sits
+//            `clusterPad` px above the top of the community's projected ball (the centroid is the
+//            densest spot of a community: a name printed there covers its hub and collides with
+//            the labels around it). The lift is the projected radius, computed in the vertex stage
+//            from the world radius of the last decision (1.29 rms radii), at most `clusterLiftMax`
+//            of the view's height and not past the top edge of the view. Always on top: a name belongs to a region, not to a point in depth
+//   look     its size follows the community on screen: `clusterNameSize` (0.22) × the projected
+//            radius, between `clusterNameMin` (11 CSS px) and the size it had before (clusterScale ×
+//            1…1.4 with the community's member count, × the node font), so the names of a graph
+//            that is small on screen are small captions instead of a layer of headlines. Wider
+//            letter spacing, a light tint of the community's colour (the mean colour of its
+//            members, so it follows a colour lens), calmer opacity; fades back while a selection
+//            exists. A community whose ball is below `clusterMinRadius` = [ 10, 18 ] CSS px fades
+//            out with its size (not with clusterLabels 'on')
 //   zoom     every community cross-fades on its own between its name and the labels of its nodes,
 //            driven by its projected size: t = communityFade(), the mean on-screen distance between
 //            neighbouring members (measured inside the finest communities, where the members
@@ -116,8 +126,8 @@
 //            node labels, then the receding names, which only take what is free. All with the
 //            same hysteresis; a name additionally keeps `clusterSpacing` (half its font size) of
 //            air to whatever is placed already.
-//  A second small instanced draw (a child of `mesh`, drawn before the node labels): 3 vertex storage
-//  buffers (clusterPos, the label records, the glyphs), the shared atlas, the same fragment stage.
+//  A second small instanced draw (a child of `mesh`, drawn before the node labels): 4 vertex storage
+//  buffers (clusterPos, the label records, the radii, the glyphs), the shared atlas, the same fragment stage.
 //  All names are laid out once per graph (≤ 48 names, a few hundred glyphs); the draw is skipped
 //  while no name is visible.
 //
@@ -145,6 +155,7 @@
 //  labels.maxZoomLabels = null | n     context labels the semantic zoom brings up in graphs beyond
 //                      autoMaxNodes (null = from the size of the view, see "zoom")
 //  labels.clusterText( cluster ) → the name shown for a community of the active level, or null
+//  labels.clusterBox( cluster ) → { x0, y0, x1, y1, font } (CSS px) of that name as placed, or null
 //  labels.clusterMesh  the second draw (a child of labels.mesh)
 //  labels.fontSize (CSS px, null = 11, 12 on coarse pointers) / fontFamily / fontWeight
 //  labels.depthTest, labels.setSceneDepth( node | null ), labels.output, labels.gain
@@ -156,7 +167,7 @@
 //  shadowBlur, shadowOpacity, shadowOffset, weight, weightPx, embolden, selScale, pad, snap, hint,
 //  depthFade, contextFade, onTop, depthBias, occlusionSoftness, gain, blendGamma; community names:
 //  clusterScale, clusterColor, clusterOpacity, clusterTint, clusterCount, clusterWeight,
-//  clusterFocusFade, clusterDepthFade.
+//  clusterFocusFade, clusterDepthFade, clusterNameSize, clusterNameMin, clusterPad, clusterLiftMax.
 //  labels.stats: { labels, clusters (names shown), zoomBudget (0 = not limited by it), glyphs,
 //                  clusterGlyphs, capacity, atlas, … }
 //  Not supported: orthographic cameras, logarithmic depth, more than one canvas per instance.
@@ -165,7 +176,7 @@
 import * as THREE from 'three/webgpu';
 import {
 	Fn, instanceIndex, positionGeometry, uniform, instancedArray, texture, varyingProperty, float, uint, vec2, vec3, vec4,
-	select, mix, clamp, max, min, floor, sqrt, pow, dot, step, smoothstep, fwidth, length,
+	select, mix, clamp, max, min, abs, floor, sqrt, pow, dot, step, smoothstep, fwidth, length,
 	cameraViewMatrix, cameraProjectionMatrix, cameraNear, cameraFar, screenSize, screenUV,
 	perspectiveDepthToViewZ, sRGBTransferOETF,
 } from 'three/tsl';
@@ -212,6 +223,7 @@ export class TextLabels {
 			maxLooseNames: 4, // names placed although they do not fit (the largest communities, see looseNameArea())
 			maxNamesInView: null, // names shown at once (null = by the size of the view, nameBudget())
 			clusterSpacing: 0.5, // free space a name keeps to what is placed already, in units of its font size
+			clusterMinRadius: [ 10, 18 ], // projected radius (CSS px) over which a community's name fades in
 			clusterMaxWidth: 0.3, // widest name as a share of the view's width (its font shrinks)
 			maxZoomLabels: null, // context labels the zoom brings up in graphs beyond autoMaxNodes (null = by the size of the view)
 			zoomSpacing: 5, // CSS px of free space a context label of the semantic zoom needs around it …
@@ -315,6 +327,10 @@ export class TextLabels {
 			clusterWeight: uniform( 0.007 ), // em added to the strokes of the name and taken from the count
 			clusterFocusFade: uniform( 0.6 ), // names lose this much while a selection exists
 			clusterDepthFade: uniform( 0.35 ), // far names keep 1 − clusterDepthFade of their opacity
+			clusterNameSize: uniform( 0.22 ), // font size of a name in projected radii of its community …
+			clusterNameMin: uniform( 11 ), // … at least this (CSS px), at most clusterScale × its scale × the node font
+			clusterPad: uniform( 4 ), // CSS px between the top of the community's ball and the name
+			clusterLiftMax: uniform( 0.28 ), // most lift of a name above its centroid, in view heights
 		};
 
 		this._geometry = quadGeometry();
@@ -1232,6 +1248,7 @@ export class TextLabels {
 			cl.weight = new Float32Array( cl.count ); // 0 = not a place (dispersed) or behind the camera
 			cl.spacing = new Float32Array( cl.count ); // world units: rms radius / √members of the finest communities
 			cl.radius = new Float32Array( cl.count ); // projected radius of the community, CSS px (1.29 × rms: the ball)
+			cl.world = new Float32Array( cl.count ); // … and in world units
 			cl.stats = null;
 			// the finest communities inside each community of the level (their member spacing is the one that counts)
 			cl.fineParent = null;
@@ -1297,6 +1314,12 @@ export class TextLabels {
 
 		}
 
+		// one record per name: ( world radius of the community, –, –, – ): the lift and the size of the
+		// name are projected from it in the vertex stage, so they follow the camera every frame
+		cl.geomNode = instancedArray( Math.max( 1, cl.K ), 'vec4' ).setName( 'clusterLabelGeom' );
+		cl.geom = cl.geomNode.value.array;
+		cl.geomDirty = false;
+
 		cl.built = true;
 		cl.colorVersion = - 1;
 		this._syncClusterColors();
@@ -1329,6 +1352,16 @@ export class TextLabels {
 			slot.shown = scale;
 			cl.S[ 8 * j + 3 ] = scale;
 			cl.stateDirty = true;
+
+		}
+
+		// world radius of every named community for the vertex stage (steps below 2 % are not uploaded)
+		for ( let j = 0; j < cl.K; j ++ ) {
+
+			const R = 1.29 * s.rms[ cl.slots[ j ].k ], was = cl.geom[ 4 * j ];
+			if ( Math.abs( R - was ) <= 0.02 * was ) continue;
+			cl.geom[ 4 * j ] = R;
+			cl.geomDirty = true;
 
 		}
 
@@ -1390,7 +1423,7 @@ export class TextLabels {
 			if ( ! ( cw > cam.near ) || s.size[ k ] === 0 ) {
 
 				cl.weight[ k ] = 0;
-				cl.fade[ k ] = cl.name[ k ] = cl.nodes[ k ] = cl.radius[ k ] = 0;
+				cl.fade[ k ] = cl.name[ k ] = cl.nodes[ k ] = cl.radius[ k ] = cl.world[ k ] = 0;
 				continue;
 
 			}
@@ -1398,6 +1431,7 @@ export class TextLabels {
 			cl.sx[ k ] = ( ( m[ 0 ] * x + m[ 4 ] * y + m[ 8 ] * z + m[ 12 ] ) / cw * 0.5 + 0.5 ) * W;
 			cl.sy[ k ] = ( 0.5 - ( m[ 1 ] * x + m[ 5 ] * y + m[ 9 ] * z + m[ 13 ] ) / cw * 0.5 ) * H;
 			cl.radius[ k ] = 1.29 * s.rms[ k ] * P11 * H * 0.5 / cw;
+			cl.world[ k ] = P11 * H * 0.5 / cw; // CSS px per world unit at the centroid
 			// projected spacing = 1.29 · ( rms / √n ) · √π · px per unit (a uniform ball of radius r has an rms radius of 0.775 r)
 			const rPx = 1.29 * ( sp[ k ] > 0 ? sp[ k ] : typical ) * P11 * H * 0.5 / cw;
 			const t = Math.round( communityFade( rPx, 1, { lo, hi } ) * 16 ) / 16;
@@ -1424,17 +1458,25 @@ export class TextLabels {
 		const size = fontPx * this.uniforms.clusterScale.value;
 		const fit = always ? 0 : this.options.clusterFit, air = this.options.clusterSpacing;
 		const most = always ? Infinity : this.options.maxNamesInView ?? nameBudget( W, H );
+		const U = this.uniforms, [ r0, r1 ] = this.options.clusterMinRadius;
+		const nameK = U.clusterNameSize.value, nameMin = U.clusterNameMin.value, pad = U.clusterPad.value, liftMax = U.clusterLiftMax.value * H;
 		let placed = 0;
 		for ( let j = 0; j < cl.K && cl.placed < most; j ++ ) {
 
 			const slot = cl.slots[ j ], k = slot.k;
 			if ( slot.gen === gen ) continue;
-			const alpha = Math.round( ( always ? 1 : cl.name[ k ] ) * cl.weight[ k ] * 16 ) / 16;
+			// the vertex stage works with the world radius of the last upload: the same value here
+			const rPx = cl.built ? cl.geom[ 4 * j ] * cl.world[ k ] : cl.radius[ k ];
+			// a community that is a dot on screen is not named (its name would be larger than itself)
+			const big = always || ! ( r1 > r0 ) ? 1 : smooth( ( rPx - r0 ) / ( r1 - r0 ) );
+			const alpha = Math.round( ( always ? 1 : cl.name[ k ] ) * cl.weight[ k ] * big * 16 ) / 16;
 			if ( alpha < 0.06 || ( always || cl.fade[ k ] <= 0.5 ) !== dominant ) continue;
-			const F = size * slot.shown;
+			// size and place as the vertex stage computes them (_buildClusterMaterial)
+			const F = Math.min( size * slot.shown, Math.max( nameMin, nameK * rPx ) );
 			const width = slot.widthEm * F;
 			const hw = width * 0.5 + 3, hh = F * 0.66;
-			const sx = cl.sx[ k ], sy = cl.sy[ k ];
+			// … but not out of the view's top edge while the centroid is inside it
+			const sx = cl.sx[ k ], sy = Math.max( cl.sy[ k ] - ( Math.min( rPx, liftMax ) + pad + 0.5 * F ), Math.min( cl.sy[ k ], 1.1 * F ) );
 			if ( sx + hw < 0 || sx - hw > W || sy + hh < 0 || sy - hh > H ) continue;
 			const was = cl.S[ 8 * j + 1 ] > 0;
 			// a name sits on what it names; of those that are wider than their community only the
@@ -1451,6 +1493,7 @@ export class TextLabels {
 			const h = ( was ? - hyst : hyst ) + air * F;
 			if ( ! grid.free( sx - hw - h, sy - hh - h * 0.5, sx + hw + h, sy + hh + h * 0.5 ) ) continue;
 			grid.insert( sx - hw, sy - hh, sx + hw, sy + hh );
+			slot.box = [ sx - hw, sy - hh, sx + hw, sy + hh, F ];
 			if ( loose ) {
 
 				cl.loose ++;
@@ -1496,6 +1539,20 @@ export class TextLabels {
 		T[ o + 1 ] = alpha;
 		T[ o + 2 ] = now;
 		cl.stateDirty = true;
+
+	}
+
+	/**
+	 * Where the last decision placed the name of community `cluster` (an index of the active level):
+	 * { x0, y0, x1, y1 } in CSS px (y down) and its font size, or null while it is not shown.
+	 */
+	clusterBox( cluster ) {
+
+		const cl = this._cl;
+		const j = cl && cl.built ? cl.slots.findIndex( ( s ) => s.cluster === cluster ) : - 1;
+		if ( j < 0 || ! ( cl.S[ 8 * j + 1 ] > 0 ) || ! cl.slots[ j ].box ) return null;
+		const [ x0, y0, x1, y1, font ] = cl.slots[ j ].box;
+		return { x0, y0, x1, y1, font };
 
 	}
 
@@ -1555,6 +1612,7 @@ export class TextLabels {
 
 			cl.glyphNode.value.dispose();
 			cl.stateNode.value.dispose();
+			cl.geomNode.value.dispose();
 
 		}
 
@@ -1615,7 +1673,7 @@ export class TextLabels {
 		let changed = false;
 		if ( this._lastPositions !== app.positionsVersion ) {
 
-			// the readback runs every frame even when the layout is asleep: compare the content
+			// a readback can deliver unchanged positions ( a sleeping layout ): compare the content
 			this._lastPositions = app.positionsVersion;
 			const p = app.positions;
 			let sum = 0;
@@ -1746,6 +1804,14 @@ export class TextLabels {
 
 				cl.stateNode.value.needsUpdate = true;
 				cl.stateDirty = false;
+				this.stats.uploads ++;
+
+			}
+
+			if ( cl.geomDirty ) {
+
+				cl.geomNode.value.needsUpdate = true;
+				cl.geomDirty = false;
 				this.stats.uploads ++;
 
 			}
@@ -2003,11 +2069,11 @@ export class TextLabels {
 
 	}
 
-	/** The community names: the node labels' vertex stage without a node (centred text on clusterPos). */
+	/** The community names: the node labels' vertex stage without a node (centred text above clusterPos). */
 	_buildClusterMaterial( cl ) {
 
 		const U = this.uniforms, buffers = this.buffers, BU = buffers.uniforms;
-		const glyphs = cl.glyphNode, records = cl.stateNode;
+		const glyphs = cl.glyphNode, records = cl.stateNode, geom = cl.geomNode;
 		const atlas = this.atlas;
 		const S = atlas.size, BUF = atlas.buffer, REACH = atlas.edge * atlas.radius;
 		const srgb = this._output === 'srgb';
@@ -2059,13 +2125,19 @@ export class TextLabels {
 				.mul( float( 1 ).sub( U.clusterFocusFade.mul( BU.focus ) ) ).toVar( 'nAlpha' );
 
 			const css = screenSize.y.div( U.cssHeight ).toVar( 'nCss' );
-			const F = U.fontSize.mul( css ).mul( U.clusterScale ).mul( lab.w ).toVar( 'nF' ); // target px per em
+			const clipC = cameraProjectionMatrix.mul( vec4( center, 1 ) ).toVar( 'nClip' );
+			// the community's ball on screen (CSS px): the name is sized by it and sits above it
+			// (the CPU twin of both is in _placeClusters)
+			const rCss = geom.element( slot ).x.mul( abs( cameraProjectionMatrix.element( 1 ).element( 1 ) ) ).mul( U.cssHeight ).mul( 0.5 ).div( max( clipC.w, 1e-4 ) ).toVar( 'nBall' );
+			const Fcss = min( U.fontSize.mul( U.clusterScale ).mul( lab.w ), max( U.clusterNameMin, rCss.mul( U.clusterNameSize ) ) ).toVar( 'nFcss' );
+			const F = Fcss.mul( css ).toVar( 'nF' ); // target px per em
 			const xh = U.xHeight.mul( F );
 			const hintY = mix( float( 1 ), max( floor( xh.add( 0.5 ) ), 1 ).div( xh ), U.hint.mul( smoothstep( 24, 40, F ).oneMinus() ) );
 
-			const clipC = cameraProjectionMatrix.mul( vec4( center, 1 ) ).toVar( 'nClip' );
 			const sp = clipC.xy.div( clipC.w ).mul( 0.5 ).add( 0.5 ).mul( screenSize );
-			const oy = sp.y.sub( U.baseline.mul( F ) );
+			const lift = min( rCss, U.cssHeight.mul( U.clusterLiftMax ) ).add( U.clusterPad ).add( Fcss.mul( 0.5 ) ).mul( css );
+			// (kept inside the top edge of the view while the centroid is)
+			const oy = min( sp.y.add( lift ), max( sp.y, screenSize.y.sub( F.mul( 1.1 ) ) ) ).sub( U.baseline.mul( F ) );
 			const origin = vec2( mix( sp.x, floor( sp.x.add( 0.5 ) ), U.snap ), mix( oy, floor( oy.add( 0.5 ) ), U.snap ) );
 
 			const tpp = float( S ).div( F ).toVar( 'nTpp' );

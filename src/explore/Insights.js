@@ -58,7 +58,7 @@ export class Insights {
 		this._allCommunities = false;
 		this._communities = null;
 		this._build();
-		slots.topRight.append( this.button );
+		slots.topRight.prepend( this.button ); // first on screen ( CSS order 0 ), first in the Tab order
 		slots.right.prepend( this.el );
 
 		this._onGraph = () => {

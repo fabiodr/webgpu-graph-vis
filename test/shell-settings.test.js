@@ -481,6 +481,8 @@ test( 'automatic per-graph choices', () => {
 	const g = ( E, clusters ) => ( { E, stats: { clusters } } );
 	assert.deepEqual( autoChoices( g( 254, 6 ), { tubes: true } ), { edgeBlend: 'normal', edgeStyle: 'luminous', fieldStrength: 0.5 } );
 	assert.equal( autoChoices( g( AUTO.additiveEdges + 1, 40 ) ).edgeBlend, 'additive' );
+	assert.equal( autoChoices( g( 39817, 40 ) ).edgeBlend, 'normal', 'tens of thousands of additive strands wash the picture out' );
+	assert.equal( autoChoices( { E: 500, stats: { clusters: 18 }, clustering: { communities: 2, mainLevel: 1 } } ).fieldStrength, 0, 'the communities of the main level count, not all levels' );
 	assert.equal( autoChoices( g( 78, 4 ), { tubes: true } ).edgeStyle, 'solid' );
 	assert.equal( autoChoices( g( 78, 4 ), { tubes: false } ).edgeStyle, 'luminous', 'no tubes in this tier' );
 	assert.equal( autoChoices( g( 500, 1 ) ).fieldStrength, 0 );

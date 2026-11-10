@@ -1,6 +1,6 @@
 // Settings model of the app shell: ONE schema that declares every setting, a store with the
 // "touched by the user" rule and versioned persistence, and the compact URL codec of share links.
-// Pure logic: no DOM, no three.js; storage and URL parameters are passed in, so everything here
+// Pure logic: no DOM, no three.js (its one import, explore/communities.js, is pure too); storage and URL parameters are passed in, so everything here
 // runs under node:test (test/shell-settings.test.js).
 //
 // ─── Schema ─────────────────────────────────────────────────────────────────────────────────
@@ -66,7 +66,7 @@
 //
 // ─── Per-graph automatic choices ────────────────────────────────────────────────────────────
 //  autoChoices( graph, { tubes } ) -> { edgeBlend, edgeStyle, fieldStrength }: additive strands
-//  for dense graphs, solid tubes for tiny ones (only where the tier draws tubes), no community
+//  for very large graphs, solid tubes for tiny ones (only where the tier draws tubes), no community
 //  field where there are no communities. Edge blend and edge style have an explicit 'auto' value
 //  that stands for this choice (so a person can always hand the setting back); the field strength
 //  is a number and follows the `auto` rule of the store instead.
@@ -74,6 +74,8 @@
 //  turns on, in plain words. describeClustering( graph ) -> one line about the hierarchy in use.
 //  deferredStorage( storage, delay ) -> a storage that writes after a pause (with flush()), so
 //  dragging a slider does not write on every frame.
+
+import { communitySummary } from '../explore/communities.js';
 
 export const SETTINGS_VERSION = 2;
 export const STORAGE_KEY = 'wgv:settings';
@@ -86,7 +88,7 @@ export const SECTIONS = [
 	{ id: 'edges', title: 'Edges' },
 	{ id: 'nodes', title: 'Nodes and labels' },
 	{ id: 'scene', title: 'Scene' },
-	{ id: 'camera', title: 'Camera and lens' },
+	{ id: 'camera', title: 'Camera and focus' },
 	{ id: 'quality', title: 'Quality' },
 ];
 
@@ -118,7 +120,7 @@ export const SETTINGS = [
 		hint: 'Friction of the simulation' },
 
 	// ── communities ──
-	{ key: 'clusterMethod', type: 'enum', default: 'default', section: 'communities', label: 'Clustering', code: 'cm', save: false, needs: 'recluster',
+	{ key: 'clusterMethod', type: 'enum', default: 'default', section: 'communities', label: 'Method', code: 'cm', save: false, needs: 'recluster',
 		options: opts( [ 'default', 'Original' ], 'louvain', 'leiden' ), hint: 'Original: the communities the graph came with' },
 	{ key: 'clusterResolution', type: 'number', default: 1, min: 0.25, max: 4, step: 0.05, log: true, section: 'communities', label: 'Resolution', code: 'cr', save: false,
 		needs: 'recluster', hint: 'Larger values give more, smaller communities', visible: ( s ) => s.clusterMethod !== 'default' },
@@ -140,7 +142,7 @@ export const SETTINGS = [
 	{ key: 'edgeOpacity', type: 'number', default: 1, min: 0, max: 1, step: 0.01, section: 'edges', advanced: true, label: 'Opacity', code: 'eo' },
 	{ key: 'edgeWidth', type: 'number', default: 1, min: 0.25, max: 4, step: 0.05, section: 'edges', advanced: true, label: 'Width', code: 'ew', format: times },
 	{ key: 'edgeBlend', type: 'enum', default: 'auto', section: 'edges', advanced: true, label: 'Blend', code: 'eb',
-		options: opts( 'auto', 'normal', 'additive' ), hint: 'Additive strands glow where they are dense. Auto: additive on large graphs' },
+		options: opts( 'auto', 'normal', 'additive' ), hint: 'Additive strands glow where they are dense. Auto: additive on very large graphs only' },
 
 	// ── nodes and labels ──
 	{ key: 'nodeSize', type: 'number', default: 1, min: 0.25, max: 4, step: 0.05, section: 'nodes', label: 'Size', code: 'ns', format: times },
@@ -149,7 +151,9 @@ export const SETTINGS = [
 		hint: 'Matte to mirror-like; 1 is the look of the theme' },
 	{ key: 'nodeGlow', type: 'number', default: 1, min: 0, max: 2, step: 0.02, section: 'nodes', label: 'Glow', code: 'nw', format: times, needs: 'nodeLook',
 		hint: 'Emissive core of the nodes; 1 is the look of the theme' },
-	{ key: 'palette', type: 'enum', default: 'paper', section: 'nodes', label: 'Palette', code: 'pl', options: opts( 'paper', 'rainbow', 'aurora', 'ember' ) },
+	{ key: 'palette', type: 'enum', default: 'paper', section: 'nodes', label: 'Palette', code: 'pl',
+		// 'paper' is the palette of the paper; it is called Spectrum, as a look and a theme carry names too
+		options: opts( [ 'paper', 'Spectrum' ], 'rainbow', 'aurora', 'ember' ) },
 
 	// ── scene ──
 	{ key: 'theme', type: 'enum', default: 'aurora', section: 'scene', label: 'Theme', code: 'th', needs: 'env', options: opts( 'aurora', 'studio', 'void' ) },
@@ -158,7 +162,7 @@ export const SETTINGS = [
 	{ key: 'fog', type: 'number', default: 1, min: 0, max: 2, step: 0.02, section: 'scene', label: 'Fog', code: 'fg', format: times, needs: 'env' },
 	{ key: 'dust', type: 'number', default: 0.5, min: 0, max: 1, step: 0.01, section: 'scene', label: 'Depth motes', code: 'du', format: percent, needs: 'dust' },
 
-	// ── camera and lens ──
+	// ── camera and focus ──
 	{ key: 'autoRotate', type: 'bool', default: true, section: 'camera', label: 'Auto-rotate', code: 'ar', hint: 'A slow turn while idle; after a minute it becomes a drift with a focus pull' },
 	{ key: 'dof', type: 'enum', default: 'auto', section: 'camera', label: 'Depth of field', code: 'df', options: opts( 'auto', 'off', 'on' ),
 		hint: 'Auto follows the quality tier' },
@@ -709,7 +713,10 @@ export function parseLegacyParams( params, hash = '' ) {
 // ── per-graph automatic choices, tier description ──────────────────────────────────────────
 
 export const AUTO = {
-	additiveEdges: 20000, // above this edge count strands read better additive (glow)
+	// above this edge count strands are drawn additive (glow). Additive strands add up without a
+	// bound and feed the bloom: at tens of thousands of edges they wash the picture out, so the
+	// automatic choice keeps them for graphs whose single strands are nearly invisible
+	additiveEdges: 150000,
 	solidEdges: 120, // up to this edge count every edge may be a solid tube (style 'auto')
 	fieldMinClusters: 3, // fewer communities than this: no community field
 };
@@ -717,7 +724,7 @@ export const AUTO = {
 export function autoChoices( graph, { tubes = false, fieldDefault = 0.5 } = {} ) {
 
 	const E = graph ? graph.E | 0 : 0;
-	const clusters = graph && graph.stats ? graph.stats.clusters | 0 : 0;
+	const clusters = communitySummary( graph ).count;
 	return {
 		edgeBlend: E > AUTO.additiveEdges ? 'additive' : 'normal',
 		edgeStyle: tubes && E > 0 && E <= AUTO.solidEdges ? 'solid' : 'luminous',
@@ -732,13 +739,13 @@ export function autoChoices( graph, { tubes = false, fieldDefault = 0.5 } = {} )
 export const LOOK_KEYS = [ 'theme', 'palette', 'edgeStyle', 'edgeBlend', 'bloom', 'nodeGloss', 'nodeGlow', 'fog', 'dof', 'grain', 'vignette' ];
 
 /**
- * Looks: one choice that sets the theme, the palette, the edge style and the lens together.
+ * Looks: one choice that sets the theme, the palette, the edge style and the camera effects together.
  * `values` names what differs from the defaults; a key a look does not name goes back to its
  * default, which for the edge blend and the edge style is 'auto', the per-graph choice.
  */
 export const LOOKS = [
 	{ value: 'aurora', label: 'Aurora', hint: 'The lit default: soft sky, glossy nodes', values: {} },
-	{ value: 'paper', label: 'Paper', hint: 'As in the paper: black ground, additive glow',
+	{ value: 'paper', label: 'Classic', hint: 'As in the paper: black ground, additive glow',
 		values: { theme: 'void', edgeStyle: 'luminous', edgeBlend: 'additive', bloom: 1.2, nodeGloss: 0.6, nodeGlow: 1.5, dof: 'off', vignette: false } },
 	{ value: 'blueprint', label: 'Blueprint', hint: 'A technical drawing: cool, crisp, little glow',
 		values: { theme: 'studio', palette: 'aurora', edgeBlend: 'normal', bloom: 0.25, nodeGloss: 1.3, nodeGlow: 0.5, fog: 0.4, dof: 'off', grain: false } },
@@ -814,12 +821,15 @@ export function describeClustering( graph ) {
 	const method = String( ( c && c.method ) || ( h && h.method ) || '' ).split( /[\s(,;]/ )[ 0 ];
 	const parts = [];
 	if ( method ) parts.push( names[ method.toLowerCase() ] || method[ 0 ].toUpperCase() + method.slice( 1 ) );
-	const count = graph.stats ? graph.stats.clusters | 0 : 0;
-	if ( count ) parts.push( `${count.toLocaleString( 'en-US' )} ${count === 1 ? 'community' : 'communities'}` );
+	// the same number as the legend and the insights drawer (communitySummary), not the sum of all levels
+	const { count, finest } = communitySummary( graph );
+	if ( count ) parts.push( `${count.toLocaleString( 'en-US' )} ${count === 1 ? 'community' : 'communities'}${finest > count ? ` (${finest.toLocaleString( 'en-US' )} at the finest level)` : ''}` );
 	const levels = ( c && c.levels ) || graph.D || 0;
 	const n = Array.isArray( levels ) ? levels.length : levels | 0;
 	if ( n > 1 ) parts.push( `${n} levels` );
-	if ( c && Number.isFinite( c.resolution ) && Math.abs( c.resolution - 1 ) > 1e-6 ) parts.push( `resolution ${+ c.resolution.toFixed( 2 )}` );
+	// the data layer moves the resolution on a grid: say the one that was used
+	const res = c ? ( Number.isFinite( c.resolutionUsed ) ? c.resolutionUsed : c.resolution ) : NaN;
+	if ( Number.isFinite( res ) && Math.abs( res - 1 ) > 1e-6 ) parts.push( `resolution ${+ res.toFixed( 2 )}` );
 	const q = c && Number.isFinite( c.modularity ) ? c.modularity : null;
 	if ( q !== null ) parts.push( `modularity ${q.toFixed( 2 )}` );
 	return parts.join( ' · ' );

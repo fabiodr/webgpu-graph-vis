@@ -22,10 +22,10 @@
 // scene
 //   ?nodes=debug|real|mesh|off   debug sprites (default), NodeRenderer, lit instanced spheres (static), none
 //   ?layout=1                 live ForceLayout (default: static positions; the page then stamps moveFrame)
-//   ?post=1 ?bg=1             PostFX (bloom, tone mapping) and Background as in the app
+//   ?post=1 ?bg=1             the 'high' chain of the render graph (bloom, tone mapping) and the Environment as in the app
 //   ?mode=sphere ?blend=0.5 ?cam=inside   paper sphere layout (static: nodePos = sphereDir · R), partial blend
-//   ?env=1                    key DirectionalLight with shadows + procedural environment (lit tubes)
-//   ?light=3 ?envint=0.6 ?floor=1   light intensity, environment intensity, a matte floor that receives shadows
+//   ?env=1                    the Environment module: key light with shadows + procedural environment (lit tubes)
+//   ?floor=1                  with env=1: a matte floor that receives shadows
 //   ?zoom=1 ?az=0 ?el=0       camera distance multiplier, azimuth / elevation in degrees
 //   ?look=<node>|max ?dist=0.5   aim at a node from dist · R (close-ups)
 //   ?spin=0.5                 orbit by this many degrees per frame (motion vectors)
@@ -175,15 +175,16 @@ try {
 
 	if ( num( 'bg', 0 ) === 1 ) {
 
-		const { Background } = await import( '../src/render/Background.js' );
-		app.use( new Background() );
+		const { Environment } = await import( '../src/render/gfx/Environment.js' );
+		app.use( new Environment() );
 
 	}
 
 	if ( num( 'post', 0 ) === 1 && ! useVelocity ) {
 
-		const { PostFX } = await import( '../src/render/PostFX.js' );
-		app.use( new PostFX( { bloom: num( 'bloom', 0.8 ), quality: 'high' } ) );
+		// the render graph owns the post chain: bloom strength and tier
+		app.gfx.set( 'bloom', num( 'bloom', 0.8 ) );
+		if ( app.gfx.setting !== 'high' ) app.gfx.setQuality( 'high' );
 
 	}
 
@@ -468,47 +469,17 @@ try {
 	app.controls.update();
 	applyFx();
 
-	// ── lights (?env=1): what the Environment module of the app provides ──
-	let light = null;
+	// ── lights (?env=1): the Environment module of the app (key light, shadows on demand, IBL) ──
 	if ( num( 'env', 0 ) === 1 ) {
 
-		const { createEnvironment } = await import( './spikes/lighting-env.js' );
-		const env = createEnvironment( app.renderer );
-		app.scene.environment = env.texture;
-		app.scene.environmentIntensity = num( 'envint', 0.6 );
-		app.renderer.shadowMap.enabled = true;
-		app.renderer.shadowMap.type = THREE.PCFShadowMap;
-		const dir = gfxUniforms.keyDir.value.clone().normalize();
-		light = new THREE.DirectionalLight( 0xfff0dd, num( 'light', 3 ) );
-		light.castShadow = true;
-		light.shadow.mapSize.set( 2048, 2048 );
-		const sphere = mode === 'sphere' ? new THREE.Sphere( new THREE.Vector3(), R * 1.6 ) : app.boundingSphere();
-		const r = sphere.radius * 1.25;
-		light.target.position.copy( sphere.center );
-		light.position.copy( sphere.center ).addScaledVector( dir, 2 * r );
-		const cam = light.shadow.camera;
-		cam.left = - r; cam.right = r; cam.top = r; cam.bottom = - r; cam.near = r * 0.5; cam.far = 3.5 * r;
-		cam.updateProjectionMatrix();
-		light.shadow.bias = - 0.0006;
-		light.shadow.normalBias = ( 2 * r / 2048 ) * 0.6;
-		light.shadow.radius = 2;
-		light.shadow.autoUpdate = false; // on demand, as the app does: the edge renderer asks for updates
-		light.shadow.needsUpdate = true;
-		app.scene.add( light, light.target );
-		window.__light = light;
-		let shadowRenders = 0;
-		const updateMatrices = light.shadow.updateMatrices.bind( light.shadow );
-		light.shadow.updateMatrices = ( l ) => {
-
-			shadowRenders ++;
-			updateMatrices( l );
-
-		};
-
-		window.__shadowRenders = () => shadowRenders;
-
+		const { Environment } = await import( '../src/render/gfx/Environment.js' );
+		const env = app.modules.find( ( m ) => m.isEnvironment ) || app.use( new Environment() );
+		window.__env = env;
+		window.__shadowRenders = () => env.stats.shadowRenders;
 		if ( num( 'floor', 0 ) === 1 ) {
 
+			const sphere = mode === 'sphere' ? new THREE.Sphere( new THREE.Vector3(), R * 1.6 ) : app.boundingSphere();
+			const r = sphere.radius * 1.25;
 			const floor = new THREE.Mesh( new THREE.PlaneGeometry( 6 * r, 6 * r ), new THREE.MeshStandardNodeMaterial( { color: 0x1a1d26, roughness: 0.9, metalness: 0 } ) );
 			floor.rotation.x = - Math.PI / 2;
 			floor.position.copy( sphere.center ).y -= sphere.radius * num( 'floory', 0.75 );
@@ -568,7 +539,7 @@ try {
 		const nodePos = buffers.nodePos.value.array, clusterPos = buffers.clusterPos.value.array;
 		const U = buffers.uniforms;
 		const opts = {
-			paths: curves.paths, beta: curves.uniforms.beta.value, layoutBlend: U.layoutBlend.value, sphereRadius: U.sphereRadius.value,
+			paths: curves.paths, beta: curves.uniforms.beta.value, unhook: curves.uniforms.unhook.value, layoutBlend: U.layoutBlend.value, sphereRadius: U.sphereRadius.value,
 			levelOffset: U.levelOffset.value, levelScale: U.levelScale.value, levelExponent: U.levelExponent.value,
 			center: U.graphCenter.value.toArray(), sphereAxis: curves.uniforms.sphereAxis.value.toArray(), highlightLevel: curves.uniforms.highlightLevel.value,
 		};

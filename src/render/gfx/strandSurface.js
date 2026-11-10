@@ -4,6 +4,9 @@
 // ─── Strand shading ─────────────────────────────────────────────────────────────────────────
 //    lmsRoot( rgb ), lmsRootToLinear( q )   linear sRGB ↔ cube-root LMS. OKLab is a linear map of
 //                                the latter, so a linear blend of lmsRoot values IS the OKLab blend
+//    gradientColor( a, b, t, restore )   OKLab blend of two linear colours whose chroma is pushed
+//                                back toward the mix of the two end chromas (no grey middle
+//                                between hues that lie far apart)
 //    strandLight( T, V, o )      analytic light on a strand much thinner than a pixel, no texture
 //                                taps: Lambert averaged over the visible half of a cylinder, a
 //                                Kajiya-Kay highlight around the tangent, hemisphere ambient; all
@@ -12,7 +15,7 @@
 //    tubeFrame( viewPos, tangent, signedPx, halfPx, radius )   per-fragment cylinder frame of a
 //                                screen-space ribbon: { V, T, front, normal, hit, edge }
 //    flowPulse( arc, seed, o )   travelling energy pulses along the arc length
-import { float, vec3, select, clamp, max, abs, sqrt, pow, dot, cross, normalize, mix, exp, fract } from 'three/tsl';
+import { float, vec2, vec3, select, clamp, max, abs, sqrt, pow, dot, cross, normalize, mix, exp, fract, length } from 'three/tsl';
 import { gfxUniforms } from './shared.js';
 import { viewRay } from './impostor.js';
 
@@ -38,6 +41,40 @@ export const lmsRootToLinear = ( q ) => {
 		dot( c, vec3( - 1.2684380046, 2.6097574011, - 0.3413193965 ) ),
 		dot( c, vec3( - 0.0041960863, - 0.7034186147, 1.7076147010 ) ),
 	), vec3( 0 ) );
+
+};
+
+/** The a and b axes of OKLab from cube-root LMS. */
+const oklabAB = ( q ) => vec2(
+	dot( q, vec3( 1.9779984951, - 2.4285922050, 0.4505937099 ) ),
+	dot( q, vec3( 0.0259040371, 0.7827717662, - 0.8086757660 ) ),
+);
+
+/** Largest factor by which gradientColor() raises the chroma of a blend. */
+export const CHROMA_GAIN_MAX = 2.5;
+
+/**
+ * Gradient colour between two linear sRGB colours at t: the OKLab blend, with its chroma moved by
+ * `restore` (0..1) toward the mix of the two end chromas. A straight line through OKLab between
+ * two saturated hues passes close to the grey axis (orange → cyan turns grey-white in the middle);
+ * scaling ( a, b ) keeps the hue and the lightness of the blend and gives the saturation back. The
+ * factor is limited to CHROMA_GAIN_MAX (exactly opposite hues have no hue in the middle to amplify)
+ * and never lowers the chroma.
+ */
+export const gradientColor = ( colorA, colorB, t, restore = float( 1 ) ) => {
+
+	const qA = lmsRoot( colorA ).toVar(), qB = lmsRoot( colorB ).toVar();
+	const q = mix( qA, qB, t ).toVar();
+	const ab = oklabAB( q ).toVar();
+	const wanted = mix( length( oklabAB( qA ) ), length( oklabAB( qB ) ), t );
+	const gain = clamp( wanted.div( max( length( ab ), 1e-4 ) ), 1, CHROMA_GAIN_MAX );
+	const d = ab.mul( mix( float( 1 ), gain, restore ).sub( 1 ) ); // what is added to ( a, b ); L stays
+	// OKLab → cube-root LMS is linear: only the change has to be mapped back
+	return lmsRootToLinear( q.add( vec3(
+		d.x.mul( 0.3963377774 ).add( d.y.mul( 0.2158037573 ) ),
+		d.x.mul( - 0.1055613458 ).add( d.y.mul( - 0.0638541728 ) ),
+		d.x.mul( - 0.0894841775 ).add( d.y.mul( - 1.2914855480 ) ),
+	) ) );
 
 };
 

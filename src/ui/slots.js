@@ -18,8 +18,12 @@
 // CSS variables published on <html>: --wgv-inset-left / -right / -top / -bottom, --wgv-bottom-h
 // (current height of the bottom slot, for surfaces that must stay clear of it on phones),
 // --wgv-bottom-clear (that height plus a gap, 0 while the slot is empty: the status chips sit
-// above it), --wgv-tools-w (current width of the top right slot: the top slot leaves that room free); the
-// settings panel publishes --wgv-sheet-h (visible height of the phone bottom sheet).
+// above it), --wgv-tools-w (current width of the top right slot: the top slot leaves that room free),
+// --wgv-status-h (height of the status chips at the bottom left, one row or two; 0 on phones, where
+// they sit at the top), --wgv-right-w (what the right column covers, with its gap, while it shows something; 0 while it
+// is empty and on phones, where it is a stack above the bottom: the status chips and the first-run
+// hint keep clear of it); the settings panel publishes --wgv-sheet-h (visible height of the phone
+// bottom sheet).
 // <html class="wgv-ui-hidden"> (photo mode) hides the slots root and everything in it.
 import './slots.css';
 
@@ -28,6 +32,7 @@ let instance = null;
 export function uiSlots( container = document.body ) {
 
 	if ( instance ) return instance;
+	const phone = typeof matchMedia === 'function' ? matchMedia( '(max-width: 640px)' ) : null;
 	const root = document.createElement( 'div' );
 	root.className = 'wgv-slots';
 	const make = ( name ) => {
@@ -54,6 +59,8 @@ export function uiSlots( container = document.body ) {
 		},
 		dispose() {
 
+			window.removeEventListener( 'resize', measureRight );
+			rightObserver?.disconnect();
 			observer?.disconnect();
 			root.remove();
 			instance = null;
@@ -68,10 +75,28 @@ export function uiSlots( container = document.body ) {
 		style.setProperty( '--wgv-bottom-h', h + 'px' );
 		style.setProperty( '--wgv-bottom-clear', ( h > 0 ? h + 8 : 0 ) + 'px' );
 		style.setProperty( '--wgv-tools-w', slots.topRight.offsetWidth + 'px' );
+		style.setProperty( '--wgv-status-h', ( phone?.matches ? 0 : slots.status.offsetHeight ) + 'px' );
 
 	} ) : null;
 	observer?.observe( slots.bottom );
 	observer?.observe( slots.topRight );
+	observer?.observe( slots.status );
+	// the right column has a fixed box: what counts is whether one of its surfaces is shown
+	let rightW = - 1;
+	function measureRight() {
+
+		const shown = ! phone?.matches && Array.from( slots.right.children ).some( ( el ) => ! el.hidden && el.offsetParent !== null );
+		const w = shown ? slots.right.offsetWidth + 8 : 0;
+		if ( w === rightW ) return;
+		rightW = w;
+		document.documentElement.style.setProperty( '--wgv-right-w', w + 'px' );
+
+	}
+
+	const rightObserver = typeof MutationObserver === 'function' ? new MutationObserver( measureRight ) : null;
+	rightObserver?.observe( slots.right, { childList: true, subtree: true, attributes: true, attributeFilter: [ 'hidden' ] } );
+	window.addEventListener( 'resize', measureRight );
+	measureRight();
 	instance = slots;
 	return slots;
 

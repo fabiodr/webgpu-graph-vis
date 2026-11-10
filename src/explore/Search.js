@@ -73,6 +73,8 @@ export class Search {
 			if ( ( e.ctrlKey || e.metaKey ) && ! e.altKey && ! e.shiftKey && ( e.key === 'k' || e.key === 'K' ) ) {
 
 				e.preventDefault();
+				// photo mode hides every surface: a search nobody can see must not take the keys
+				if ( document.documentElement.classList.contains( 'wgv-ui-hidden' ) ) return;
 				this.toggle();
 
 			}

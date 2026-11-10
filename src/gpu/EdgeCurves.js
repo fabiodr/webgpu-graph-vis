@@ -21,7 +21,21 @@
 //  starts and ends exactly at the node centres). Sample i of S segments sits at x = i (L+1) / S:
 //  span j = min( floor( x ), L ), u = x − j (exact integer arithmetic on the GPU), control points
 //  Q[ j .. j+3 ] with Q[ m ] = P'[ clamp( m − 2, 0, L − 1 ) ]: a 4-point window, no loop over the
-//  path. With hierarchical paths this is exactly the curve of the first edge renderer.
+//  path. With hierarchical paths and unhook = 0 this is exactly the curve of the first edge renderer.
+//
+//  Unhooking (force layout; uniforms.unhook, default 1, 0 = off): a cluster centroid that lies
+//  behind the source or beyond the target of its edge makes the curve leave the node backwards
+//  and hook around it; a hub at the rim of its cluster then has the star of its edges beside it,
+//  on the centroid. With d = the unit chord ( t − s ) / |t − s|, q = P_k − s, along = q · d,
+//  over = along − clamp( along, 0, |t − s| ) and side = q − d · along, the curve uses
+//    P_k − ( d · over + side · |over| / ( |side| + |over| ) ) · unhook
+//  in place of such a centroid: it is moved into the plane through the end point it lies behind,
+//  and toward that end point the further behind it lies (straight behind: the end point itself).
+//  Every control point then projects into the chord, so no curve passes behind either of its
+//  end points (a B-spline stays in the convex hull of its control points), the pull to the side
+//  that makes the bundles stays, and the correction follows the live positions continuously.
+//  Centroids that project into the chord are not touched, nor are the nodes of a path
+//  (edge-path bundling: places the path really visits) or the sphere layout.
 //
 //  Sphere layout (buffers.uniforms.layoutBlend > 0, the paper's look): every control point is split
 //  into a direction from the sphere centre and a radial level. Nodes (the end points and node refs
@@ -41,7 +55,12 @@
 //  One invocation per edge loops over its S + 1 samples (a fixed count: the loop carries the
 //  running arc length and hoists the per-edge reads). Storage bindings of the kernel: edgeInfo,
 //  pathRefs, nodePos, clusterPos, nodeState, edgeAttr, samples = 7.
-//  Memory: 16 bytes · E · ( S + 1 ), capped by `memoryBudget` (default 64 MiB): S is clamped to
+//  Memory: 16 bytes · E · ( S + 1 ) ON THE GPU AND AGAIN ON THE CPU: three keeps the zero-filled
+//  Float32Array it uploads once as attribute.array for the life of the buffer, although only the
+//  compute kernel ever writes it (r187 derives the element count from that array, so it cannot be
+//  swapped for a small one; the same holds for the other GPU-written buffers of GraphBuffers,
+//  which are small). Both copies are capped by `memoryBudget` (default 64 MiB per copy; the edge
+//  renderer passes 24 MiB on touch devices, see autoCurveMemory there): S is clamped to
 //  maxSegments(). 384,444 edges: S = 8 → 55.4 MB (force layout); the sphere layout asks for 16 and
 //  gets 9 → 61.5 MB. The buffer only grows (a larger S re-allocates it and calls onRealloc so
 //  the renderers rebuild their materials). setGraph( …, { reserve } ) allocates room for a larger
@@ -51,7 +70,7 @@
 //  The kernel runs in update() when
 //    · node positions moved: buffers.moveFrame >= the frame of the last evaluation (Infinity =
 //      unknown = moved; GraphBuffers.setPositions and the layout module maintain it),
-//    · beta, the sample count, layoutBlend, sphereRadius, the level parameters, graphCenter,
+//    · beta, unhook, the sample count, layoutBlend, sphereRadius, the level parameters, graphCenter,
 //      sphereAxis or highlightLevel changed (compared by value every frame),
 //    · the path set changed (setPaths), or invalidate() was called,
 //    · in sphere mode only: the highlight state is easing (a CPU write that changed what the
@@ -73,7 +92,7 @@
 //  curves.invalidate( seconds = 0 )    force an evaluation now (and for `seconds` more)
 //  curves.readback( renderer ) → Promise<Float32Array>   the samples (tests, CPU picking)
 //  curves.samples / .pathRefs          storage nodes (null before setGraph / when E = 0)
-//  curves.uniforms                     { beta, highlightLevel, sphereAxis, highlightFade, stride }
+//  curves.uniforms                     { beta, unhook, highlightLevel, sphereAxis, highlightFade, stride }
 //  curves.segments / .capacity / .paths / .memoryBudget / .reserveBudget / .onRealloc
 //  curves.stats                        { updates, skipped, lastUpdateFrame, segments, samples,
 //                                        capacity, bytes, pathRefs, maxInterior, reallocations }
@@ -84,12 +103,13 @@
 //  Also exported: evalEdgeCurveCPU( graph, e, t, nodePos4, clusterPos4, options ), the pure-JS
 //  mirror of the kernel (tests, CPU picking), maxSegmentsForBudget( E, bytes ), encodePathRefs().
 
-import { Fn, If, Loop, instanceIndex, instancedArray, storage, uniform, float, int, uint, vec3, vec4, select, mix, clamp, max, min, pow, length, dot, sin, cos, atan, normalize } from 'three/tsl';
+import { Fn, If, Loop, instanceIndex, instancedArray, storage, uniform, float, int, uint, vec3, vec4, select, mix, clamp, max, min, pow, length, dot, sin, cos, atan, normalize, abs } from 'three/tsl';
 import { Vector3 } from 'three/webgpu';
 import { hierarchicalPaths } from '../graph/bundling.js';
 
 export const CURVE_DEFAULTS = {
 	beta: 0.85,
+	unhook: 1, // 0..1: how far a centroid behind an end point of its edge is pulled back to it (see Curve)
 	highlightLevel: 0.75, // sphere mode: level the cluster points of highlighted edges move to
 	memoryBudget: 64 * 1024 * 1024, // bytes for the sample buffer
 	reserveBudget: 8 * 1024 * 1024, // setGraph( { reserve } ): most bytes allocated ahead of need
@@ -173,7 +193,7 @@ function hierarchicalPathsOf( g ) {
  * @param {number} t curve parameter in [0,1]
  * @param {Float32Array} nodePos4 node positions (vec4 per node)
  * @param {Float32Array} clusterPos4 cluster centroids (vec4 per cluster)
- * @param {object} [o] { paths (default: hierarchicalPaths( g )), beta, layoutBlend, sphereRadius,
+ * @param {object} [o] { paths (default: hierarchicalPaths( g )), beta, unhook, layoutBlend, sphereRadius,
  *                       center:[x,y,z], sphereAxis:[x,y,z], levelOffset, levelScale, levelExponent,
  *                       highlight, highlightLevel }
  * @returns {{ position: number[], tangent: number[], L: number, controlPoints: number[][] }}
@@ -184,6 +204,7 @@ export function evalEdgeCurveCPU( g, e, t, nodePos4, clusterPos4, o = {} ) {
 
 	const paths = o.paths ?? hierarchicalPathsOf( g );
 	const beta = o.beta ?? CURVE_DEFAULTS.beta;
+	const unhook = o.unhook ?? CURVE_DEFAULTS.unhook;
 	const blend = o.layoutBlend ?? 0;
 	const R = o.sphereRadius ?? g.layoutRadius;
 	const c = o.center ?? [ 0, 0, 0 ];
@@ -218,25 +239,34 @@ export function evalEdgeCurveCPU( g, e, t, nodePos4, clusterPos4, o = {} ) {
 
 	};
 
+	const chord = sub( pT, pS ), chordLen = len( chord ), chordDir = chord.map( ( v ) => v / Math.max( chordLen, 1e-6 ) );
 	const rS = sub( pS, c ), rT = sub( pT, c );
 	const levS = len( rS ) / R, levT = len( rT ) / R, vS = logMap( rS ), vT = logMap( rT );
 	const point = ( k ) => {
 
-		if ( k <= 0 ) return { p: pS, lev: levS };
-		if ( k >= L - 1 ) return { p: pT, lev: levT };
+		if ( k <= 0 ) return { p: pS, f: pS, lev: levS };
+		if ( k >= L - 1 ) return { p: pT, f: pT, lev: levT };
 		const ref = paths.pathRefs[ start + k - 1 ];
 		if ( ref < N ) {
 
 			// a node on the path keeps its own radial level
 			const p = [ nodePos4[ 4 * ref ], nodePos4[ 4 * ref + 1 ], nodePos4[ 4 * ref + 2 ] ];
-			return { p, lev: len( sub( p, c ) ) / R };
+			return { p, f: p, lev: len( sub( p, c ) ) / R };
 
 		}
 
 		const cl = ref - N;
 		const h = g.clusterHeight ? g.clusterHeight[ cl ] : 1;
 		const level = 1 + lvOff + lvScale * ( h > 1 ? Math.pow( h - 1, lvExp ) : 0 );
-		return { p: [ clusterPos4[ 4 * cl ], clusterPos4[ 4 * cl + 1 ], clusterPos4[ 4 * cl + 2 ] ], lev: level + ( hlLevel - level ) * hl };
+		const p = [ clusterPos4[ 4 * cl ], clusterPos4[ 4 * cl + 1 ], clusterPos4[ 4 * cl + 2 ] ];
+		// force layout: a centroid behind the source or beyond the target is pulled back to that
+		// end point (see Curve), so that the curve does not hook around the node
+		const q = sub( p, pS ), along = dot3( q, chordDir );
+		const over = along - Math.min( Math.max( along, 0 ), chordLen );
+		const side = [ q[ 0 ] - chordDir[ 0 ] * along, q[ 1 ] - chordDir[ 1 ] * along, q[ 2 ] - chordDir[ 2 ] * along ];
+		const fade = Math.abs( over ) / Math.max( len( side ) + Math.abs( over ), 1e-6 );
+		const f = [ 0, 1, 2 ].map( ( i ) => p[ i ] - ( chordDir[ i ] * over + side[ i ] * fade ) * unhook );
+		return { p, f, lev: level + ( hlLevel - level ) * hl };
 
 	};
 
@@ -254,8 +284,8 @@ export function evalEdgeCurveCPU( g, e, t, nodePos4, clusterPos4, o = {} ) {
 
 		const k = Math.min( Math.max( j + i - 2, 0 ), L - 1 );
 		const a = k / ( L - 1 );
-		const { p, lev } = point( k );
-		const f = sub( lerp3( lerp3( pS, pT, a ), p, beta ), pS );
+		const { p, f: pf, lev } = point( k );
+		const f = sub( lerp3( lerp3( pS, pT, a ), pf, beta ), pS );
 		const v = lerp3( lerp3( vS, vT, a ), logMap( sub( p, c ) ), beta );
 		const lv = ( levS + ( levT - levS ) * a ) * ( 1 - beta ) + lev * beta;
 		F.push( f ); Sv.push( v ); Sl.push( lv );
@@ -374,6 +404,7 @@ export class EdgeCurves {
 
 		this.uniforms = {
 			beta: uniform( o.beta ),
+			unhook: uniform( o.unhook ),
 			highlightLevel: uniform( o.highlightLevel ),
 			sphereAxis: uniform( new Vector3( ...( o.sphereAxis || [ 0, 0, 1 ] ) ).normalize() ),
 			highlightFade: uniform( 1 ), // weight of edgeAttr.y in the sphere-mode highlight level
@@ -555,7 +586,7 @@ export class EdgeCurves {
 		const sphere = U.layoutBlend.value > 0;
 		const c = U.graphCenter.value, ax = u.sphereAxis.value;
 		const sig = [
-			u.beta.value, u.stride.value, U.layoutBlend.value, U.sphereRadius.value, U.levelOffset.value, U.levelScale.value,
+			u.beta.value, u.unhook.value, u.stride.value, U.layoutBlend.value, U.sphereRadius.value, U.levelOffset.value, U.levelScale.value,
 			U.levelExponent.value, c.x, c.y, c.z, ax.x, ax.y, ax.z, u.highlightLevel.value, sphere ? u.highlightFade.value : 0,
 		];
 		const old = this._signature;
@@ -661,6 +692,9 @@ export class EdgeCurves {
 			const pS = nodePos.element( info.x ).xyz.toVar();
 			const pT = nodePos.element( info.y ).xyz.toVar();
 			const beta = clamp( u.beta, 0, 1 ).toVar();
+			const unhook = clamp( u.unhook, 0, 1 ).toVar();
+			const chordLen = length( pT.sub( pS ) ).toVar();
+			const chordDir = pT.sub( pS ).div( max( chordLen, 1e-6 ) ).toVar();
 			const blend = clamp( U.layoutBlend, 0, 1 ).toVar();
 			const center = U.graphCenter;
 			const R = max( U.sphereRadius, 1e-6 ).toVar();
@@ -712,19 +746,20 @@ export class EdgeCurves {
 				].map( ( n ) => n.toVar() );
 
 				// the span's 4 control points: position, and the radial level for sphere mode
-				const P = [], LV = [], A = [];
+				const P = [], PF = [], LV = [], A = [];
 				for ( let m = 0; m < 4; m ++ ) {
 
 					const k = clamp( j.add( int( m - 2 ) ), int( 0 ), Lm1 ).toVar();
 					const pk = vec3( 0 ).toVar();
 					const lev = float( 1 ).toVar();
+					const pf = vec3( 0 ).toVar(); // the point the force-layout curve uses
 					If( k.lessThanEqual( int( 0 ) ), () => {
 
-						pk.assign( pS ); lev.assign( levS );
+						pk.assign( pS ); pf.assign( pS ); lev.assign( levS );
 
 					} ).ElseIf( k.greaterThanEqual( Lm1 ), () => {
 
-						pk.assign( pT ); lev.assign( levT );
+						pk.assign( pT ); pf.assign( pT ); lev.assign( levT );
 
 					} ).Else( () => {
 
@@ -733,6 +768,7 @@ export class EdgeCurves {
 
 							// a node on the path: its own radial level
 							pk.assign( nodePos.element( ref ).xyz );
+							pf.assign( pk );
 							If( blend.greaterThan( 0 ), () => {
 
 								lev.assign( length( pk.sub( center ) ).div( R ) );
@@ -742,6 +778,14 @@ export class EdgeCurves {
 						} ).Else( () => {
 
 							pk.assign( clusterPos.element( ref.bitAnd( uint( REF_INDEX_MASK ) ) ).xyz );
+							// a centroid behind the source or beyond the target: pulled back to that end
+							// point, so that the curve does not hook around the node (see Curve)
+							const q = pk.sub( pS ).toVar();
+							const along = dot( q, chordDir ).toVar();
+							const over = along.sub( clamp( along, 0, chordLen ) ).toVar();
+							const side = q.sub( chordDir.mul( along ) ).toVar();
+							const fade = abs( over ).div( max( length( side ).add( abs( over ) ), 1e-6 ) );
+							pf.assign( pk.sub( chordDir.mul( over ).add( side.mul( fade ) ).mul( unhook ) ) );
 							If( blend.greaterThan( 0 ), () => {
 
 								const hm1 = float( ref.shiftRight( uint( REF_HEIGHT_SHIFT ) ).bitAnd( uint( 15 ) ) ).sub( 1 ).toVar();
@@ -754,12 +798,12 @@ export class EdgeCurves {
 
 					} );
 
-					P.push( pk ); LV.push( lev ); A.push( float( k ).div( float( Lm1 ) ).toVar() );
+					P.push( pk ); PF.push( pf ); LV.push( lev ); A.push( float( k ).div( float( Lm1 ) ).toVar() );
 
 				}
 
 				// force layout: Euclidean B-spline over the straightened points, relative to the source
-				const F = P.map( ( pk, m ) => mix( mix( pS, pT, A[ m ] ), pk, beta ).sub( pS ) );
+				const F = PF.map( ( pf, m ) => mix( mix( pS, pT, A[ m ] ), pf, beta ).sub( pS ) );
 				const position = pS.add( F[ 0 ].mul( bs[ 0 ] ) ).add( F[ 1 ].mul( bs[ 1 ] ) ).add( F[ 2 ].mul( bs[ 2 ] ) ).add( F[ 3 ].mul( bs[ 3 ] ) ).toVar();
 
 				If( blend.greaterThan( 0 ), () => {

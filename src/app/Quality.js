@@ -19,7 +19,13 @@
 //
 // ─── resolveQuality( setting, env, overrides ) → config ─────────────────────────────────────
 //  setting    'auto' | 'low' | 'medium' | 'high' | 'ultra' (anything else counts as 'auto')
-//  env        { coarsePointer, smallScreen, softwareAdapter, edges, dpr, deviceDpr, cssWidth, cssHeight }
+//  env        { coarsePointer, smallScreen, softwareAdapter, gpuClass, compat, edges, dpr, deviceDpr,
+//               cssWidth, cssHeight }
+//             gpuClass = gpuClass( GPUAdapterInfo ): 'software' | 'integrated' | 'mobile' | 'discrete' |
+//             'apple' | 'unknown' (default; the browser masks the adapter): what 'auto' starts with,
+//             see autoTier(). compat = the renderer runs in WebGPU compatibility mode (no depth
+//             texture gather, no multisampled float targets, no per-attachment blending): every
+//             setting resolves to 'low' there (config.compat, config.requested = the tier asked for).
 //             dpr = renderer pixel ratio (drawing-buffer pixels per CSS pixel, the App caps it),
 //             deviceDpr = window.devicePixelRatio (default: dpr), decides the FXAA rule of low
 //  overrides  forced switches (settings / URL); undefined or null = tier default:
@@ -30,7 +36,7 @@
 //             `scale` fixes the scene-pass resolution scale (no pixel cap, no governor),
 //             `debug` is 'ao' | 'depth' | 'velocity' | 'coc' | null.
 //  config     a plain object with every structural decision of the render pipeline:
-//             setting, tier, explicit, samples, aa ('none'|'fxaa'|'smaa'|'msaa'|'traa'), velocity,
+//             setting, tier, explicit, compat, requested, samples, aa ('none'|'fxaa'|'smaa'|'msaa'|'traa'), velocity,
 //             lit, clearcoat, shadows, shadowMapSize, shadowRadius, ao, aoScale, aoSamples,
 //             aoDenoise ('none'|'bilateral'), aoTemporal, dof, dofTaps, dofAmount, dofMaxBlur,
 //             bloom, bloomScale, streak, vignette, grain, chromaticAberration, sharpen, edges { lit, tubes,
@@ -60,17 +66,31 @@
 //    discoverWindows without timings. The answer "the display" takes the step back and doubles
 //    the pause before the next question (a loop that turns slow meanwhile may still descend).
 //    Below the scale where such a step still fits above the floor the nominal targetFps counts.
+//    A climb after a descent whose cause went away (the pace is pinned at the display rate and no
+//    climb has failed) takes fastUpFactor steps every fastUpWindows, never past a scale that failed.
 //  · 'auto' only: at the lowest scale and still slow, the tier steps down. Where the resolution
 //    is not the reason (see above, or dynamic resolution is off) the tier steps down ON TRIAL:
 //    no gain within trialWindows and it goes back up and stays (tierUseless).
+//  · A TRANSIENT load is not charged to the tier: while the caller flags frames as transient (the
+//    layout is running, a graph was just loaded) only the scale moves, for at most transientMs in
+//    a row (a layout that never rests on a device that is too slow still gets its cheaper tier).
+//  · Nothing is for good on the way up either: a tier below the ceiling (configure( { ceiling } ),
+//    what 'auto' may reach on this device: never 'ultra', which changes the look) is tried again
+//    after upgradeWindows good windows at full scale; with GPU timings only while the render
+//    passes leave headroom, without them on the frame rate alone. A step up that turns slow
+//    within upTrialWindows is taken back, and so is the next try twice as late (upRetryMs,
+//    doubled after every step down, up to maxRetryMs). So a device that was demoted by a thermal
+//    dip, or one whose adapter the browser masks and that therefore starts at 'medium', finds its
+//    tier, and a device that cannot hold it pays one short trial per pause.
 //  · An explicit tier is never changed (only its scale, and only with dynamic resolution on).
-//    The tier goes up at most once, never after a step down, and only on measured GPU headroom.
 //  · Frames longer than dropMs (hidden tab) are ignored; after every change the governor waits
 //    settleMs / settleFrames (pipeline compiles) before it measures again.
 //
 //    const gov = new Governor( options );
-//    gov.configure( { tier, explicit, scale, maxScale, dynamicResolution, enabled } );  // after builds / resizes
-//    const action = gov.sample( frameMs, nowMs, gpuMs? );                                 // every frame
+//    gov.configure( { tier, explicit, ceiling, scale, maxScale, dynamicResolution, enabled } );  // after builds / resizes
+//    const action = gov.sample( frameMs, nowMs, gpuMs?, { transient, renderMs }? );       // every frame
+//                              // gpuMs: all GPU passes of the frame; renderMs: its render passes only
+//    gov.settle();             // the loop was paused (hidden tab, idle): wait before measuring again
 //    gov.reset();              // a new quality setting: forget everything but the display rate
 //    gov.reset( false );       // a new graph: forget the measurements, keep the tier history
 //    gov.enabled = false;                                                                 // ?governor=0
@@ -142,12 +162,64 @@ export function isSoftwareAdapter( info ) {
 
 }
 
-/** The tier 'auto' starts with on a device (before the governor has measured anything). */
+/**
+ * What kind of GPU an adapter is, from its GPUAdapterInfo (vendor, architecture, device,
+ * description; browsers fill in what they are willing to tell):
+ *   'software'    CPU rasterizers
+ *   'apple'       Apple silicon
+ *   'discrete'    NVIDIA, AMD RDNA, Intel Arc
+ *   'integrated'  Intel gen-* / xe-lp*, AMD APUs and the GCN generation (cannot be told apart)
+ *   'mobile'      ARM Mali, Qualcomm Adreno, Imagination, Samsung, Broadcom
+ *   'unknown'     no information (masked), or a vendor that is not known here
+ */
+export function gpuClass( info ) {
+
+	if ( ! info ) return 'unknown';
+	if ( isSoftwareAdapter( info ) ) return 'software';
+	const vendor = String( info.vendor || '' ).toLowerCase();
+	const text = [ info.vendor, info.architecture, info.device, info.description ].filter( Boolean ).join( ' ' ).toLowerCase();
+	if ( text === '' ) return 'unknown';
+	if ( /apple/.test( vendor ) ) return 'apple';
+	if ( /nvidia/.test( vendor ) || /geforce|quadro|\brtx\b|\bgtx\b/.test( text ) ) return /tegra/.test( text ) ? 'mobile' : 'discrete';
+	if ( /intel/.test( vendor ) ) return /\barc\b|dg2|alchemist|battlemage|xe2?-hpg/.test( text ) ? 'discrete' : 'integrated';
+	if ( /amd|ati\b|advanced micro/.test( vendor ) || /radeon/.test( text ) ) {
+
+		if ( /vega \d+ graphics|radeon\(tm\) graphics|radeon graphics|\b\d{3}m\b|gcn/.test( text ) ) return 'integrated';
+		return 'discrete';
+
+	}
+
+	if ( /\barm\b|qualcomm|adreno|mali|\bimg\b|imagination|powervr|samsung|xclipse|broadcom|videocore/.test( text ) ) return 'mobile';
+	return 'unknown';
+
+}
+
+/**
+ * The tier 'auto' starts with on a device, decided before the first frame from what the adapter
+ * says (the governor corrects it afterwards, in both directions, see Governor): 'high' only for
+ * GPUs known to be discrete or Apple silicon; integrated, mobile and unknown GPUs start at
+ * 'medium' (a start that is too low costs a later step up, one that is too high costs the first
+ * impression: seconds below 30 fps while the layout unfolds).
+ */
 export function autoTier( env = {} ) {
 
-	if ( env.softwareAdapter ) return 'low';
+	const gpu = env.softwareAdapter ? 'software' : ( env.gpuClass || 'unknown' );
+	if ( env.compat || gpu === 'software' ) return 'low';
 	if ( env.coarsePointer && env.smallScreen ) return 'low'; // phones
 	if ( env.coarsePointer || env.smallScreen ) return 'medium'; // tablets, small windows
+	return gpu === 'discrete' || gpu === 'apple' ? 'high' : 'medium';
+
+}
+
+/**
+ * The highest tier the governor may lift 'auto' to on a device: 'high' on desktops (never 'ultra':
+ * depth of field, streak and grain are a look the user chooses), the starting tier on phones,
+ * tablets, small windows and software rasterizers.
+ */
+export function autoCeiling( env = {} ) {
+
+	const start = autoTier( env );
+	if ( env.compat || env.softwareAdapter || env.gpuClass === 'software' || env.coarsePointer || env.smallScreen ) return start;
 	return 'high';
 
 }
@@ -221,13 +293,18 @@ export function parseGfxParams( params ) {
 
 export function resolveQuality( setting = 'auto', env = {}, overrides = {} ) {
 
-	const e = { coarsePointer: false, smallScreen: false, softwareAdapter: false, edges: 0, dpr: 1, cssWidth: 1280, cssHeight: 800, ...env };
-	const o = overrides || {};
+	const e = { coarsePointer: false, smallScreen: false, softwareAdapter: false, compat: false, edges: 0, dpr: 1, cssWidth: 1280, cssHeight: 800, ...env };
+	let o = overrides || {};
 	setting = normalizeSetting( setting );
 	const explicit = setting !== 'auto';
-	const tier = explicit ? setting : ( TIER_ORDER.includes( o.tier ) ? o.tier : autoTier( e ) );
+	const requested = explicit ? setting : ( TIER_ORDER.includes( o.tier ) ? o.tier : autoTier( e ) );
+	// compatibility mode: the chains above 'low' are invalid there (see the header), and so are the
+	// switches that would bring their passes back
+	const compat = !! e.compat;
+	const tier = compat ? 'low' : requested;
+	if ( compat ) o = { ...o, ao: null, traa: null, dof: null, shadows: null, debug: null };
 	const t = TIERS[ tier ];
-	const c = { setting, tier, explicit, ...t, edges: { ...t.edges } };
+	const c = { setting, tier, explicit, compat, requested, ...t, edges: { ...t.edges } };
 
 	// per-graph and per-display rules of the table
 	if ( c.aa === 'msaa' && e.edges > MSAA_MAX_EDGES ) {
@@ -358,6 +435,9 @@ export const GOVERNOR_DEFAULTS = {
 	maxUpWindows: 128, // cap of the doubled waiting time after failed climbs
 	downFactor: 0.85, // scale step down (pixels × 0.72)
 	upFactor: 1.08,
+	fastUpWindows: 2, // … while the pace is pinned at the display rate and no climb has failed: this soon …
+	fastUpFactor: 1.2, // … and in steps of this size (never past a scale where a climb failed)
+	pinnedRatio: 0.97, // at or above this fraction of the display rate the loop is pinned to it
 	minScaleRatio: 0.5, // floor relative to maxScale (a quarter of the pixels)
 	probeScale: 0.7, // half the pixels: moves even a rate that is locked to a divisor of the display rate, if the load is the pixels
 	gainRatio: 1.12, // the frame rate must be this much better there, or the resolution is not the bottleneck
@@ -367,8 +447,11 @@ export const GOVERNOR_DEFAULTS = {
 	busyRatio: 0.5, // GPU time above this fraction of the frame time: the pace can be the GPU's (with GPU timings)
 	tierDownWindows: 3, // slow windows at the lowest usable scale before the tier steps down
 	trialWindows: 2, // windows a tier that was stepped down on trial has to show a gain
-	upgradeWindows: 20, // good windows at full scale before a tier upgrade is considered
-	headroom: 0.35, // … and the GPU time must be below this fraction of the frame budget
+	transientMs: 45000, // longest stretch of transient frames (layout running) that is kept from the tier
+	upgradeWindows: 8, // good windows at full scale before the tier above is tried (below the ceiling only)
+	headroom: 0.35, // … with GPU timings: only while the render passes take less than this fraction of the frame budget
+	upTrialWindows: 3, // windows the tier above must not be slow in, or the step is taken back
+	upRetryMs: 60000, // pause before the tier above is tried again after a step down, doubled every time (≤ maxRetryMs)
 };
 
 export class Governor {
@@ -381,16 +464,18 @@ export class Governor {
 		this.gpuMs = null;
 		this.displayFps = 0; // measured display rate (0 = nothing measured yet)
 		this.log = []; // the latest actions: { t, type, scale | tier, reason }
-		this.upgraded = false; // the one allowed step up has been used
-		this.downgraded = false; // the tier was stepped down: no upgrade any more
+		this.upgraded = false; // the governor has stepped the tier up at least once
+		this.downgraded = false; // its last tier step was a step down (it is tried again, see the header)
 		this.scaleUseless = false; // a descent without gain: the resolution is left alone until the pause is over
 		this.tierUseless = false; // a lower tier did not help either: the tier stays
-		this._state = { tier: 'high', explicit: false, scale: 1, maxScale: 1, dynamicResolution: true };
+		this._state = { tier: 'high', explicit: false, ceiling: 'high', scale: 1, maxScale: 1, dynamicResolution: true };
 		this._intervals = new Float32Array( 256 ); // frame times of the running window
 		this._rates = []; // display-rate estimates of the last windows
 		this._settleFrames = this.options.settleFrames;
 		this._settleUntil = null; // set from the first sample's clock
 		this._pendingTier = null; // the tier of the governor's own last tier action
+		this._transientSince = null; // clock time at which the running stretch of transient frames began
+		this._renderMs = null; // GPU time of the render passes of the last sample
 		this._resetWindow();
 		this.reset();
 
@@ -398,34 +483,45 @@ export class Governor {
 
 	/**
 	 * Forgets what was measured about the load (descents, pauses, trials); the display rate stays.
-	 * `tierHistory = false` keeps the upgraded / downgraded flags (a new graph on the same device).
+	 * `tierHistory = false` keeps what is known about the tiers: the upgraded / downgraded flags and
+	 * the pause before the tier above is tried again (a new graph on the same device).
 	 */
 	reset( tierHistory = true ) {
 
 		this._descent = null; // { fps, ratio, gain } where the scale started to drop
 		this._probe = null; // { fps, ratio, windows } the one step that asks "display or GPU?"
 		this._trial = null; // { from, to, fps, windows } a tier stepped down on trial
+		this._upTrial = null; // { from, to, windows } a tier stepped up, on probation
 		this._lastClimb = null; // { from, windows } scale before the last step up, on probation
 		this._climbFails = 0;
+		this._climbCap = Infinity; // scale / maxScale at which a climb failed: fast climbs stay below it
 		this._fails = 0; // descents without gain in a row
 		this._retryAt = 0; // clock time at which the resolution may be tried again
 		this._asks = 0; // "display or GPU?" steps answered "display" in a row
 		this._askAt = 0; // clock time at which the question may be asked again
 		this.scaleUseless = false;
 		this.tierUseless = false;
-		if ( tierHistory ) this.upgraded = this.downgraded = false;
+		if ( tierHistory ) {
+
+			this.upgraded = this.downgraded = false;
+			this._upFails = 0; // steps down in a row that a step up was (or would have to be) taken back for
+			this._upAt = 0; // clock time at which the tier above may be tried again
+
+		}
+
 		this._low = 0; this._high = 0; this._floor = 0; this._top = 0; this._paced = 0;
 		return this;
 
 	}
 
 	/** The current pipeline state. Call after every build, tier change, resize or manual scale change. */
-	configure( { tier, explicit, scale, maxScale, dynamicResolution, enabled } = {} ) {
+	configure( { tier, explicit, ceiling, scale, maxScale, dynamicResolution, enabled } = {} ) {
 
 		const s = this._state;
 		const tierChanged = tier !== undefined && tier !== s.tier;
 		if ( tier !== undefined ) s.tier = tier;
 		if ( explicit !== undefined ) s.explicit = !! explicit;
+		if ( TIER_ORDER.includes( ceiling ) ) s.ceiling = ceiling;
 		if ( maxScale !== undefined ) s.maxScale = maxScale;
 		if ( scale !== undefined ) s.scale = scale;
 		if ( dynamicResolution !== undefined ) s.dynamicResolution = !! dynamicResolution;
@@ -433,11 +529,12 @@ export class Governor {
 		if ( tierChanged ) {
 
 			// the scale starts again with a tier, and its measurements say nothing about another one
-			this._descent = null; this._probe = null; this._lastClimb = null; this._climbFails = 0;
+			this._descent = null; this._probe = null; this._lastClimb = null; this._climbFails = 0; this._climbCap = Infinity;
 			if ( tier !== this._pendingTier ) {
 
 				// not a step of the governor: nothing it knows applies any more
 				this._trial = null;
+				this._upTrial = null;
 				this._forgetPauses();
 
 			}
@@ -454,6 +551,13 @@ export class Governor {
 
 		// a canvas resize (maxScale) keeps everything: scales are remembered relative to the cap
 		this._low = this._high = this._floor = this._top = this._paced = 0;
+		return this.settle();
+
+	}
+
+	/** Waits settleMs / settleFrames before measuring again (after a build, a resize, a paused loop). */
+	settle() {
+
 		this._resetWindow();
 		this._settleFrames = this.options.settleFrames;
 		this._settleUntil = null; // set from the next sample's clock
@@ -465,7 +569,7 @@ export class Governor {
 
 		return {
 			...this._state, fps: this.fps, displayFps: this.displayFps, targetFps: this.targetFps,
-			upgraded: this.upgraded, downgraded: this.downgraded, scaleUseless: this.scaleUseless, tierUseless: this.tierUseless, retryAt: this._retryAt, askAt: this._askAt,
+			upgraded: this.upgraded, downgraded: this.downgraded, scaleUseless: this.scaleUseless, tierUseless: this.tierUseless, retryAt: this._retryAt, askAt: this._askAt, upAt: this._upAt,
 		};
 
 	}
@@ -492,12 +596,20 @@ export class Governor {
 
 	/**
 	 * One rendered frame: its duration and the caller's clock (both ms), optionally the GPU time
-	 * of the frame (ms, timestamp queries). Returns an action or null.
+	 * of the frame (ms, timestamp queries) and { transient: the frame carries a load that will go
+	 * away (layout running), renderMs: GPU time of the render passes alone }. Returns an action or null.
 	 */
-	sample( frameMs, now, gpuMs = null ) {
+	sample( frameMs, now, gpuMs = null, info = null ) {
 
 		const o = this.options;
 		if ( ! this.enabled || ! ( frameMs > 0 ) ) return null;
+		if ( info && info.transient ) {
+
+			if ( this._transientSince === null ) this._transientSince = now;
+
+		} else this._transientSince = null;
+
+		this._renderMs = info && info.renderMs !== null && info.renderMs >= 0 ? info.renderMs : gpuMs;
 		if ( frameMs > o.dropMs ) {
 
 			this._resetWindow();
@@ -528,7 +640,9 @@ export class Governor {
 		this._resetWindow();
 		this.fps = fps;
 		this.gpuMs = gpu;
-		const action = this._decide( fps, gpu, now );
+		// a stretch of transient frames is kept from the tier, but not for ever
+		const transient = this._transientSince !== null && now - this._transientSince < o.transientMs;
+		const action = this._decide( fps, gpu, now, transient );
 		if ( action ) {
 
 			this.log.push( { t: now, ...action } );
@@ -563,7 +677,7 @@ export class Governor {
 
 	}
 
-	_decide( fps, gpu, now ) {
+	_decide( fps, gpu, now, transient = false ) {
 
 		const o = this.options, s = this._state;
 		const dyn = s.dynamicResolution;
@@ -585,7 +699,7 @@ export class Governor {
 
 		this._low = slow ? this._low + 1 : 0;
 		this._high = good ? this._high + 1 : 0;
-		this._floor = slow && atFloor ? this._floor + 1 : 0;
+		this._floor = slow && atFloor && ! transient ? this._floor + 1 : 0;
 		this._top = good && atTop ? this._top + 1 : 0;
 		this._paced = capped && ! slow ? this._paced + 1 : 0;
 
@@ -606,6 +720,27 @@ export class Governor {
 				this._trial = null;
 				this.tierUseless = true;
 				return this._setTier( trial.from, 'the lower tier is no faster' );
+
+			} else return null;
+
+		}
+
+		// a tier that was stepped up stays unless it is slow
+		const up = this._upTrial;
+		if ( up ) {
+
+			if ( s.tier !== up.to ) this._upTrial = null;
+			else if ( slow ) {
+
+				this._upTrial = null;
+				this._failUp( now );
+				this._low = 0; this._floor = 0;
+				return this._setTier( up.from, 'the tier above is too slow' );
+
+			} else if ( ++ up.windows >= o.upTrialWindows ) {
+
+				this._upTrial = null; // it holds
+				this.downgraded = false;
 
 			} else return null;
 
@@ -643,6 +778,7 @@ export class Governor {
 				const back = this._lastClimb.from;
 				this._lastClimb = null;
 				this._climbFails ++;
+				this._climbCap = ratio;
 				this._low = 0; this._high = 0;
 				return this._setScale( back, 'climb failed' );
 
@@ -653,6 +789,7 @@ export class Governor {
 				// it held, and well: the load has changed, the next step need not wait as long
 				this._lastClimb = null;
 				this._climbFails = 0;
+				if ( ratio >= this._climbCap * 0.999 ) this._climbCap = Infinity; // … and what failed before does not any more
 
 			} else if ( ++ this._lastClimb.windows >= 2 ) this._lastClimb = null; // it held: accept it
 
@@ -693,7 +830,7 @@ export class Governor {
 				if ( i > 0 && canDescend ) {
 
 					// the pixels are the load and a quarter of them is still too many: a cheaper tier
-					this.downgraded = true;
+					this._failUp( now );
 					this._floor = 0; this._low = 0;
 					this._forgetPauses();
 					return this._setTier( TIER_ORDER[ i - 1 ], 'slow at the lowest resolution' );
@@ -703,7 +840,7 @@ export class Governor {
 				if ( i > 0 && ! this.tierUseless ) {
 
 					// the resolution is not the reason (or must not change): fewer passes may be. On trial.
-					this.downgraded = true;
+					this._failUp( now );
 					this._floor = 0; this._low = 0;
 					this._trial = { from: s.tier, to: TIER_ORDER[ i - 1 ], fps, windows: 0 };
 					return this._setTier( TIER_ORDER[ i - 1 ], 'slow, and not because of the resolution' );
@@ -721,12 +858,16 @@ export class Governor {
 			this._descent = null;
 			if ( dyn && ! atTop ) {
 
-				const wait = Math.min( o.maxUpWindows, o.upWindows * 2 ** this._climbFails );
+				// The cause of the descent went away (a layout that came to rest, a thermal dip): the pace is
+				// pinned at the display rate and no climb has failed. Larger steps, sooner, up to where one failed.
+				const cap = this._climbCap * s.maxScale;
+				const fast = this._climbFails === 0 && fps >= target * o.pinnedRatio && s.scale * o.fastUpFactor < cap * 0.999;
+				const wait = fast ? o.fastUpWindows : Math.min( o.maxUpWindows, o.upWindows * 2 ** this._climbFails );
 				if ( this._high >= wait ) {
 
 					this._high = 0;
 					this._lastClimb = { from: s.scale, windows: 0 };
-					return this._setScale( Math.min( s.maxScale, s.scale * o.upFactor ), 'headroom' );
+					return this._setScale( Math.min( s.maxScale, s.scale * ( fast ? o.fastUpFactor : o.upFactor ) ), 'headroom' );
 
 				}
 
@@ -753,16 +894,20 @@ export class Governor {
 
 		}
 
-		// one step up, only on evidence: full scale, a long good stretch and an idle GPU
-		if ( good && ! s.explicit && ! this.upgraded && ! this.downgraded && s.scale >= s.maxScale * 0.999 && this._top >= o.upgradeWindows && gpu !== null && gpu < o.headroom * 1000 / target ) {
+		// The tier above, below the ceiling only: after a good stretch at full scale, once the pause
+		// since the last step down is over, and with GPU timings only while the render passes leave
+		// headroom (the layout's compute passes are not what another tier adds to). On probation.
+		if ( good && ! s.explicit && s.scale >= s.maxScale * 0.999 && this._top >= o.upgradeWindows && now >= this._upAt ) {
 
-			const i = TIER_ORDER.indexOf( s.tier );
-			if ( i >= 0 && i < TIER_ORDER.length - 1 ) {
+			const i = TIER_ORDER.indexOf( s.tier ), top = TIER_ORDER.indexOf( s.ceiling );
+			const render = this._renderMs;
+			if ( i >= 0 && i < top && ( gpu === null || render === null || render < o.headroom * 1000 / target ) ) {
 
 				this.upgraded = true;
 				this._top = 0;
 				this._forgetPauses();
-				return this._setTier( TIER_ORDER[ i + 1 ], 'GPU headroom' );
+				this._upTrial = { from: s.tier, to: TIER_ORDER[ i + 1 ], windows: 0 };
+				return this._setTier( TIER_ORDER[ i + 1 ], gpu === null ? 'trying the tier above' : 'GPU headroom' );
 
 			}
 
@@ -782,6 +927,16 @@ export class Governor {
 		this.scaleUseless = true;
 		this._low = 0; this._paced = 0;
 		return this._setScale( scale, reason );
+
+	}
+
+	/** The tier steps down: the tier above is not tried again before a pause that doubles every time. */
+	_failUp( now ) {
+
+		const o = this.options;
+		this.downgraded = true;
+		this._upAt = now + Math.min( o.maxRetryMs, o.upRetryMs * 2 ** this._upFails );
+		this._upFails ++;
 
 	}
 

@@ -28,7 +28,7 @@ label.tier{color:#6f7b93}
 <div id="app"></div><div id="ui"></div><div id="err"></div>
 <script type="module">
 // Dev page for the render pipeline (src/render/gfx/RenderGraph.js, src/app/Quality.js) on the real
-// modules: ForceLayout, EdgeRenderer, NodeRenderer, Background, TextLabels (overlay pass),
+// modules: ForceLayout, EdgeRenderer, NodeRenderer, Environment, TextLabels (overlay pass),
 // Interaction, CameraRig. Every switch of the panel calls app.gfx.setQuality() / app.gfx.set().
 //
 // Query (all optional):
@@ -72,7 +72,7 @@ import { DataClient } from '../src/data/client.js';
 import { ForceLayout } from '../src/gpu/ForceLayout.js';
 import { NodeRenderer } from '../src/render/NodeRenderer.js';
 import { EdgeRenderer } from '../src/render/EdgeRenderer.js';
-import { Background } from '../src/render/Background.js';
+import { Environment } from '../src/render/gfx/Environment.js';
 import { TextLabels } from '../src/render/TextLabels.js';
 import { CameraRig } from '../src/interact/CameraRig.js';
 import { Interaction } from '../src/interact/Interaction.js';
@@ -100,7 +100,7 @@ try {
 	const layout = app.use( new ForceLayout() );
 	const edges = app.use( new EdgeRenderer() );
 	const nodes = app.use( new NodeRenderer() );
-	app.use( new Background() );
+	app.use( new Environment() );
 	const labels = app.use( new TextLabels( { mode: P( 'labels', 'auto' ) } ) );
 	gfx.attachLabels( labels );
 	if ( P( 'labeldepth', '' ) === 'live' ) {

@@ -54,10 +54,10 @@
 //   panel.setManifest( { groups, datasets } )
 //   panel.setGenerators( list )
 //   panel.setDatasetInfo( { id, name, nodes, edges, levels } )   for files / generated graphs
-//   panel.update( stats )               { nodes, edges, clusters, levels } for the footer
+//   panel.update( stats )               { nodes, edges, communities, levels } for the footer
 //                                       (throttled to ~2×/s; pass { force: true } to bypass)
 //   panel.setLoading( message, fraction? )   fraction 0..1 or null (indeterminate); falsy hides
-//   panel.toast( message, { type: 'error'|'info', duration } )
+//   panel.toast( message, { type: 'error'|'info', duration, action: { label, run() } } )
 //   panel.showHelp( on ) / toggleHelp() / helpVisible     forwarded to options.help (ui/Help.js)
 //   panel.setCollapsed( on ) / collapsed / isSheet
 //   panel.setAccent( paletteName )      accent CSS variables (also on palette change)
@@ -96,6 +96,14 @@ const LAYOUT_TEXT = {
 };
 
 const cap = ( s ) => ( s ? s[ 0 ].toUpperCase() + s.slice( 1 ) : '' );
+/** The schema's name of a palette, with what the colour module says about it in brackets. */
+const paletteLabel = ( p ) => {
+
+	const about = /\(.*\)/.exec( PALETTES[ p ]?.label || '' );
+	return optionLabel( 'palette', p ) + ( about ? ' ' + about[ 0 ] : '' );
+
+};
+
 const optionLabel = ( key, value ) => settingSpec( key )?.options?.find( ( o ) => o.value === value )?.label || cap( String( value ) );
 
 export const PANEL_LAYOUT = [
@@ -139,8 +147,8 @@ export const PANEL_LAYOUT = [
 			{ type: 'group', id: 'edges-advanced', title: 'Advanced', items: [ 'edgeOpacity', 'edgeWidth', 'edgeBlend' ] },
 		] },
 	{ id: 'nodes',
-		// "Paper palette", not "Paper": a look and a theme carry the same names two rows further down
-		summary: ( s ) => { const name = ( PALETTES[ s.palette ]?.label || s.palette || '' ).split( ' (' )[ 0 ]; return name ? name + ' palette' : ''; },
+		// "Aurora palette", not "Aurora": a look and a theme carry the same name two rows further down
+		summary: ( s ) => ( s.palette ? optionLabel( 'palette', s.palette ) + ' palette' : '' ),
 		items: [ 'nodeSize', 'labels', 'nodeGloss', 'nodeGlow', { type: 'palette', key: 'palette' } ] },
 	{ id: 'scene',
 		summary: ( s, info ) => ( info.features?.env ? optionLabel( 'theme', s.theme ) : '' ),
@@ -282,7 +290,7 @@ export function structurePreset( s ) {
 export function lookText( id ) {
 
 	const look = LOOKS.find( ( l ) => l.value === id );
-	return look ? look.hint : 'Your own mix of theme, palette and lens';
+	return look ? look.hint : 'Your own mix of theme, palette and effects';
 
 }
 
@@ -455,7 +463,7 @@ export class Panel {
 
 		text( s.nodes, fmtInt( stats.nodes ) );
 		text( s.edges, fmtInt( stats.edges ) );
-		text( s.clusters, stats.clusters !== undefined ? fmtInt( stats.clusters ) : '–' );
+		text( s.communities, stats.communities !== undefined ? fmtInt( stats.communities ) : '–' );
 		text( s.levels, stats.levels !== undefined ? `${stats.levels}` : '–' );
 		text( this._barCounts, stats.nodes !== undefined ? `${fmtInt( stats.nodes )} · ${fmtInt( stats.edges )}` : '' );
 
@@ -481,11 +489,12 @@ export class Panel {
 
 	}
 
-	toast( message, { type = 'error', duration = 5200 } = {} ) {
+	toast( message, { type = 'error', duration = 5200, action = null } = {} ) {
 
+		const act = action && typeof action.run === 'function' ? h( 'button.wgv-link.wgv-toast-act', { type: 'button' }, action.label || 'Undo' ) : null;
+		const close = h( 'button.wgv-icon.wgv-toast-x', { type: 'button', 'aria-label': 'Dismiss', html: icon( 'close', 14 ) } );
 		const el = h( 'div.wgv-toast.wgv-glass', { role: type === 'error' ? 'alert' : 'status', 'data-type': type },
-			h( 'i.wgv-toast-dot' ), h( 'span', null, String( message ) ),
-			h( 'button.wgv-icon.wgv-toast-x', { 'aria-label': 'Dismiss', html: icon( 'close', 14 ) } ) );
+			h( 'i.wgv-toast-dot' ), h( 'span', null, String( message ) ), act, close );
 		const remove = () => {
 
 			el.classList.remove( 'is-in' );
@@ -493,7 +502,13 @@ export class Panel {
 
 		};
 
-		el.querySelector( 'button' ).addEventListener( 'click', remove );
+		close.addEventListener( 'click', remove );
+		act?.addEventListener( 'click', () => {
+
+			remove();
+			action.run();
+
+		} );
 		this._toasts.append( el );
 		while ( this._toasts.children.length > 4 ) this._toasts.firstChild.remove();
 		requestAnimationFrame( () => el.classList.add( 'is-in' ) );
@@ -862,6 +877,29 @@ export class Panel {
 			else this._queue( item.key, v );
 
 		} );
+		if ( log ) {
+
+			// a log slider runs over 0…1000 while its value is rounded to `step`: one native arrow
+			// step would change nothing. The keys move by an even share of the range instead (about
+			// 60 presses end to end), and by at least one value step
+			const step = item.step ?? 0.01;
+			const presses = Math.max( 8, Math.min( 60, Math.round( Math.log( item.max / item.min ) / Math.log( 1 + step / Math.sqrt( item.min * item.max ) ) ) ) );
+			input.addEventListener( 'keydown', ( e ) => {
+
+				const d = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: - 1, ArrowDown: - 1, PageUp: 5, PageDown: - 5 }[ e.key ];
+				if ( ! d || e.ctrlKey || e.metaKey || e.altKey ) return;
+				e.preventDefault();
+				const cur = fromSlider( + input.value );
+				let next = fromSlider( Math.min( 1000, Math.max( 0, toSlider( cur ) + ( d * 1000 ) / presses ) ) );
+				if ( Math.sign( next - cur ) !== Math.sign( d ) ) next = Math.min( item.max, Math.max( item.min, + ( cur + Math.sign( d ) * step ).toFixed( Math.max( dec, 3 ) ) ) );
+				if ( next === cur ) return;
+				input.value = toSlider( next );
+				input.dispatchEvent( new Event( 'input', { bubbles: true } ) );
+
+			} );
+
+		}
+
 		label.addEventListener( 'dblclick', () => {
 
 			if ( set ) {
@@ -982,7 +1020,7 @@ export class Panel {
 
 			const stops = [];
 			for ( let k = 0; k <= 6; k ++ ) stops.push( paletteCss( p, k / 6 ) );
-			const b = h( 'button.wgv-swatch', { role: 'radio', title: PALETTES[ p ]?.label || p, 'aria-label': PALETTES[ p ]?.label || p, style: { '--g': `linear-gradient(90deg, ${stops.join( ', ' )})` } } );
+			const b = h( 'button.wgv-swatch', { role: 'radio', title: paletteLabel( p ), 'aria-label': paletteLabel( p ), style: { '--g': `linear-gradient(90deg, ${stops.join( ', ' )})` } } );
 			b.addEventListener( 'click', () => this._change( item.key, p ) );
 			wrap.append( b );
 			return b;
@@ -1111,7 +1149,7 @@ export class Panel {
 
 	}
 
-	/** Whole look: theme, palette, edge style and lens behind one choice. Nothing is lit when the settings match no look. */
+	/** Whole look: theme, palette, edge style and camera effects behind one choice. Nothing is lit when the settings match no look. */
 	_look( item ) {
 
 		const row = this._segmented( { label: 'Look', caption: 'Look', full: true, options: LOOKS, visible: item.visible, live: true }, {
@@ -1426,9 +1464,9 @@ export class Panel {
 
 		const [ cN, nodes ] = cell( 'nodes' );
 		const [ cE, edges ] = cell( 'edges' );
-		const [ cC, clusters ] = cell( 'clusters' );
+		const [ cC, communities ] = cell( 'communities' );
 		const [ cL, levels ] = cell( 'levels' );
-		this._stats = { nodes, edges, clusters, levels };
+		this._stats = { nodes, edges, communities, levels };
 		const c = this.options.credit;
 		return h( 'footer.wgv-foot', null,
 			h( 'div.wgv-stats', null, cN, cE, cC, cL ),

@@ -52,7 +52,9 @@
 //    canvas. setInsets( { left, right, top, bottom } ) shifts the projection centre (camera view
 //    offset, eased) so the graph is centred in the free area, and fitting uses the free area.
 //    When the free area changes (insets, window size) and the rig still owns the framing, the
-//    fit follows softly; a camera the user placed keeps its distance and only shifts.
+//    fit follows softly; a camera the user placed keeps its distance and only shifts. A fit never
+//    assumes less than half of the height (a quarter of the width) to be free: a tall sheet, like
+//    the node card of a phone, moves the view centre but does not push the camera far out.
 //  • Interaction (order 30) calls setInputLocked( true ) while a press that started on a node is
 //    in progress: rotation / pan / look are blocked but pointers stay tracked, so when a second
 //    finger lands the lock is released and the pinch goes straight to the camera.
@@ -110,8 +112,11 @@ const _q = new Quaternion();
 const _m = new Matrix4();
 const ZERO = new Vector3();
 const _sd = [ 0, 0 ];
+const _free = { w: 1, h: 1 };
 
 const MAX_PITCH = 1.553; // 89°: the up vector stays well defined
+// smallest share of the view's width / height that a fit assumes to be free (see _freeFraction)
+const FREE_MIN_W = 0.25, FREE_MIN_H = 0.5;
 const KEY_TARGETS = 'input, select, textarea, button, a, summary, [role], [contenteditable=""], [contenteditable="true"], [tabindex]';
 
 // ── pure helpers ───────────────────────────────────────────────────────────────────────────
@@ -696,11 +701,24 @@ export class CameraRig {
 	/** Distance at which a sphere of radius r fills the free (non-inset) part of the view. */
 	fitDistance( r ) {
 
-		const cam = this.camera, ins = this._insets;
+		const f = this._freeFraction();
+		return fitDistanceFor( r, this._orbitFov, this.camera.aspect, f.w, f.h );
+
+	}
+
+	/**
+	 * The share of the view that counts as free when a distance is fitted. Covered height counts
+	 * up to half of the view only: a sheet that takes more than that (the node card of a phone)
+	 * shifts the view centre like every inset, but does not push the camera far out for the
+	 * moment it is open (FREE_MIN_H, FREE_MIN_W).
+	 */
+	_freeFraction() {
+
+		const ins = this._insets;
 		const w = Math.max( 1, this.app?.width || 1 ), h = Math.max( 1, this.app?.height || 1 );
-		const fw = Math.max( 0.25 * w, w - ins.left - ins.right ) / w;
-		const fh = Math.max( 0.25 * h, h - ins.top - ins.bottom ) / h;
-		return fitDistanceFor( r, this._orbitFov, cam.aspect, fw, fh );
+		_free.w = Math.max( FREE_MIN_W * w, w - ins.left - ins.right ) / w;
+		_free.h = Math.max( FREE_MIN_H * h, h - ins.top - ins.bottom ) / h;
+		return _free;
 
 	}
 
@@ -1291,12 +1309,9 @@ export class CameraRig {
 
 	_tanHalfFree() {
 
-		const cam = this.camera, ins = this._insets;
-		const w = Math.max( 1, this.app?.width || 1 ), h = Math.max( 1, this.app?.height || 1 );
-		const fw = Math.max( 0.25 * w, w - ins.left - ins.right ) / w;
-		const fh = Math.max( 0.25 * h, h - ins.top - ins.bottom ) / h;
+		const cam = this.camera, f = this._freeFraction();
 		const t = Math.tan( MathUtils.degToRad( this._orbitFov ) / 2 );
-		return Math.min( t * fh, t * cam.aspect * fw );
+		return Math.min( t * f.h, t * cam.aspect * f.w );
 
 	}
 
