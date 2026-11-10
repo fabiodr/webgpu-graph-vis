@@ -16,8 +16,11 @@
 //
 // Children get pointer events, the containers do not, so the canvas stays reachable between them.
 // CSS variables published on <html>: --wgv-inset-left / -right / -top / -bottom, --wgv-bottom-h
-// (current height of the bottom slot, for surfaces that must stay clear of it on phones); the
+// (current height of the bottom slot, for surfaces that must stay clear of it on phones),
+// --wgv-bottom-clear (that height plus a gap, 0 while the slot is empty: the status chips sit
+// above it), --wgv-tools-w (current width of the top right slot: the top slot leaves that room free); the
 // settings panel publishes --wgv-sheet-h (visible height of the phone bottom sheet).
+// <html class="wgv-ui-hidden"> (photo mode) hides the slots root and everything in it.
 import './slots.css';
 
 let instance = null;
@@ -60,10 +63,15 @@ export function uiSlots( container = document.body ) {
 	container.appendChild( root );
 	const observer = typeof ResizeObserver === 'function' ? new ResizeObserver( () => {
 
-		document.documentElement.style.setProperty( '--wgv-bottom-h', slots.bottom.offsetHeight + 'px' );
+		const style = document.documentElement.style;
+		const h = slots.bottom.offsetHeight;
+		style.setProperty( '--wgv-bottom-h', h + 'px' );
+		style.setProperty( '--wgv-bottom-clear', ( h > 0 ? h + 8 : 0 ) + 'px' );
+		style.setProperty( '--wgv-tools-w', slots.topRight.offsetWidth + 'px' );
 
 	} ) : null;
 	observer?.observe( slots.bottom );
+	observer?.observe( slots.topRight );
 	instance = slots;
 	return slots;
 

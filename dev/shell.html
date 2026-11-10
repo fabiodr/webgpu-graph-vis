@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<base href="../" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>dev: shell</title>
+<style>
+html, body { margin: 0; height: 100%; background: #04060c; overflow: hidden; overscroll-behavior: none; color: #d8e2f0; font: 14px/1.4 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+#app { position: fixed; inset: 0; }
+#boot { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; transition: opacity .6s; }
+#boot.hidden { opacity: 0; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="boot"><div class="msg">Starting WebGPU…</div></div>
+<script type="module">
+// Dev page of the shell: the application itself (src/main.js, unchanged) with stand-ins for the
+// modules other packages are still building, so every control of the settings panel, the share
+// link and the help can be seen and exercised before those modules arrive.
+//
+// Query (besides everything the application understands: ?ds= ?layout= ?quality= ?hint= …):
+//   mock=0            no stand-ins: the page is the application as it is in this tree
+//   open=all | a,b    open these panel sections (dataset, layout, communities, edges, nodes,
+//                     scene, camera, quality); adv=1 also opens their "Advanced" groups
+//   show=help | photo | drop | hint | sheet | toast | loading | collapsed
+//                     put the UI into that state once the graph is there
+//   slow=<ms>         how long the stand-in re-clustering / bundling takes (default 700)
+//
+// Stand-ins (mock ≠ 0), installed the moment main.js publishes window.__ui, i.e. before the first
+// graph and before a share link is restored:
+//   data.recluster / data.bundle (with progress) / data.cancelBundle / data.formats, edges.style /
+//   .flow / .setPaths, field.focus, labels.clusterLabels, env.dust, and an explore API with
+//   commands.register / has, shortcuts, search.open, state() and restore() (state: { selection,
+//   note }), insets() and the 'exploreinsets' event.
+// window.__mock records what the application called: { calls: [ [ name, …args ] ], commands: [],
+// restored: state | null }; __mock.setInsets( { right: 340 } ) plays an explore surface opening.
+// window.__bbox() is the screen box of the nodes (camera framing).
+const params = new URLSearchParams( location.search );
+const mock = { calls: [], commands: [], restored: null, enabled: params.get( 'mock' ) !== '0' };
+window.__mock = mock;
+const delay = ( ms ) => new Promise( ( r ) => setTimeout( r, ms ) );
+const slow = + ( params.get( 'slow' ) || 700 );
+
+function install( ui ) {
+
+	const { app, data, edges, field, labels, env, explore, interaction } = ui;
+	const own = ( obj, key, value ) => Object.defineProperty( obj, key, { value, writable: true, configurable: true, enumerable: true } );
+
+	if ( typeof data.formats !== 'function' ) {
+
+		data.formats = () => [
+			{ id: 'json', name: 'Graph JSON', extensions: [ '.json' ] },
+			{ id: 'graphml', name: 'GraphML', extensions: [ '.graphml' ] },
+			{ id: 'gexf', name: 'GEXF', extensions: [ '.gexf' ] },
+			{ id: 'gml', name: 'GML', extensions: [ '.gml' ] },
+			{ id: 'edgelist', name: 'Edge list', extensions: [ '.csv', '.tsv', '.txt', '.edges', '.mtx' ] },
+		];
+
+	}
+
+	if ( typeof data.recluster !== 'function' ) {
+
+		// the same graph again (worker cache), labelled as the requested clustering
+		data.recluster = async ( options, prepare = {} ) => {
+
+			mock.calls.push( [ 'recluster', { ...options }, { positions: !! prepare.positions } ] );
+			await delay( slow );
+			const { positions, ...rest } = prepare;
+			const r = await data.reprepare( rest );
+			if ( r.cancelled ) return r;
+			r.graph.clustering = { method: options.method, resolution: options.resolution, levels: r.graph.D, modularity: 0.5 };
+			if ( positions && positions.length === r.graph.initPos.length ) r.graph.initPos.set( positions );
+			return r;
+
+		};
+
+	}
+
+	if ( typeof data.bundle !== 'function' ) {
+
+		// like the data layer: progress while it works, cancelBundle() ends the request in flight
+		let job = 0;
+		data.bundle = async ( options ) => {
+
+			const id = ++ job;
+			mock.calls.push( [ 'bundle', { mode: options.mode, positions: options.positions.length } ] );
+			for ( let k = 1; k <= 5; k ++ ) {
+
+				await delay( slow / 5 );
+				if ( id !== job ) return { cancelled: true };
+				options.onProgress?.( { phase: 'route', fraction: k / 5, completed: k, total: 5 } );
+
+			}
+
+			const { hierarchicalPaths } = await import( '../src/graph/bundling.js' );
+			return { cancelled: false, paths: hierarchicalPaths( app.graph ), load: new Float32Array( app.graph.E ), stats: {}, timings: { compute: slow * 0.9, roundTrip: slow } };
+
+		};
+
+		data.cancelBundle = () => {
+
+			mock.calls.push( [ 'cancelBundle' ] );
+			job ++;
+
+		};
+
+	}
+
+	if ( typeof edges.setPaths !== 'function' && ! edges.curves?.setPaths ) edges.setPaths = ( paths ) => mock.calls.push( [ 'setPaths', paths ? paths.pathStart.length - 1 : null ] );
+	if ( ! ( 'style' in edges ) ) own( edges, 'style', 'luminous' );
+	if ( ! ( 'flow' in edges ) ) own( edges, 'flow', 'selection' );
+	if ( typeof field.focus !== 'function' ) field.focus = ( c ) => mock.calls.push( [ 'field.focus', c ] );
+	if ( ! ( 'clusterLabels' in labels ) ) own( labels, 'clusterLabels', 'auto' );
+	if ( ! ( 'dust' in env ) ) own( env, 'dust', 0.35 );
+
+	if ( ! explore.commands ) {
+
+		const drop = ( id ) => mock.commands.splice( 0, mock.commands.length, ...mock.commands.filter( ( c ) => c.id !== id ) );
+		explore.commands = {
+			register: ( c ) => ( drop( c.id ), mock.commands.push( c ) ), // the same id again replaces
+			unregister: drop,
+			has: ( id ) => mock.commands.some( ( c ) => c.id === id ),
+		};
+		explore.shortcuts = [
+			{ keys: '/', title: 'Search nodes and commands', group: 'Explore' },
+			{ keys: [ 'I' ], title: 'Insights', group: 'Explore' },
+			{ keys: [ '[', ']' ], title: 'Previous or next neighbour', group: 'Explore' },
+		];
+		explore.search = { open: ( text ) => mock.calls.push( [ 'search.open', text ] ) };
+		explore.state = () => ( { selection: interaction.selectedIndex, note: 'dev' } );
+		explore.restore = ( state ) => {
+
+			mock.restored = state;
+			if ( state && state.selection >= 0 ) interaction.select( state.selection );
+
+		};
+
+		// what the explore surfaces cover; __mock.setInsets( { right: 340 } ) plays a drawer opening
+		let covered = { left: 0, right: 0, top: 0, bottom: 0 };
+		explore.insets = () => ( { ...covered } );
+		mock.setInsets = ( insets ) => {
+
+			covered = { left: 0, right: 0, top: 0, bottom: 0, ...insets };
+			app.events.dispatchEvent( new CustomEvent( 'exploreinsets', { detail: { ...covered } } ) );
+
+		};
+
+	}
+
+	ui.registerCommands();
+	ui.refreshFeatures();
+
+}
+
+// main.js assigns window.__ui before it loads the first graph: catch that moment
+if ( mock.enabled ) {
+
+	Object.defineProperty( window, '__ui', {
+		configurable: true,
+		set( ui ) {
+
+			Object.defineProperty( window, '__ui', { value: ui, writable: true, configurable: true } );
+			install( ui );
+
+		},
+	} );
+
+}
+
+/** Screen box of the nodes, CSS px: [ left, top, right, bottom ] (to check how the camera frames the graph). */
+window.__bbox = () => {
+
+	const a = window.__app, cam = a.camera, p = a.positions, N = a.graph.N;
+	cam.updateMatrixWorld();
+	const m = cam.projectionMatrix.clone().multiply( cam.matrixWorldInverse ).elements;
+	const box = [ Infinity, Infinity, - Infinity, - Infinity ];
+	for ( let i = 0; i < N; i ++ ) {
+
+		const x = p[ 4 * i ], y = p[ 4 * i + 1 ], z = p[ 4 * i + 2 ];
+		const w = m[ 3 ] * x + m[ 7 ] * y + m[ 11 ] * z + m[ 15 ];
+		const sx = ( ( m[ 0 ] * x + m[ 4 ] * y + m[ 8 ] * z + m[ 12 ] ) / w * 0.5 + 0.5 ) * innerWidth;
+		const sy = ( 0.5 - ( m[ 1 ] * x + m[ 5 ] * y + m[ 9 ] * z + m[ 13 ] ) / w * 0.5 ) * innerHeight;
+		box[ 0 ] = Math.min( box[ 0 ], sx ); box[ 1 ] = Math.min( box[ 1 ], sy );
+		box[ 2 ] = Math.max( box[ 2 ], sx ); box[ 3 ] = Math.max( box[ 3 ], sy );
+
+	}
+
+	return box.map( Math.round );
+
+};
+
+await import( '../src/main.js' );
+while ( ! window.__ready && ! window.__error ) await delay( 50 );
+if ( window.__ready ) {
+
+	const { panel, photo, help } = window.__ui;
+	const open = params.get( 'open' );
+	if ( open ) {
+
+		const all = [ 'dataset', 'layout', 'communities', 'edges', 'nodes', 'scene', 'camera', 'quality' ];
+		const want = open === 'all' ? all : open.split( ',' );
+		for ( const id of all ) panel.openSection( id, want.includes( id ) );
+		if ( params.get( 'adv' ) === '1' ) for ( const b of document.querySelectorAll( '.wgv-group.is-closed > .wgv-group-h' ) ) b.click();
+
+	}
+
+	for ( const state of ( params.get( 'show' ) || '' ).split( ',' ) ) {
+
+		if ( state === 'help' ) help.show( true );
+		else if ( state === 'photo' ) photo.enter();
+		else if ( state === 'drop' ) document.documentElement.classList.add( 'wgv-drop-active' );
+		else if ( state === 'hint' ) help.showHint( { force: true } );
+		else if ( state === 'sheet' ) panel.setCollapsed( false );
+		else if ( state === 'collapsed' ) panel.setCollapsed( true );
+		else if ( state === 'toast' ) {
+
+			panel.toast( 'Link copied · 142 characters', { type: 'info', duration: 0 } );
+			panel.toast( 'Could not open “broken.graphml”: unexpected end of the file', { type: 'error', duration: 0 } );
+
+		} else if ( state === 'loading' ) panel.setLoading( 'Finding communities…', 0.4 );
+
+	}
+
+}
+</script>
+</body>
+</html>

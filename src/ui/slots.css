@@ -13,7 +13,12 @@
 	--wgv-pad-b: max(12px, env(safe-area-inset-bottom));
 	--wgv-pad-l: max(12px, env(safe-area-inset-left));
 	--wgv-top-row: 44px; /* height reserved for the top row (search, tool buttons) */
+	transition: opacity 0.25s, visibility 0s;
 }
+
+/* photo mode: everything inside the slots steps aside */
+.wgv-ui-hidden .wgv-slots { opacity: 0; visibility: hidden; transition: opacity 0.25s, visibility 0s 0.25s; }
+.wgv-ui-hidden .wgv-slots .wgv-slot > * { pointer-events: none; }
 
 .wgv-slot {
 	position: absolute;
@@ -27,11 +32,12 @@
 .wgv-slot > * { pointer-events: auto; }
 .wgv-slot > .wgv-slot-end { margin-top: auto; } /* in a column: push to the far end */
 
-/* top centre of the free area: search */
+/* top centre of the free area: search. The tool buttons of the corner keep their room
+   (--wgv-tools-w, published by slots.js), so the two rows never overlap in a small window. */
 .wgv-slot-top {
 	top: var(--wgv-pad-t);
 	left: calc(var(--wgv-inset-left, 0px) + var(--wgv-pad-l));
-	right: calc(var(--wgv-inset-right, 0px) + var(--wgv-pad-r));
+	right: calc(max(var(--wgv-inset-right, 0px), var(--wgv-tools-w, 0px) + 8px) + var(--wgv-pad-r));
 	justify-content: center;
 	align-items: flex-start;
 }
@@ -64,20 +70,24 @@
 	align-items: center;
 }
 
-/* bottom left of the free area: status chips (frame rate, quality tier, layout state) */
+/* bottom left of the free area: status chips (frame rate, quality tier, layout state). They sit
+   above whatever the bottom slot shows (--wgv-bottom-clear: its height and a gap, 0 when empty) */
 .wgv-slot-status {
-	bottom: var(--wgv-pad-b);
+	bottom: calc(var(--wgv-pad-b) + var(--wgv-bottom-clear, 0px));
 	left: calc(var(--wgv-inset-left, 0px) + var(--wgv-pad-l));
 	align-items: flex-end;
+	transition: bottom 0.3s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 /* phones: the panel is a bottom sheet; everything at the bottom sits above it, the right column
    becomes a full-width stack above the bottom slot */
 @media (max-width: 640px) {
 
-	.wgv-slot-top { left: var(--wgv-pad-l); right: var(--wgv-pad-r); }
+	.wgv-slots { --wgv-top-row: 50px; }
+	.wgv-slot-top { left: var(--wgv-pad-l); right: calc(var(--wgv-tools-w, 0px) + 8px + var(--wgv-pad-r)); justify-content: flex-start; }
 	.wgv-slot-bottom { left: var(--wgv-pad-l); right: var(--wgv-pad-r); bottom: calc(var(--wgv-sheet-h, 0px) + 8px); }
-	.wgv-slot-status { left: var(--wgv-pad-l); bottom: auto; top: var(--wgv-pad-t); align-items: flex-start; }
+	/* status chips: under the top row, out of the thumb's way */
+	.wgv-slot-status { left: var(--wgv-pad-l); right: var(--wgv-pad-r); bottom: auto; top: calc(var(--wgv-pad-t) + var(--wgv-top-row)); align-items: flex-start; }
 	.wgv-slot-right {
 		left: var(--wgv-pad-l);
 		width: auto;
