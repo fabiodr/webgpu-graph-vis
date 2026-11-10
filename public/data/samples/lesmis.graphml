@@ -1,0 +1,340 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<graphml xmlns="http://graphml.graphdrawing.org/xmlns">
+  <key id="d0" for="node" attr.name="label" attr.type="string"/>
+  <key id="d1" for="node" attr.name="community" attr.type="string"/>
+  <key id="d2" for="node" attr.name="degree" attr.type="double"/>
+  <key id="w" for="edge" attr.name="weight" attr.type="double"/>
+  <graph id="Les Misérables (sample)" edgedefault="undirected">
+    <node id="n0"><data key="d0">Myriel</data><data key="d1">c0</data><data key="d2">10</data></node>
+    <node id="n1"><data key="d0">Napoleon</data><data key="d1">c0</data><data key="d2">1</data></node>
+    <node id="n2"><data key="d0">Mlle.Baptistine</data><data key="d1">c1</data><data key="d2">3</data></node>
+    <node id="n3"><data key="d0">Mme.Magloire</data><data key="d1">c1</data><data key="d2">3</data></node>
+    <node id="n4"><data key="d0">CountessdeLo</data><data key="d1">c0</data><data key="d2">1</data></node>
+    <node id="n5"><data key="d0">Geborand</data><data key="d1">c0</data><data key="d2">1</data></node>
+    <node id="n6"><data key="d0">Champtercier</data><data key="d1">c0</data><data key="d2">1</data></node>
+    <node id="n7"><data key="d0">Cravatte</data><data key="d1">c0</data><data key="d2">1</data></node>
+    <node id="n8"><data key="d0">Count</data><data key="d1">c0</data><data key="d2">1</data></node>
+    <node id="n9"><data key="d0">OldMan</data><data key="d1">c0</data><data key="d2">1</data></node>
+    <node id="n10"><data key="d0">Labarre</data><data key="d1">c1</data><data key="d2">1</data></node>
+    <node id="n11"><data key="d0">Valjean</data><data key="d1">c1</data><data key="d2">36</data></node>
+    <node id="n12"><data key="d0">Marguerite</data><data key="d1">c1</data><data key="d2">2</data></node>
+    <node id="n13"><data key="d0">Mme.deR</data><data key="d1">c1</data><data key="d2">1</data></node>
+    <node id="n14"><data key="d0">Isabeau</data><data key="d1">c1</data><data key="d2">1</data></node>
+    <node id="n15"><data key="d0">Gervais</data><data key="d1">c1</data><data key="d2">1</data></node>
+    <node id="n16"><data key="d0">Tholomyes</data><data key="d1">c2</data><data key="d2">9</data></node>
+    <node id="n17"><data key="d0">Listolier</data><data key="d1">c2</data><data key="d2">7</data></node>
+    <node id="n18"><data key="d0">Fameuil</data><data key="d1">c2</data><data key="d2">7</data></node>
+    <node id="n19"><data key="d0">Blacheville</data><data key="d1">c2</data><data key="d2">7</data></node>
+    <node id="n20"><data key="d0">Favourite</data><data key="d1">c2</data><data key="d2">7</data></node>
+    <node id="n21"><data key="d0">Dahlia</data><data key="d1">c2</data><data key="d2">7</data></node>
+    <node id="n22"><data key="d0">Zephine</data><data key="d1">c2</data><data key="d2">7</data></node>
+    <node id="n23"><data key="d0">Fantine</data><data key="d1">c2</data><data key="d2">15</data></node>
+    <node id="n24"><data key="d0">Mme.Thenardier</data><data key="d1">c3</data><data key="d2">11</data></node>
+    <node id="n25"><data key="d0">Thenardier</data><data key="d1">c3</data><data key="d2">16</data></node>
+    <node id="n26"><data key="d0">Cosette</data><data key="d1">c4</data><data key="d2">11</data></node>
+    <node id="n27"><data key="d0">Javert</data><data key="d1">c3</data><data key="d2">17</data></node>
+    <node id="n28"><data key="d0">Fauchelevent</data><data key="d1">c1</data><data key="d2">4</data></node>
+    <node id="n29"><data key="d0">Bamatabois</data><data key="d1">c1</data><data key="d2">8</data></node>
+    <node id="n30"><data key="d0">Perpetue</data><data key="d1">c2</data><data key="d2">2</data></node>
+    <node id="n31"><data key="d0">Simplice</data><data key="d1">c2</data><data key="d2">4</data></node>
+    <node id="n32"><data key="d0">Scaufflaire</data><data key="d1">c1</data><data key="d2">1</data></node>
+    <node id="n33"><data key="d0">Woman1</data><data key="d1">c1</data><data key="d2">2</data></node>
+    <node id="n34"><data key="d0">Judge</data><data key="d1">c1</data><data key="d2">6</data></node>
+    <node id="n35"><data key="d0">Champmathieu</data><data key="d1">c1</data><data key="d2">6</data></node>
+    <node id="n36"><data key="d0">Brevet</data><data key="d1">c1</data><data key="d2">6</data></node>
+    <node id="n37"><data key="d0">Chenildieu</data><data key="d1">c1</data><data key="d2">6</data></node>
+    <node id="n38"><data key="d0">Cochepaille</data><data key="d1">c1</data><data key="d2">6</data></node>
+    <node id="n39"><data key="d0">Pontmercy</data><data key="d1">c4</data><data key="d2">3</data></node>
+    <node id="n40"><data key="d0">Boulatruelle</data><data key="d1">c3</data><data key="d2">1</data></node>
+    <node id="n41"><data key="d0">Eponine</data><data key="d1">c3</data><data key="d2">11</data></node>
+    <node id="n42"><data key="d0">Anzelma</data><data key="d1">c3</data><data key="d2">3</data></node>
+    <node id="n43"><data key="d0">Woman2</data><data key="d1">c4</data><data key="d2">3</data></node>
+    <node id="n44"><data key="d0">MotherInnocent</data><data key="d1">c1</data><data key="d2">2</data></node>
+    <node id="n45"><data key="d0">Gribier</data><data key="d1">c1</data><data key="d2">1</data></node>
+    <node id="n46"><data key="d0">Jondrette</data><data key="d1">c5</data><data key="d2">1</data></node>
+    <node id="n47"><data key="d0">Mme.Burgon</data><data key="d1">c5</data><data key="d2">2</data></node>
+    <node id="n48"><data key="d0">Gavroche</data><data key="d1">c5</data><data key="d2">22</data></node>
+    <node id="n49"><data key="d0">Gillenormand</data><data key="d1">c4</data><data key="d2">7</data></node>
+    <node id="n50"><data key="d0">Magnon</data><data key="d1">c4</data><data key="d2">2</data></node>
+    <node id="n51"><data key="d0">Mlle.Gillenormand</data><data key="d1">c4</data><data key="d2">7</data></node>
+    <node id="n52"><data key="d0">Mme.Pontmercy</data><data key="d1">c4</data><data key="d2">2</data></node>
+    <node id="n53"><data key="d0">Mlle.Vaubois</data><data key="d1">c4</data><data key="d2">1</data></node>
+    <node id="n54"><data key="d0">Lt.Gillenormand</data><data key="d1">c4</data><data key="d2">4</data></node>
+    <node id="n55"><data key="d0">Marius</data><data key="d1">c4</data><data key="d2">19</data></node>
+    <node id="n56"><data key="d0">BaronessT</data><data key="d1">c4</data><data key="d2">2</data></node>
+    <node id="n57"><data key="d0">Mabeuf</data><data key="d1">c5</data><data key="d2">11</data></node>
+    <node id="n58"><data key="d0">Enjolras</data><data key="d1">c5</data><data key="d2">15</data></node>
+    <node id="n59"><data key="d0">Combeferre</data><data key="d1">c5</data><data key="d2">11</data></node>
+    <node id="n60"><data key="d0">Prouvaire</data><data key="d1">c5</data><data key="d2">9</data></node>
+    <node id="n61"><data key="d0">Feuilly</data><data key="d1">c5</data><data key="d2">11</data></node>
+    <node id="n62"><data key="d0">Courfeyrac</data><data key="d1">c5</data><data key="d2">13</data></node>
+    <node id="n63"><data key="d0">Bahorel</data><data key="d1">c5</data><data key="d2">12</data></node>
+    <node id="n64"><data key="d0">Bossuet</data><data key="d1">c5</data><data key="d2">13</data></node>
+    <node id="n65"><data key="d0">Joly</data><data key="d1">c5</data><data key="d2">12</data></node>
+    <node id="n66"><data key="d0">Grantaire</data><data key="d1">c5</data><data key="d2">10</data></node>
+    <node id="n67"><data key="d0">MotherPlutarch</data><data key="d1">c5</data><data key="d2">1</data></node>
+    <node id="n68"><data key="d0">Gueulemer</data><data key="d1">c3</data><data key="d2">10</data></node>
+    <node id="n69"><data key="d0">Babet</data><data key="d1">c3</data><data key="d2">10</data></node>
+    <node id="n70"><data key="d0">Claquesous</data><data key="d1">c3</data><data key="d2">10</data></node>
+    <node id="n71"><data key="d0">Montparnasse</data><data key="d1">c3</data><data key="d2">9</data></node>
+    <node id="n72"><data key="d0">Toussaint</data><data key="d1">c1</data><data key="d2">3</data></node>
+    <node id="n73"><data key="d0">Child1</data><data key="d1">c5</data><data key="d2">2</data></node>
+    <node id="n74"><data key="d0">Child2</data><data key="d1">c5</data><data key="d2">2</data></node>
+    <node id="n75"><data key="d0">Brujon</data><data key="d1">c3</data><data key="d2">7</data></node>
+    <node id="n76"><data key="d0">Mme.Hucheloup</data><data key="d1">c5</data><data key="d2">7</data></node>
+    <edge source="n0" target="n1"><data key="w">1</data></edge>
+    <edge source="n0" target="n2"><data key="w">3</data></edge>
+    <edge source="n0" target="n3"><data key="w">3</data></edge>
+    <edge source="n0" target="n4"><data key="w">1</data></edge>
+    <edge source="n0" target="n5"><data key="w">1</data></edge>
+    <edge source="n0" target="n6"><data key="w">1</data></edge>
+    <edge source="n0" target="n7"><data key="w">1</data></edge>
+    <edge source="n0" target="n8"><data key="w">1</data></edge>
+    <edge source="n0" target="n9"><data key="w">1</data></edge>
+    <edge source="n0" target="n11"><data key="w">3</data></edge>
+    <edge source="n2" target="n3"><data key="w">3</data></edge>
+    <edge source="n2" target="n11"><data key="w">3</data></edge>
+    <edge source="n3" target="n11"><data key="w">3</data></edge>
+    <edge source="n10" target="n11"><data key="w">1</data></edge>
+    <edge source="n11" target="n12"><data key="w">2</data></edge>
+    <edge source="n11" target="n13"><data key="w">1</data></edge>
+    <edge source="n11" target="n14"><data key="w">1</data></edge>
+    <edge source="n11" target="n15"><data key="w">1</data></edge>
+    <edge source="n11" target="n23"><data key="w">7</data></edge>
+    <edge source="n11" target="n24"><data key="w">8</data></edge>
+    <edge source="n11" target="n25"><data key="w">11</data></edge>
+    <edge source="n11" target="n26"><data key="w">9</data></edge>
+    <edge source="n11" target="n27"><data key="w">17</data></edge>
+    <edge source="n11" target="n28"><data key="w">3</data></edge>
+    <edge source="n11" target="n29"><data key="w">8</data></edge>
+    <edge source="n11" target="n31"><data key="w">3</data></edge>
+    <edge source="n11" target="n32"><data key="w">1</data></edge>
+    <edge source="n11" target="n33"><data key="w">2</data></edge>
+    <edge source="n11" target="n34"><data key="w">6</data></edge>
+    <edge source="n11" target="n35"><data key="w">6</data></edge>
+    <edge source="n11" target="n36"><data key="w">6</data></edge>
+    <edge source="n11" target="n37"><data key="w">6</data></edge>
+    <edge source="n11" target="n38"><data key="w">6</data></edge>
+    <edge source="n11" target="n43"><data key="w">3</data></edge>
+    <edge source="n11" target="n44"><data key="w">2</data></edge>
+    <edge source="n11" target="n48"><data key="w">9</data></edge>
+    <edge source="n11" target="n49"><data key="w">4</data></edge>
+    <edge source="n11" target="n51"><data key="w">4</data></edge>
+    <edge source="n11" target="n55"><data key="w">8</data></edge>
+    <edge source="n11" target="n58"><data key="w">6</data></edge>
+    <edge source="n11" target="n64"><data key="w">4</data></edge>
+    <edge source="n11" target="n68"><data key="w">8</data></edge>
+    <edge source="n11" target="n69"><data key="w">8</data></edge>
+    <edge source="n11" target="n70"><data key="w">8</data></edge>
+    <edge source="n11" target="n71"><data key="w">7</data></edge>
+    <edge source="n11" target="n72"><data key="w">3</data></edge>
+    <edge source="n12" target="n23"><data key="w">2</data></edge>
+    <edge source="n16" target="n17"><data key="w">7</data></edge>
+    <edge source="n16" target="n18"><data key="w">7</data></edge>
+    <edge source="n16" target="n19"><data key="w">7</data></edge>
+    <edge source="n16" target="n20"><data key="w">7</data></edge>
+    <edge source="n16" target="n21"><data key="w">7</data></edge>
+    <edge source="n16" target="n22"><data key="w">7</data></edge>
+    <edge source="n16" target="n23"><data key="w">7</data></edge>
+    <edge source="n16" target="n26"><data key="w">2</data></edge>
+    <edge source="n16" target="n55"><data key="w">2</data></edge>
+    <edge source="n17" target="n18"><data key="w">7</data></edge>
+    <edge source="n17" target="n19"><data key="w">7</data></edge>
+    <edge source="n17" target="n20"><data key="w">7</data></edge>
+    <edge source="n17" target="n21"><data key="w">7</data></edge>
+    <edge source="n17" target="n22"><data key="w">7</data></edge>
+    <edge source="n17" target="n23"><data key="w">7</data></edge>
+    <edge source="n18" target="n19"><data key="w">7</data></edge>
+    <edge source="n18" target="n20"><data key="w">7</data></edge>
+    <edge source="n18" target="n21"><data key="w">7</data></edge>
+    <edge source="n18" target="n22"><data key="w">7</data></edge>
+    <edge source="n18" target="n23"><data key="w">7</data></edge>
+    <edge source="n19" target="n20"><data key="w">7</data></edge>
+    <edge source="n19" target="n21"><data key="w">7</data></edge>
+    <edge source="n19" target="n22"><data key="w">7</data></edge>
+    <edge source="n19" target="n23"><data key="w">7</data></edge>
+    <edge source="n20" target="n21"><data key="w">7</data></edge>
+    <edge source="n20" target="n22"><data key="w">7</data></edge>
+    <edge source="n20" target="n23"><data key="w">7</data></edge>
+    <edge source="n21" target="n22"><data key="w">7</data></edge>
+    <edge source="n21" target="n23"><data key="w">7</data></edge>
+    <edge source="n22" target="n23"><data key="w">7</data></edge>
+    <edge source="n23" target="n24"><data key="w">4</data></edge>
+    <edge source="n23" target="n25"><data key="w">4</data></edge>
+    <edge source="n23" target="n27"><data key="w">6</data></edge>
+    <edge source="n23" target="n29"><data key="w">3</data></edge>
+    <edge source="n23" target="n30"><data key="w">2</data></edge>
+    <edge source="n23" target="n31"><data key="w">4</data></edge>
+    <edge source="n24" target="n25"><data key="w">10</data></edge>
+    <edge source="n24" target="n26"><data key="w">4</data></edge>
+    <edge source="n24" target="n27"><data key="w">8</data></edge>
+    <edge source="n24" target="n41"><data key="w">6</data></edge>
+    <edge source="n24" target="n42"><data key="w">3</data></edge>
+    <edge source="n24" target="n50"><data key="w">1</data></edge>
+    <edge source="n24" target="n68"><data key="w">7</data></edge>
+    <edge source="n24" target="n69"><data key="w">7</data></edge>
+    <edge source="n24" target="n70"><data key="w">7</data></edge>
+    <edge source="n25" target="n26"><data key="w">5</data></edge>
+    <edge source="n25" target="n27"><data key="w">10</data></edge>
+    <edge source="n25" target="n39"><data key="w">2</data></edge>
+    <edge source="n25" target="n40"><data key="w">1</data></edge>
+    <edge source="n25" target="n41"><data key="w">9</data></edge>
+    <edge source="n25" target="n42"><data key="w">3</data></edge>
+    <edge source="n25" target="n48"><data key="w">8</data></edge>
+    <edge source="n25" target="n55"><data key="w">6</data></edge>
+    <edge source="n25" target="n68"><data key="w">10</data></edge>
+    <edge source="n25" target="n69"><data key="w">10</data></edge>
+    <edge source="n25" target="n70"><data key="w">9</data></edge>
+    <edge source="n25" target="n71"><data key="w">9</data></edge>
+    <edge source="n25" target="n75"><data key="w">7</data></edge>
+    <edge source="n26" target="n27"><data key="w">6</data></edge>
+    <edge source="n26" target="n43"><data key="w">3</data></edge>
+    <edge source="n26" target="n49"><data key="w">5</data></edge>
+    <edge source="n26" target="n51"><data key="w">5</data></edge>
+    <edge source="n26" target="n54"><data key="w">4</data></edge>
+    <edge source="n26" target="n55"><data key="w">7</data></edge>
+    <edge source="n26" target="n72"><data key="w">3</data></edge>
+    <edge source="n27" target="n28"><data key="w">2</data></edge>
+    <edge source="n27" target="n29"><data key="w">3</data></edge>
+    <edge source="n27" target="n31"><data key="w">3</data></edge>
+    <edge source="n27" target="n33"><data key="w">2</data></edge>
+    <edge source="n27" target="n43"><data key="w">3</data></edge>
+    <edge source="n27" target="n48"><data key="w">7</data></edge>
+    <edge source="n27" target="n58"><data key="w">4</data></edge>
+    <edge source="n27" target="n68"><data key="w">8</data></edge>
+    <edge source="n27" target="n69"><data key="w">8</data></edge>
+    <edge source="n27" target="n70"><data key="w">8</data></edge>
+    <edge source="n27" target="n71"><data key="w">7</data></edge>
+    <edge source="n27" target="n72"><data key="w">3</data></edge>
+    <edge source="n28" target="n44"><data key="w">2</data></edge>
+    <edge source="n28" target="n45"><data key="w">1</data></edge>
+    <edge source="n29" target="n34"><data key="w">6</data></edge>
+    <edge source="n29" target="n35"><data key="w">6</data></edge>
+    <edge source="n29" target="n36"><data key="w">6</data></edge>
+    <edge source="n29" target="n37"><data key="w">6</data></edge>
+    <edge source="n29" target="n38"><data key="w">6</data></edge>
+    <edge source="n30" target="n31"><data key="w">2</data></edge>
+    <edge source="n34" target="n35"><data key="w">6</data></edge>
+    <edge source="n34" target="n36"><data key="w">6</data></edge>
+    <edge source="n34" target="n37"><data key="w">6</data></edge>
+    <edge source="n34" target="n38"><data key="w">6</data></edge>
+    <edge source="n35" target="n36"><data key="w">6</data></edge>
+    <edge source="n35" target="n37"><data key="w">6</data></edge>
+    <edge source="n35" target="n38"><data key="w">6</data></edge>
+    <edge source="n36" target="n37"><data key="w">6</data></edge>
+    <edge source="n36" target="n38"><data key="w">6</data></edge>
+    <edge source="n37" target="n38"><data key="w">6</data></edge>
+    <edge source="n39" target="n52"><data key="w">1</data></edge>
+    <edge source="n39" target="n55"><data key="w">2</data></edge>
+    <edge source="n41" target="n42"><data key="w">3</data></edge>
+    <edge source="n41" target="n55"><data key="w">4</data></edge>
+    <edge source="n41" target="n57"><data key="w">3</data></edge>
+    <edge source="n41" target="n62"><data key="w">3</data></edge>
+    <edge source="n41" target="n68"><data key="w">7</data></edge>
+    <edge source="n41" target="n69"><data key="w">7</data></edge>
+    <edge source="n41" target="n70"><data key="w">7</data></edge>
+    <edge source="n41" target="n71"><data key="w">6</data></edge>
+    <edge source="n41" target="n75"><data key="w">6</data></edge>
+    <edge source="n46" target="n47"><data key="w">1</data></edge>
+    <edge source="n47" target="n48"><data key="w">1</data></edge>
+    <edge source="n48" target="n55"><data key="w">11</data></edge>
+    <edge source="n48" target="n57"><data key="w">9</data></edge>
+    <edge source="n48" target="n58"><data key="w">14</data></edge>
+    <edge source="n48" target="n59"><data key="w">11</data></edge>
+    <edge source="n48" target="n60"><data key="w">9</data></edge>
+    <edge source="n48" target="n61"><data key="w">11</data></edge>
+    <edge source="n48" target="n62"><data key="w">12</data></edge>
+    <edge source="n48" target="n63"><data key="w">12</data></edge>
+    <edge source="n48" target="n64"><data key="w">13</data></edge>
+    <edge source="n48" target="n65"><data key="w">12</data></edge>
+    <edge source="n48" target="n66"><data key="w">10</data></edge>
+    <edge source="n48" target="n68"><data key="w">7</data></edge>
+    <edge source="n48" target="n69"><data key="w">7</data></edge>
+    <edge source="n48" target="n71"><data key="w">7</data></edge>
+    <edge source="n48" target="n73"><data key="w">2</data></edge>
+    <edge source="n48" target="n74"><data key="w">2</data></edge>
+    <edge source="n48" target="n75"><data key="w">5</data></edge>
+    <edge source="n48" target="n76"><data key="w">7</data></edge>
+    <edge source="n49" target="n50"><data key="w">1</data></edge>
+    <edge source="n49" target="n51"><data key="w">5</data></edge>
+    <edge source="n49" target="n54"><data key="w">4</data></edge>
+    <edge source="n49" target="n55"><data key="w">6</data></edge>
+    <edge source="n49" target="n56"><data key="w">2</data></edge>
+    <edge source="n51" target="n52"><data key="w">1</data></edge>
+    <edge source="n51" target="n53"><data key="w">1</data></edge>
+    <edge source="n51" target="n54"><data key="w">4</data></edge>
+    <edge source="n51" target="n55"><data key="w">5</data></edge>
+    <edge source="n54" target="n55"><data key="w">4</data></edge>
+    <edge source="n55" target="n56"><data key="w">2</data></edge>
+    <edge source="n55" target="n57"><data key="w">10</data></edge>
+    <edge source="n55" target="n58"><data key="w">10</data></edge>
+    <edge source="n55" target="n59"><data key="w">9</data></edge>
+    <edge source="n55" target="n61"><data key="w">9</data></edge>
+    <edge source="n55" target="n62"><data key="w">10</data></edge>
+    <edge source="n55" target="n63"><data key="w">9</data></edge>
+    <edge source="n55" target="n64"><data key="w">10</data></edge>
+    <edge source="n55" target="n65"><data key="w">9</data></edge>
+    <edge source="n57" target="n58"><data key="w">9</data></edge>
+    <edge source="n57" target="n59"><data key="w">9</data></edge>
+    <edge source="n57" target="n61"><data key="w">9</data></edge>
+    <edge source="n57" target="n62"><data key="w">10</data></edge>
+    <edge source="n57" target="n63"><data key="w">9</data></edge>
+    <edge source="n57" target="n64"><data key="w">9</data></edge>
+    <edge source="n57" target="n65"><data key="w">9</data></edge>
+    <edge source="n57" target="n67"><data key="w">1</data></edge>
+    <edge source="n58" target="n59"><data key="w">11</data></edge>
+    <edge source="n58" target="n60"><data key="w">9</data></edge>
+    <edge source="n58" target="n61"><data key="w">11</data></edge>
+    <edge source="n58" target="n62"><data key="w">12</data></edge>
+    <edge source="n58" target="n63"><data key="w">12</data></edge>
+    <edge source="n58" target="n64"><data key="w">13</data></edge>
+    <edge source="n58" target="n65"><data key="w">12</data></edge>
+    <edge source="n58" target="n66"><data key="w">10</data></edge>
+    <edge source="n58" target="n70"><data key="w">3</data></edge>
+    <edge source="n58" target="n76"><data key="w">7</data></edge>
+    <edge source="n59" target="n60"><data key="w">9</data></edge>
+    <edge source="n59" target="n61"><data key="w">11</data></edge>
+    <edge source="n59" target="n62"><data key="w">11</data></edge>
+    <edge source="n59" target="n63"><data key="w">11</data></edge>
+    <edge source="n59" target="n64"><data key="w">11</data></edge>
+    <edge source="n59" target="n65"><data key="w">11</data></edge>
+    <edge source="n59" target="n66"><data key="w">9</data></edge>
+    <edge source="n60" target="n61"><data key="w">9</data></edge>
+    <edge source="n60" target="n62"><data key="w">9</data></edge>
+    <edge source="n60" target="n63"><data key="w">9</data></edge>
+    <edge source="n60" target="n64"><data key="w">9</data></edge>
+    <edge source="n60" target="n65"><data key="w">9</data></edge>
+    <edge source="n60" target="n66"><data key="w">9</data></edge>
+    <edge source="n61" target="n62"><data key="w">11</data></edge>
+    <edge source="n61" target="n63"><data key="w">11</data></edge>
+    <edge source="n61" target="n64"><data key="w">11</data></edge>
+    <edge source="n61" target="n65"><data key="w">11</data></edge>
+    <edge source="n61" target="n66"><data key="w">9</data></edge>
+    <edge source="n62" target="n63"><data key="w">12</data></edge>
+    <edge source="n62" target="n64"><data key="w">12</data></edge>
+    <edge source="n62" target="n65"><data key="w">12</data></edge>
+    <edge source="n62" target="n66"><data key="w">10</data></edge>
+    <edge source="n62" target="n76"><data key="w">7</data></edge>
+    <edge source="n63" target="n64"><data key="w">12</data></edge>
+    <edge source="n63" target="n65"><data key="w">12</data></edge>
+    <edge source="n63" target="n66"><data key="w">10</data></edge>
+    <edge source="n63" target="n76"><data key="w">7</data></edge>
+    <edge source="n64" target="n65"><data key="w">12</data></edge>
+    <edge source="n64" target="n66"><data key="w">10</data></edge>
+    <edge source="n64" target="n76"><data key="w">7</data></edge>
+    <edge source="n65" target="n66"><data key="w">10</data></edge>
+    <edge source="n65" target="n76"><data key="w">7</data></edge>
+    <edge source="n66" target="n76"><data key="w">7</data></edge>
+    <edge source="n68" target="n69"><data key="w">10</data></edge>
+    <edge source="n68" target="n70"><data key="w">9</data></edge>
+    <edge source="n68" target="n71"><data key="w">9</data></edge>
+    <edge source="n68" target="n75"><data key="w">7</data></edge>
+    <edge source="n69" target="n70"><data key="w">9</data></edge>
+    <edge source="n69" target="n71"><data key="w">9</data></edge>
+    <edge source="n69" target="n75"><data key="w">7</data></edge>
+    <edge source="n70" target="n71"><data key="w">8</data></edge>
+    <edge source="n70" target="n75"><data key="w">6</data></edge>
+    <edge source="n71" target="n75"><data key="w">7</data></edge>
+    <edge source="n73" target="n74"><data key="w">2</data></edge>
+  </graph>
+</graphml>

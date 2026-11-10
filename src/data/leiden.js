@@ -40,11 +40,14 @@
 //     are dissolved; the remaining depth differences are aligned by cluster size (treeLevels).
 //   · Leaves above maxLeafSize are cut into connected pieces (Leiden parts packed up to the
 //     limit; BFS-grown chunks when Leiden will not split, e.g. a clique) as a new finest level.
+//     Around a hub the leaves that no connected piece can hold are packed into satellite groups
+//     (connectedChunks): the one case where a cluster is not connected.
 //  'aggregate': the refined partitions of the aggregation levels of the run (finest first, the
 //   last one is the final partition). Measured to recover nested structure worse than both the
 //   recursive strategy and Louvain's levels (the finest levels are small random fragments).
 //  'flat': the Leiden partition only.
-//  Every cluster of every level induces a connected subgraph, for all strategies.
+//  Every cluster of every level induces a connected subgraph, for all strategies (satellite
+//  groups of a size-limited hub excepted).
 //
 // ─── Output ─────────────────────────────────────────────────────────────────────────────────
 //  levels[l][i] = cluster of original node i at level l, dense 0..K_l−1, levels[0] finest, every
@@ -61,14 +64,20 @@
 //               sizes, default 1), randomness θ (0.01), iterations (4; ≤ 0 = until stable, at most 1000),
 //               strategy ('recursive' | 'aggregate' | 'flat'), significance (1.3; 0 = keep every
 //               split), minSplitSize (12), levelsBelow (3), levelsAbove (3), coarsenResolution
-//               (1.5), coarsenMinModularity (0.3), balance (true),
+//               (1.5), coarsenMinModularity (0.3), balance (true), queueCap (64, see DEFAULT_QUEUE_CAP),
 //               refine ({ maxLeafSize, maxDepth = 6 } or null),
 //               onProgress({ phase: 'leiden', level, pass: iteration, communities, modularity }
 //                          | { phase: 'refine', level, pass: nodes done, communities: nodeCount })
 //  modularity( { nodeCount, edges, weights? }, partition, resolution = 1 ) -> Q
+//  cutToSize( { nodeCount, edges, weights? }, maxSize, { seed } ) -> { partition, K }
+//      connected pieces of at most maxSize nodes: the forced split of an oversized leaf
 //  randomGraphModularity( n, k ) -> expected maximum modularity of a random graph
-//  leidenHierarchy( g, options ) -> { method, levels, modularity, resolution, seed, refined, maxLeafSize, dropped, ms }
+//  leidenHierarchy( g, options ) -> { method, levels, modularity, resolution, seed, refined, maxLeafSize, dropped,
+//                                     communities, partition, partitionModularity, capped, ms }
 //      canonical hierarchy for a canonical graph; levels pass format.js normalizeLevels unchanged.
+//      communities / partition / partitionModularity: the Leiden partition of the whole graph;
+//      capped: local-moving runs stopped by the queue cap (options.queueCap, pops per node,
+//      default DEFAULT_QUEUE_CAP = 64; 0 on every graph measured).
 //      options.maxLeafSize defaults to DEFAULT_MAX_LEAF_SIZE (200; 0 disables the size limit).
 //      options.minLevelRatio (DEFAULT_MIN_LEVEL_RATIO = 1.2; 1 keeps every level): a level that
 //      does not reduce the cluster count of the kept level below it by this factor is dropped
@@ -99,6 +108,12 @@ const BALANCE_MIN_SCALE = 0.25;
 const EARLY_REJECT = 0.85;
 const PACK_MAX_PARTS = 384;
 const MAX_ITERATIONS = 1000; // safety net of "until stable" (the slowest graph seen needed 108)
+// Safety cap of the local-moving queue, in pops per node of the (aggregate) graph. A node only
+// moves for a strictly better gain, which ends the loop in exact arithmetic; with rounded
+// floating-point gains (arbitrary user weights) that proof does not hold, so the loop also ends
+// after this many pops. The largest ratio measured at the first level of the test graphs
+// (structured, scale-free, lattices, random weights) is 7.3.
+export const DEFAULT_QUEUE_CAP = 64;
 
 // ── weighted CSR graph (self loops kept separately) ─────────────────────────────────────────
 
@@ -299,6 +314,9 @@ function createScratch( n, entries = 0 ) {
 		ext: new Float64Array( n ), // weight between a refined community and the rest of its community
 		merged: new Uint8Array( n ), // refined community has more than one node
 		cand: new Float64Array( n + 1 ),
+		capFactor: 0, // queue pops per node allowed in one local-moving run (0 = DEFAULT_QUEUE_CAP)
+		capped: 0, // local-moving runs that were stopped by the cap
+		pops: 0, // queue pops of the last local-moving run
 	};
 
 }
@@ -361,8 +379,12 @@ function moveNodesFast( g, nw, comm, gamma, rand, S ) {
 	shuffle( queue, n, rand );
 	inQueue.fill( 1, 0, n );
 	let head = 0, tail = 0, count = n, moves = 0;
+	const cap = Math.max( n, Math.floor( n * ( S.capFactor > 0 ? S.capFactor : DEFAULT_QUEUE_CAP ) ) );
+	let pops = 0;
 	while ( count > 0 ) {
 
+		if ( pops === cap ) break; // safety cap (see DEFAULT_QUEUE_CAP); the bookkeeping is repaired below
+		pops ++;
 		const v = queue[ head ];
 		head = head + 1 === n ? 0 : head + 1;
 		count --;
@@ -439,6 +461,26 @@ function moveNodesFast( g, nw, comm, gamma, rand, S ) {
 				}
 
 			}
+
+		}
+
+	}
+
+	S.pops = pops;
+	if ( count > 0 ) {
+
+		// stopped by the cap: the nodes still queued have lost a neighbour from their community
+		// since their ext was written, so it is recomputed before the refinement reads it
+		S.capped ++;
+		for ( ; count > 0; count -- ) {
+
+			const v = queue[ head ];
+			head = head + 1 === n ? 0 : head + 1;
+			inQueue[ v ] = 0;
+			const cv = comm[ v ];
+			let x = 0;
+			for ( let e = start[ v ]; e < start[ v + 1 ]; e ++ ) if ( comm[ adj[ e ] ] === cv ) x += w[ e ];
+			ext[ v ] = x;
 
 		}
 
@@ -619,7 +661,14 @@ function splitComponents( g, comm ) {
 function leidenCsr( g0, nw0, gamma, { seed = 1, randomness = DEFAULT_RANDOMNESS, iterations = 2, maxLevels = 64, initial = null, report = null } = {}, S = null ) {
 
 	const n0 = g0.n;
-	if ( ! S || S.n < n0 ) S = createScratch( n0, g0.adj.length );
+	if ( ! S || S.n < n0 ) {
+
+		const grown = createScratch( n0, g0.adj.length );
+		if ( S ) grown.capFactor = S.capFactor;
+		S = grown;
+
+	}
+
 	const rand = rng( seed );
 	const maxIter = iterations > 0 ? iterations : MAX_ITERATIONS;
 	let partition = new Int32Array( n0 );
@@ -811,6 +860,11 @@ function splitGraph( sub, ctx, seed, threshold ) {
 /**
  * Fallback split of a graph that Leiden will not split (cliques, stars): regions grown by BFS
  * over the still unassigned nodes, so every chunk is connected and has at most maxSize nodes.
+ * Satellites: around a hub the BFS leaves every remaining leaf as a chunk of its own (a connected
+ * piece would have to contain the hub), thousands of one-node clusters for a large star. When
+ * most chunks have one or two nodes (and there are more than 8 of them), these are therefore
+ * packed, in the order of the chunk they hang on, into groups of at most maxSize nodes. Such
+ * groups are the one exception to "every cluster is connected": a hub's leaves cannot be both.
  */
 function connectedChunks( sub, maxSize ) {
 
@@ -847,7 +901,54 @@ function connectedChunks( sub, maxSize ) {
 
 	}
 
-	return { partition: out, K: id };
+	// satellites: chunks of at most two nodes, keyed by the (larger) chunk they are attached to
+	const csize = partSizes( out, id );
+	let small = 0;
+	for ( let c = 0; c < id; c ++ ) if ( csize[ c ] <= 2 ) small ++;
+	if ( small <= 8 || 2 * small <= id ) return { partition: out, K: id }; // a few stay as they are: connected
+	const anchor = new Int32Array( id ).fill( - 1 );
+	for ( let i = 0; i < m; i ++ ) {
+
+		const c = out[ i ];
+		if ( csize[ c ] > 2 || anchor[ c ] >= 0 ) continue;
+		for ( let e = sub.start[ i ]; e < sub.start[ i + 1 ]; e ++ ) {
+
+			const d = out[ sub.adj[ e ] ];
+			if ( d !== c && csize[ d ] > 2 ) {
+
+				anchor[ c ] = d;
+				break;
+
+			}
+
+		}
+
+	}
+
+	const order = [];
+	for ( let c = 0; c < id; c ++ ) if ( csize[ c ] <= 2 ) order.push( c );
+	order.sort( ( a, b ) => anchor[ a ] - anchor[ b ] || a - b );
+	const target = new Int32Array( id );
+	for ( let c = 0; c < id; c ++ ) target[ c ] = c;
+	let group = - 1, fill = 0, groupAnchor = - 2;
+	for ( const c of order ) {
+
+		if ( group < 0 || anchor[ c ] !== groupAnchor || fill + csize[ c ] > size ) {
+
+			group = c;
+			fill = 0;
+			groupAnchor = anchor[ c ];
+
+		}
+
+		target[ c ] = group;
+		fill += csize[ c ];
+
+	}
+
+	for ( let i = 0; i < m; i ++ ) out[ i ] = target[ out[ i ] ];
+	const K = renumber( out, new Int32Array( id ) );
+	return { partition: out, K };
 
 }
 
@@ -1427,10 +1528,12 @@ function makeContext( n, options ) {
 		seed = 1, resolution = 1, quality = 'modularity', randomness = DEFAULT_RANDOMNESS, iterations = DEFAULT_ITERATIONS,
 		strategy = 'recursive', significance = DEFAULT_SIGNIFICANCE, coarsenMinModularity = DEFAULT_COARSEN_MIN_MODULARITY, coarsenResolution = DEFAULT_COARSEN_RESOLUTION,
 		minSplitSize = DEFAULT_MIN_SPLIT_SIZE, levelsBelow = DEFAULT_LEVELS_BELOW, levelsAbove = DEFAULT_LEVELS_ABOVE,
-		balance = true, refine = null, nodeWeights = null, onProgress = null,
+		balance = true, refine = null, nodeWeights = null, onProgress = null, queueCap = 0,
 	} = options;
 	if ( quality !== 'modularity' && quality !== 'cpm' ) throw new Error( `leiden: unknown quality "${quality}" (modularity | cpm)` );
 	if ( strategy !== 'recursive' && strategy !== 'aggregate' && strategy !== 'flat' ) throw new Error( `leiden: unknown strategy "${strategy}" (recursive | aggregate | flat)` );
+	const S = createScratch( n );
+	S.capFactor = queueCap > 0 ? queueCap : 0;
 	return {
 		seed: ( seed >>> 0 ) || 1, resolution, quality, randomness: Math.max( 1e-6, randomness ), iterations,
 		strategy, significance, coarsenMinModularity, coarsenResolution, minSplitSize: Math.max( 2, minSplitSize ), levelsBelow, levelsAbove, balance,
@@ -1438,7 +1541,7 @@ function makeContext( n, options ) {
 		forceDepth: ( refine && refine.maxDepth ) ?? 6,
 		subResolution: quality === 'cpm' ? 1 : resolution,
 		nodeWeights, onProgress,
-		S: createScratch( n ),
+		S,
 		localOf: new Int32Array( n ).fill( - 1 ),
 	};
 
@@ -1454,7 +1557,7 @@ export function leiden( graph, options = {} ) {
 	const n = graph.nodeCount | 0;
 	const ctx = makeContext( n, options );
 	// no nodes: no levels (as louvain.js)
-	if ( n === 0 ) return { levels: [], modularity: [], levelSizes: [], partition: new Int32Array( 0 ), partitionModularity: 0, communities: 0, refined: false, passes: 0, iterations: 0, stable: true, ms: now() - t0 };
+	if ( n === 0 ) return { levels: [], modularity: [], levelSizes: [], partition: new Int32Array( 0 ), partitionModularity: 0, communities: 0, refined: false, passes: 0, iterations: 0, stable: true, capped: 0, ms: now() - t0 };
 	const g0 = csrFromEdges( n, graph.edges, graph.weights );
 	const r = buildLevels( g0, ctx );
 	const resolution = ctx.quality === 'cpm' ? 1 : ctx.resolution;
@@ -1469,6 +1572,7 @@ export function leiden( graph, options = {} ) {
 		passes: r.iterations,
 		iterations: r.iterations,
 		stable: r.stable,
+		capped: ctx.S.capped,
 		ms: now() - t0,
 	};
 
@@ -1478,6 +1582,25 @@ export function leiden( graph, options = {} ) {
 export function modularity( graph, partition, resolution = 1 ) {
 
 	return csrModularity( csrFromEdges( graph.nodeCount | 0, graph.edges, graph.weights ), partition, resolution );
+
+}
+
+/**
+ * Cuts a graph into connected pieces of at most maxSize nodes: the forced split that the
+ * hierarchy applies to a leaf above maxLeafSize (Leiden parts packed up to the limit, BFS-grown
+ * chunks where Leiden does not split, satellite groups around a hub), for a caller that has
+ * such a leaf of its own.
+ * @returns {{ partition: Int32Array, K: number }} dense piece ids per node
+ */
+export function cutToSize( graph, maxSize, options = {} ) {
+
+	const n = graph.nodeCount | 0;
+	if ( ! ( maxSize > 0 ) || n <= maxSize ) return { partition: new Int32Array( n ), K: n > 0 ? 1 : 0 };
+	const ctx = makeContext( n, { ...options, strategy: 'flat', refine: { maxLeafSize: maxSize, maxDepth: options.maxDepth } } );
+	const g0 = csrFromEdges( n, graph.edges, graph.weights );
+	const parts = forcedSplit( g0, maxSize, splitGraph( g0, ctx, ctx.seed, Infinity ), ctx, ctx.seed, 0 );
+	const partition = Int32Array.from( parts.partition );
+	return { partition, K: renumber( partition, new Int32Array( n ) ) };
 
 }
 
@@ -1545,6 +1668,10 @@ export function leidenHierarchy( g, options = {} ) {
 		refined: r.refined,
 		maxLeafSize,
 		dropped: r.levels.length - kept.length,
+		communities: r.communities,
+		partition: r.partition,
+		partitionModularity: r.partitionModularity,
+		capped: r.capped,
 		ms: r.ms,
 	};
 

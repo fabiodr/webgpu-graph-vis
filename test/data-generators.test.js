@@ -41,6 +41,9 @@ const SMALL = {
 	rgg3d: { n: 1500, avgDegree: 10 },
 	lattice3d: { nx: 6, ny: 5, nz: 4 },
 	caveman: { cliques: 10, cliqueSize: 6, rewire: 0.1 },
+	galaxy: { n: 1200, groups: 4, systems: 5 },
+	geosf: { n: 1500, avgDegree: 8 },
+	mesh: { nu: 12, nv: 9 },
 };
 
 for ( const m of MODELS ) {
@@ -59,7 +62,7 @@ for ( const m of MODELS ) {
 		assert.equal( a.meta.stats.edges, a.edges.length / 2 );
 		assert.equal( a.meta.stats.nodes, a.nodeCount );
 		assert.ok( a.name && a.description );
-		if ( m.id !== 'lattice3d' ) {
+		if ( m.id !== 'lattice3d' && m.id !== 'mesh' ) {
 
 			const c = generate( { ...spec, seed: 4 } );
 			assert.ok( c.edges.length !== a.edges.length || c.edges.some( ( x, i ) => x !== a.edges[ i ] ), 'seed changes the graph' );
@@ -182,6 +185,130 @@ test( 'caveman: ring of cliques', () => {
 	assert.equal( g.edges.length / 2, L * ( ( K * ( K - 1 ) ) / 2 ) );
 	assert.equal( g.meta.stats.components, 1 );
 	assert.equal( g.planted.levels[ 0 ][ K ], 1 );
+
+} );
+
+test( 'galaxy: hubs with satellites and moons, two planted levels, connected', () => {
+
+	const p = { n: 3000, groups: 6, systems: 8, moons: 0.3, mesh: 0.15, bridges: 2 };
+	const g = generate( { model: 'galaxy', params: p, seed: 2 } );
+	assert.equal( g.nodeCount, 3000 );
+	assert.equal( g.meta.stats.components, 1 );
+	assert.equal( g.meta.stats.isolated, 0 );
+	const [ system, group ] = g.planted.levels;
+	assert.equal( new Set( system ).size, 48 );
+	assert.equal( new Set( group ).size, 6 );
+	// systems are nested in groups
+	const parent = new Map();
+	for ( let i = 0; i < g.nodeCount; i ++ ) {
+
+		if ( ! parent.has( system[ i ] ) ) parent.set( system[ i ], group[ i ] );
+		assert.equal( parent.get( system[ i ] ), group[ i ] );
+
+	}
+
+	// the hub of every system (its first node) has the highest degree of the system, and most
+	// edges stay inside a system
+	const d = degrees( g );
+	const top = new Map();
+	for ( let i = 0; i < g.nodeCount; i ++ ) if ( ! top.has( system[ i ] ) || d[ i ] > d[ top.get( system[ i ] ) ] ) top.set( system[ i ], i );
+	let hubsFirst = 0;
+	for ( const [ sys, i ] of top ) if ( i === system.indexOf( sys ) ) hubsFirst ++;
+	assert.ok( hubsFirst >= 46, `${hubsFirst} of 48 hubs lead their system` );
+	let inside = 0;
+	for ( let k = 0; k < g.edges.length; k += 2 ) if ( system[ g.edges[ k ] ] === system[ g.edges[ k + 1 ] ] ) inside ++;
+	assert.ok( inside / ( g.edges.length / 2 ) > 0.9 );
+	assert.ok( g.meta.stats.moons > 500 && g.meta.stats.moons < 1200, `${g.meta.stats.moons} moons` );
+	// no moons, no mesh: every system is a star, the graph is a tree plus the links between hubs
+	const stars = generate( { model: 'galaxy', params: { ...p, moons: 0, mesh: 0 }, seed: 2 } );
+	assert.equal( stars.meta.stats.moons, 0 );
+	const ds = degrees( stars );
+	let leaves = 0;
+	for ( const x of ds ) if ( x === 1 ) leaves ++;
+	assert.equal( leaves, 3000 - 48 );
+	// tiny requests still give every system a hub and a satellite
+	const tiny = generate( { model: 'galaxy', params: { n: 100, groups: 16, systems: 40 } } );
+	assert.equal( tiny.nodeCount, 2 * 16 * 40 );
+	assert.equal( tiny.meta.stats.components, 1 );
+
+} );
+
+test( 'geosf: exactly the pairs within reach, power-law degrees, target average degree', async () => {
+
+	const { rng } = await import( '../src/graph/prepare.js' );
+	for ( const params of [ { n: 900, avgDegree: 8, exponent: 2.6, dimension: 2, periodic: false }, { n: 700, avgDegree: 10, exponent: 2.3, dimension: 3, periodic: true }, { n: 600, avgDegree: 30, exponent: 3.5, dimension: 2, periodic: true } ] ) {
+
+		const seed = 5;
+		const g = generate( { model: 'geosf', params, seed } );
+		assertCanonicalEdges( g );
+		// the same stream as the generator: positions, then weights
+		const { n, dimension: d } = params;
+		const rand = rng( seed );
+		const pos = new Float64Array( d * n );
+		for ( let k = 0; k < d * n; k ++ ) pos[ k ] = rand();
+		const cap = Math.pow( n, 1 / ( params.exponent - 1 ) );
+		const w = new Float64Array( n );
+		for ( let i = 0; i < n; i ++ ) w[ i ] = Math.min( cap, Math.pow( 1 - rand(), - 1 / ( params.exponent - 1 ) ) );
+		const c = g.meta.stats.threshold;
+		const expected = [];
+		for ( let i = 0; i < n; i ++ ) for ( let j = i + 1; j < n; j ++ ) {
+
+			let dist2 = 0;
+			for ( let k = 0; k < d; k ++ ) {
+
+				let dx = Math.abs( pos[ d * i + k ] - pos[ d * j + k ] );
+				if ( params.periodic && dx > 0.5 ) dx = 1 - dx;
+				dist2 += dx * dx;
+
+			}
+
+			const r = Math.sqrt( dist2 );
+			if ( ( d === 3 ? r * r * r : dist2 ) <= c * w[ i ] * w[ j ] ) expected.push( i, j );
+
+		}
+
+		assert.deepEqual( Array.from( g.edges ), expected, `all pairs within reach, d = ${d}${params.periodic ? ', periodic' : ''}` );
+		assert.ok( Math.abs( g.meta.stats.avgDegree / params.avgDegree - 1 ) < 0.1, `average degree ${g.meta.stats.avgDegree} for ${params.avgDegree}` );
+
+	}
+
+	// hubs: the heaviest node has far more neighbours than the average; degree follows weight
+	const big = generate( { model: 'geosf', params: { n: 8000, avgDegree: 8, exponent: 2.5 }, seed: 1 } );
+	assert.ok( Math.abs( big.meta.stats.avgDegree / 8 - 1 ) < 0.08, `average degree ${big.meta.stats.avgDegree}` );
+	assert.ok( big.meta.stats.maxDegree > 25 * 8, `max degree ${big.meta.stats.maxDegree}` );
+	const sorted = Array.from( degrees( big ) ).sort( ( a, b ) => b - a );
+	assert.ok( sorted[ 80 ] > 3 * 8, 'the top percent has well above the average degree' );
+	assert.ok( sorted[ 4000 ] <= 8, 'the median is at most the average' );
+
+} );
+
+test( 'mesh: sheet, tube and torus, triangles or quads', () => {
+
+	const count = ( params ) => {
+
+		const g = generate( { model: 'mesh', params } );
+		assert.equal( g.meta.stats.components, 1 );
+		return { g, edges: g.edges.length / 2, d: degrees( g ) };
+
+	};
+
+	const nu = 14, nv = 9;
+	const torus = count( { nu, nv, wrapU: true, wrapV: true, triangles: true } );
+	assert.equal( torus.edges, 3 * nu * nv );
+	assert.ok( torus.d.every( ( x ) => x === 6 ), 'every node of a triangulated torus has 6 neighbours' );
+	const quadTorus = count( { nu, nv, wrapU: true, wrapV: true, triangles: false } );
+	assert.equal( quadTorus.edges, 2 * nu * nv );
+	assert.ok( quadTorus.d.every( ( x ) => x === 4 ) );
+	const tube = count( { nu, nv, wrapU: true, wrapV: false, triangles: true } );
+	assert.equal( tube.edges, nu * nv + 2 * nu * ( nv - 1 ) );
+	const sheet = count( { nu, nv, wrapU: false, wrapV: false, triangles: true } );
+	assert.equal( sheet.edges, ( nu - 1 ) * nv + nu * ( nv - 1 ) + ( nu - 1 ) * ( nv - 1 ) );
+	const quadSheet = count( { nu, nv, wrapU: false, wrapV: false, triangles: false } );
+	assert.equal( quadSheet.edges, ( nu - 1 ) * nv + nu * ( nv - 1 ) );
+	assert.equal( sheet.g.labels[ nu + 2 ], '2,1' );
+	assert.match( torus.g.name, /torus/ );
+	assert.match( tube.g.name, /tube/ );
+	assert.match( sheet.g.name, /sheet/ );
 
 } );
 

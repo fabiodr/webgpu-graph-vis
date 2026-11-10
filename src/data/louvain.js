@@ -35,7 +35,8 @@
 //               refine ({ maxLeafSize, maxDepth = 6 } or null), onProgress({ phase, level, pass,
 //               communities, modularity })
 //  modularity( { nodeCount, edges, weights? }, partition, resolution = 1 ) -> Q
-//  louvainHierarchy( g, options ) -> { method, levels, modularity, resolution, seed, refined, maxLeafSize, dropped }
+//  louvainHierarchy( g, options ) -> { method, levels, modularity, resolution, seed, refined, maxLeafSize, dropped,
+//                                      communities (size of the final Louvain partition) }
 //      canonical hierarchy for a canonical graph; levels pass format.js normalizeLevels unchanged.
 //      options.maxLeafSize defaults to DEFAULT_MAX_LEAF_SIZE (200; 0 disables refinement).
 //      options.minLevelRatio (DEFAULT_MIN_LEVEL_RATIO = 1.2; 1 keeps every level): a level that
@@ -448,7 +449,8 @@ function splitCommunity( sub, maxSize, seed, resolution, minGain, depth, maxDept
 
 	}
 
-	if ( ! chosen ) return bfsChunks( sub, maxSize );
+	// no split, or one that leaves the nodes alone (a star at a high resolution): chunks
+	if ( ! chosen || 2 * chosenK > m ) return bfsChunks( sub, maxSize );
 
 	// recurse into parts that are still too large
 	const sizes = partSizes( chosen, chosenK );
@@ -689,6 +691,7 @@ export function louvainHierarchy( g, options = {} ) {
 		refined: r.refined,
 		maxLeafSize,
 		dropped: r.levels.length - kept.length,
+		communities: r.levelSizes.length ? r.levelSizes[ r.levelSizes.length - 1 ] : 0, // of the final partition (1 = no split)
 		ms: r.ms,
 	};
 

@@ -19,6 +19,16 @@
 //  tree (root excluded) in depth-first preorder as pairs (ref, skip): ref < N is a node, ref >= N
 //  is cluster ref-N; skip is the preorder index just past the element's subtree. A stackless
 //  traversal is: i = 0; while (i < T) { if (leaf or accepted) { use; i = skip } else i++ }.
+//
+// ─── From the file ──────────────────────────────────────────────────────────────────────────
+//  attributes  { [name]: { type: 'number', values: Float32Array( N ) (NaN = missing) }
+//                        | { type: 'category', values: Int32Array( N ) (−1 = missing), categories: string[] } }
+//              node attributes of the canonical graph ({} when there are none)
+//  edgeWeight  Float32Array( E ) or null: edge weights, in edge order
+//  clustering  { method, resolution, levels, communities, modularity, quality, … } of the
+//              hierarchy in use (src/data/hierarchy.js), or null
+//  options.initPos (Float32Array( 4N )) replaces the computed seed positions (re-clustering:
+//  the layout then morphs from where the nodes are).
 
 import { paletteColor } from '../util/color.js';
 import { stressSeed } from './layouts.js';
@@ -28,6 +38,7 @@ export const DEFAULT_PREPARE_OPTIONS = {
 	seed: 1,
 	linkDistance: 30, // world units; the force layout uses the same value by default
 	sphere: { fov: 240, aspect: 1.6, nesting: 0.1, projection: 'stereographic-radial' },
+	initPos: null, // Float32Array( 4N ): start positions instead of the computed seed
 };
 
 /** Deterministic PRNG (mulberry32). */
@@ -241,8 +252,42 @@ export function prepareGraph( g, options = {} ) {
 	// Stress seed (layouts.js): clusters are placed by a stress layout of the quotient graph, so
 	// connected communities start next to each other. Graphs without a hierarchy (D = 0), or with
 	// more than 400 clusters on every level, keep the purely hierarchical seed.
+	// options.initPos (vec4 per node, e.g. a position readback of the same nodes under another
+	// hierarchy) replaces the seed, so the layout morphs from where the nodes are; nodes with a
+	// non-finite coordinate there fall back to the seed.
 	const R = layoutRadius( N, opts.linkDistance );
-	const initPos = stressSeed( {
+	const given = opts.initPos && opts.initPos.length === 4 * N ? opts.initPos : null;
+	let initPos = null;
+	if ( given ) {
+
+		initPos = new Float32Array( 4 * N );
+		let bad = 0;
+		for ( let i = 0; i < N; i ++ ) {
+
+			const x = given[ 4 * i ], y = given[ 4 * i + 1 ], z = given[ 4 * i + 2 ];
+			if ( Number.isFinite( x ) && Number.isFinite( y ) && Number.isFinite( z ) ) {
+
+				initPos[ 4 * i ] = x; initPos[ 4 * i + 1 ] = y; initPos[ 4 * i + 2 ] = z;
+
+			} else bad ++;
+
+		}
+
+		if ( bad > 0 ) {
+
+			const seed = seedPositions( { N, C, root, childStart, childCount, childRefs, clusterMass, R, seed: opts.seed } );
+			for ( let i = 0; i < N; i ++ ) {
+
+				if ( Number.isFinite( given[ 4 * i ] ) && Number.isFinite( given[ 4 * i + 1 ] ) && Number.isFinite( given[ 4 * i + 2 ] ) ) continue;
+				for ( let k = 0; k < 3; k ++ ) initPos[ 4 * i + k ] = seed[ 4 * i + k ];
+
+			}
+
+		}
+
+	}
+
+	if ( ! initPos ) initPos = stressSeed( {
 		N, D, E, edges, anc, levelOffset, clusterMass, childRefs, layoutRadius: R,
 		clusterChildStart: childStart, clusterChildCount: childCount,
 	}, { seed: opts.seed } ) || seedPositions( { N, C, root, childStart, childCount, childRefs, clusterMass, R, seed: opts.seed } );
@@ -269,6 +314,11 @@ export function prepareGraph( g, options = {} ) {
 		layoutRadius: R,
 		linkDistance: opts.linkDistance,
 		palette: opts.palette,
+		// from the file: node attributes ({} when there are none), edge weights (null when unweighted)
+		attributes: g.attributes || {},
+		edgeWeight: g.weights ? ( g.weights instanceof Float32Array ? g.weights : Float32Array.from( g.weights ) ) : null,
+		// the hierarchy in use (src/data/hierarchy.js; null when the canonical graph does not say)
+		clustering: g.clustering || null,
 		stats: {
 			nodes: N, edges: E, levels: D, clusters: C - 1, clustersPerLevel,
 			maxDegree, avgDegree: N ? ( 2 * E ) / N : 0, maxPath,
@@ -508,35 +558,44 @@ export function projectToSphere( px, py, projection = 'stereographic-radial' ) {
 
 function squarified( kids, first, last, bounds, weightOf, rect ) {
 
-	if ( first > last ) return;
-	if ( last - first < 2 ) return sliceAndDice( kids, first, last, bounds, weightOf, rect );
-	const [ x, y, x1, y1 ] = bounds;
-	const w = x1 - x, h = y1 - y;
-	let acc = 0;
-	for ( let k = first; k <= last; k ++ ) acc += weightOf.get( kids[ k ] );
-	const firstRel = weightOf.get( kids[ first ] ) / acc;
-	let mid = first;
-	let off = firstRel;
-	const big = w < h ? h : w, small = w < h ? w : h;
-	// grow the row while the aspect ratio of its first (largest) item keeps improving
-	while ( mid + 1 <= last ) {
+	// One row per turn of the loop (the reference recurses on the rest and sums its weights
+	// again each time: quadratic in the number of children, 13 s for the 250,000 children of the
+	// root of a graph without a hierarchy). rest[ k ] = weight of kids[ k .. last ].
+	const rest = new Float64Array( last - first + 2 );
+	for ( let k = last; k >= first; k -- ) rest[ k - first ] = rest[ k - first + 1 ] + weightOf.get( kids[ k ] );
+	let [ x, y, x1, y1 ] = bounds;
+	while ( first <= last ) {
 
-		const rel = weightOf.get( kids[ mid + 1 ] ) / acc;
-		if ( normalizedAspect( big, small, firstRel, off + rel ) > normalizedAspect( big, small, firstRel, off ) ) break;
-		mid ++;
-		off += rel;
+		if ( last - first < 2 ) return sliceAndDice( kids, first, last, [ x, y, x1, y1 ], weightOf, rect );
+		const w = x1 - x, h = y1 - y;
+		const acc = rest[ rest.length - 2 - ( last - first ) ];
+		const firstRel = weightOf.get( kids[ first ] ) / acc;
+		let mid = first;
+		let off = firstRel;
+		const big = w < h ? h : w, small = w < h ? w : h;
+		// grow the row while the aspect ratio of its first (largest) item keeps improving
+		while ( mid + 1 <= last ) {
 
-	}
+			const rel = weightOf.get( kids[ mid + 1 ] ) / acc;
+			if ( normalizedAspect( big, small, firstRel, off + rel ) > normalizedAspect( big, small, firstRel, off ) ) break;
+			mid ++;
+			off += rel;
 
-	if ( w < h ) {
+		}
 
-		sliceAndDice( kids, first, mid, [ x, y, x + w, y + h * off ], weightOf, rect );
-		squarified( kids, mid + 1, last, [ x, y + h * off, x + w, y1 ], weightOf, rect );
+		if ( w < h ) {
 
-	} else {
+			sliceAndDice( kids, first, mid, [ x, y, x + w, y + h * off ], weightOf, rect );
+			y += h * off;
 
-		sliceAndDice( kids, first, mid, [ x, y, x + w * off, y + h ], weightOf, rect );
-		squarified( kids, mid + 1, last, [ x + w * off, y, x1, y + h ], weightOf, rect );
+		} else {
+
+			sliceAndDice( kids, first, mid, [ x, y, x + w * off, y + h ], weightOf, rect );
+			x += w * off;
+
+		}
+
+		first = mid + 1;
 
 	}
 

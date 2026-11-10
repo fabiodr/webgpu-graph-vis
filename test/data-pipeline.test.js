@@ -40,7 +40,7 @@ test( 'parseGraphText: wgv-graph, node-link, ImsvGraphVis igv, edge list', () =>
 
 } );
 
-test( 'runRequest: edge list -> Louvain -> PreparedGraph, progress, cache', async () => {
+test( 'runRequest: edge list -> clustering -> PreparedGraph, progress, cache', async () => {
 
 	const text = readFileSync( 'public/data/imsv/celegansneural.json', 'utf8' );
 	const g = JSON.parse( text );
@@ -54,8 +54,12 @@ test( 'runRequest: edge list -> Louvain -> PreparedGraph, progress, cache', asyn
 	assert.ok( r.graph.D >= 1 );
 	assert.equal( r.graph.palette, 'rainbow' );
 	assert.equal( r.meta.format, 'edgelist' );
-	assert.match( r.meta.hierarchy.method, /^louvain/ );
+	assert.match( r.meta.hierarchy.method, /^leiden/ ); // the default method
 	assert.equal( r.meta.hierarchy.modularity.length, r.graph.D );
+	assert.equal( r.graph.clustering.method, 'leiden' );
+	assert.equal( r.graph.clustering.resolution, 1 );
+	assert.equal( r.graph.clustering.levels, r.graph.D );
+	assert.deepEqual( r.meta.clustering, r.graph.clustering );
 	assert.deepEqual( [ ...r.graph.labels ].sort(), [ ...g.labels ].sort() );
 	const stages = [ ...new Set( events.map( ( e ) => e.stage ) ) ];
 	assert.deepEqual( stages, [ 'parse', 'cluster', 'prepare', 'transfer' ] );
@@ -85,8 +89,14 @@ test( 'runRequest: cluster modes (planted / never / keep existing)', async () =>
 	assert.equal( lesmis.timings.cluster, undefined );
 	const again = await runRequest( { source: { kind: 'text', text: readFileSync( 'public/data/imsv/lesmis.json', 'utf8' ), name: 'lesmis.json' } }, null );
 	assert.equal( again.graph.D, 2 );
+	assert.equal( lesmis.graph.clustering.method, 'file' ); // the file does not say how it was made
+	assert.equal( lesmis.graph.clustering.stored, true );
 	const forced = await runRequest( { source: { kind: 'text', text: readFileSync( 'public/data/imsv/lesmis.json', 'utf8' ), name: 'lesmis.json' }, cluster: { mode: 'always', seed: 3 } } );
-	assert.match( forced.meta.hierarchy.method, /^louvain$/ );
+	assert.match( forced.meta.hierarchy.method, /^leiden/ );
+	assert.equal( forced.graph.clustering.seed, 3 );
+	const louvain = await runRequest( { source: { kind: 'text', text: readFileSync( 'public/data/imsv/lesmis.json', 'utf8' ), name: 'lesmis.json' }, cluster: { mode: 'always', method: 'louvain' } } );
+	assert.match( louvain.meta.hierarchy.method, /^louvain/ );
+	assert.equal( louvain.graph.clustering.method, 'louvain' );
 
 } );
 
@@ -221,7 +231,7 @@ test( 'DataClient: supersede terminates the worker and ignores its stale message
 test( 'listModels via the client matches the generator registry', () => {
 
 	const models = new DataClient( { inline: true } ).listModels();
-	assert.deepEqual( models.map( ( m ) => m.id ), [ 'hsbm', 'lfr', 'ba', 'ws', 'rgg3d', 'lattice3d', 'caveman' ] );
+	assert.deepEqual( models.map( ( m ) => m.id ), [ 'hsbm', 'lfr', 'ba', 'ws', 'rgg3d', 'lattice3d', 'caveman', 'galaxy', 'geosf', 'mesh' ] );
 
 } );
 

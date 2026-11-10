@@ -7,8 +7,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { normalizeGraph, normalizeLevels } from '../src/data/format.js';
 import {
-	leiden, leidenHierarchy, ensureHierarchy, modularity, randomGraphModularity,
-	DEFAULT_MAX_LEAF_SIZE, DEFAULT_MIN_LEVEL_RATIO, DEFAULT_MAX_LEVELS, __internals,
+	leiden, leidenHierarchy, ensureHierarchy, modularity, randomGraphModularity, cutToSize,
+	DEFAULT_MAX_LEAF_SIZE, DEFAULT_QUEUE_CAP, DEFAULT_MIN_LEVEL_RATIO, DEFAULT_MAX_LEVELS, __internals,
 } from '../src/data/leiden.js';
 import * as louvainModule from '../src/data/louvain.js';
 import { generate } from '../src/data/generators.js';
@@ -124,8 +124,12 @@ function assertNested( levels, n, what ) {
 
 }
 
-/** Number of clusters of `level` whose induced subgraph is not connected (union-find over the intra-cluster edges). */
-function disconnectedClusters( g, level ) {
+/**
+ * Number of clusters of `level` whose induced subgraph is not connected (union-find over the
+ * intra-cluster edges). With allowSatellites, a cluster made only of pieces of one or two nodes
+ * is not counted: the satellite groups of a hub's leaves (leiden.js connectedChunks).
+ */
+function disconnectedClusters( g, level, allowSatellites = false ) {
 
 	const n = g.nodeCount;
 	const parent = new Int32Array( n );
@@ -152,10 +156,20 @@ function disconnectedClusters( g, level ) {
 
 	}
 
-	const components = new Int32Array( countOf( level ) );
-	for ( let i = 0; i < n; i ++ ) if ( find( i ) === i ) components[ level[ i ] ] ++;
+	const K = countOf( level );
+	const components = new Int32Array( K );
+	const pieceSize = new Int32Array( n ), largest = new Int32Array( K );
+	for ( let i = 0; i < n; i ++ ) pieceSize[ find( i ) ] ++;
+	for ( let i = 0; i < n; i ++ ) {
+
+		if ( find( i ) !== i ) continue;
+		components[ level[ i ] ] ++;
+		if ( pieceSize[ i ] > largest[ level[ i ] ] ) largest[ level[ i ] ] = pieceSize[ i ];
+
+	}
+
 	let bad = 0;
-	for ( const c of components ) if ( c > 1 ) bad ++;
+	for ( let c = 0; c < K; c ++ ) if ( components[ c ] > 1 && ! ( allowSatellites && largest[ c ] <= 2 ) ) bad ++;
 	return bad;
 
 }
@@ -559,7 +573,8 @@ test( 'every community of every level induces a connected subgraph (all datasets
 			runs ++;
 			r.levels.forEach( ( lvl, l ) => {
 
-				assert.equal( disconnectedClusters( g, lvl ), 0, `${label}: level ${l} (${r.levelSizes[ l ]} clusters) has disconnected clusters` );
+				// only the finest level of a size-limited run may hold satellite groups
+				assert.equal( disconnectedClusters( g, lvl, l === 0 && r.refined ), 0, `${label}: level ${l} (${r.levelSizes[ l ]} clusters) has disconnected clusters` );
 				clusters += r.levelSizes[ l ];
 				levels ++;
 
@@ -1042,7 +1057,7 @@ test( 'refine.maxLeafSize: oversized leaves are cut into connected pieces as a n
 
 } );
 
-test( 'refine.maxLeafSize: a clique falls back to connected chunks; a star to one chunk and singletons', () => {
+test( 'refine.maxLeafSize: a clique falls back to connected chunks; a star to the hub chunk and satellite groups', () => {
 
 	const g = clique( 300 );
 	assert.deepEqual( leiden( g ).levelSizes, [ 1 ] );
@@ -1052,15 +1067,120 @@ test( 'refine.maxLeafSize: a clique falls back to connected chunks; a star to on
 	assert.deepEqual( sizesOf( h.levels[ 0 ] ), [ 100, 100, 100 ] );
 	assert.ok( h.refined );
 
-	// a star: every connected piece must contain the centre, so the rest can only be singletons
+	// a star: a connected piece must contain the centre, so the other leaves cannot be connected
+	// pieces. They are packed into satellite groups within the size limit instead of thousands of
+	// one-node clusters (the documented exception to connectivity).
 	const n = 300;
 	const star = normalizeGraph( { nodeCount: n, edges: Array.from( { length: n - 1 }, ( _, i ) => [ 0, i + 1 ] ).flat() } );
 	const hs = leidenHierarchy( star, { maxLeafSize: 100 } );
 	assert.equal( hs.levels.length, 1 );
 	const sizes = sizesOf( hs.levels[ 0 ] );
+	assert.deepEqual( sizes, [ 100, 100, 100 ] );
 	assert.equal( sizes[ hs.levels[ 0 ][ 0 ] ], 100 );
-	assert.equal( sizes.filter( ( s ) => s === 1 ).length, n - 100 );
-	assert.equal( disconnectedClusters( star, hs.levels[ 0 ] ), 0 );
+	assert.equal( disconnectedClusters( star, hs.levels[ 0 ] ), 2 ); // the two satellite groups
+	// a large hub: clusters stay within the limit and there are few of them
+	const big = 20000;
+	const bigStar = normalizeGraph( { nodeCount: big, edges: Array.from( { length: big - 1 }, ( _, i ) => [ 0, i + 1 ] ).flat() } );
+	const hb = leidenHierarchy( bigStar );
+	assert.equal( hb.levels.length, 1 );
+	const sb = sizesOf( hb.levels[ 0 ] );
+	assert.equal( sb.length, 100 );
+	assert.ok( Math.max( ...sb ) <= 200 );
+	// a friendship graph (triangles around a hub): the pairs are packed as well
+	const tri = [];
+	for ( let i = 0; i < 400; i ++ ) tri.push( 0, 1 + 2 * i, 0, 2 + 2 * i, 1 + 2 * i, 2 + 2 * i );
+	const hf = leidenHierarchy( normalizeGraph( { nodeCount: 801, edges: tri } ), { maxLeafSize: 100, significance: 1e9 } );
+	assert.ok( sizesOf( hf.levels[ 0 ] ).every( ( x ) => x <= 100 ) );
+
+} );
+
+test( 'cutToSize: the forced split on its own, for a caller with an oversized cluster', () => {
+
+	// a clique: nothing to find, chunks of the limit
+	const c = cutToSize( clique( 300 ), 100 );
+	assert.equal( c.K, 3 );
+	assert.deepEqual( sizesOf( c.partition ), [ 100, 100, 100 ] );
+	assert.ok( c.partition instanceof Int32Array && c.partition.length === 300 );
+	// a graph with communities: connected pieces within the limit, far fewer than nodes
+	const g = dataset( 'lfr-2k' );
+	const cut = cutToSize( g, 150, { seed: 3 } );
+	assert.equal( countOf( cut.partition ), cut.K );
+	assert.ok( Math.max( ...sizesOf( cut.partition ) ) <= 150 );
+	assert.equal( disconnectedClusters( g, cut.partition, true ), 0 );
+	assert.ok( cut.K >= Math.ceil( 2000 / 150 ) && cut.K <= 80, `${cut.K} pieces` );
+	// deterministic for a seed
+	assert.deepEqual( Array.from( cutToSize( g, 150, { seed: 3 } ).partition ), Array.from( cut.partition ) );
+	// a star: the hub's chunk and satellite groups
+	const star = normalizeGraph( { nodeCount: 1000, edges: Array.from( { length: 999 }, ( _, i ) => [ 0, i + 1 ] ).flat() } );
+	const cs = cutToSize( star, 200 );
+	assert.equal( cs.K, 5 );
+	assert.ok( Math.max( ...sizesOf( cs.partition ) ) <= 200 );
+	// within the limit already, no limit, nothing to cut: one piece
+	assert.equal( cutToSize( g, 2000 ).K, 1 );
+	assert.equal( cutToSize( g, 0 ).K, 1 );
+	assert.equal( cutToSize( { nodeCount: 0, edges: new Uint32Array( 0 ) }, 10 ).K, 0 );
+	// the leaves of the hierarchy are this cut: no leaf above maxLeafSize at any resolution
+	assert.ok( Math.max( ...sizesOf( leidenHierarchy( star, { maxLeafSize: 200 } ).levels[ 0 ] ) ) <= 200 );
+
+} );
+
+test( 'local moving: the queue cap stops the loop and leaves exact bookkeeping for the refinement', () => {
+
+	const { csrFromEdges, createScratch, moveNodesFast, refinePartition } = __internals;
+	assert.equal( DEFAULT_QUEUE_CAP, 64 );
+	for ( const id of [ 'karate', 'hsbm-500', 'ba-5k' ] ) {
+
+		const graph = dataset( id );
+		const g = csrFromEdges( graph.nodeCount, graph.edges, graph.weights );
+		const { n, start, adj, w, k } = g;
+		const gamma = 1 / g.m2;
+		// an uncapped run for reference
+		const S0 = createScratch( n, adj.length );
+		const free = Int32Array.from( { length: n }, ( _, i ) => i );
+		moveNodesFast( g, k, free, gamma, rng( 1 ), S0 );
+		assert.equal( S0.capped, 0, id );
+		assert.ok( S0.pops > n && S0.pops < 16 * n, `${id}: ${S0.pops} pops for ${n} nodes` );
+		for ( const factor of [ 1, 1.25, 1.5 ] ) {
+
+			const S = createScratch( n, adj.length );
+			S.capFactor = factor;
+			const comm = Int32Array.from( { length: n }, ( _, i ) => i );
+			moveNodesFast( g, k, comm, gamma, rng( 1 ), S );
+			assert.equal( S.capped, 1, `${id} cap ${factor}` );
+			assert.equal( S.pops, Math.floor( n * factor ), `${id} cap ${factor}` );
+			const tot = new Float64Array( n ), size = new Int32Array( n ), own = new Float64Array( n );
+			for ( let v = 0; v < n; v ++ ) {
+
+				tot[ comm[ v ] ] += k[ v ];
+				size[ comm[ v ] ] ++;
+				for ( let e = start[ v ]; e < start[ v + 1 ]; e ++ ) if ( comm[ adj[ e ] ] === comm[ v ] ) own[ v ] += w[ e ];
+
+			}
+
+			for ( let v = 0; v < n; v ++ ) {
+
+				assert.equal( S.csize[ v ], size[ v ], `${id} cap ${factor}: csize ${v}` );
+				assert.ok( Math.abs( S.tot[ v ] - tot[ v ] ) < 1e-9, `${id} cap ${factor}: tot ${v}` );
+				assert.ok( Math.abs( S.ext[ v ] - own[ v ] ) < 1e-9, `${id} cap ${factor}: ext of node ${v}: ${S.ext[ v ]} vs ${own[ v ]}` );
+				assert.equal( S.inQueue[ v ], 0, `${id} cap ${factor}: node ${v} still flagged as queued` );
+
+			}
+
+			const refined = new Int32Array( n );
+			const K = refinePartition( g, k, comm, gamma, 0.01, rng( 2 ), S, refined );
+			assertDense( refined, n, `${id} cap ${factor} refined` );
+			assert.equal( disconnectedClusters( graph, refined ), 0, `${id} cap ${factor}: refined communities are connected` );
+			assert.ok( K >= size.reduce( ( c, x ) => c + ( x > 0 ? 1 : 0 ), 0 ) );
+
+		}
+
+		// the option: a tight cap still gives a valid, connected hierarchy and reports the cut
+		const capped = leiden( graph, { queueCap: 1 } );
+		assert.ok( capped.capped > 0, id );
+		assert.equal( leiden( graph ).capped, 0, id );
+		for ( const level of capped.levels ) assert.equal( disconnectedClusters( graph, level ), 0, id );
+
+	}
 
 } );
 
@@ -1138,7 +1258,7 @@ test( 'drop-in for louvain.js: same exports, option names and result shapes', ()
 
 	const g = generate( { model: 'hsbm', params: { n: 3000, avgDegree: 12 }, seed: 3 } );
 	const a = louvainHierarchy( g ), b = leidenHierarchy( g );
-	assert.deepEqual( Object.keys( b ), Object.keys( a ) );
+	for ( const key of Object.keys( a ) ) assert.ok( key in b, `leidenHierarchy() result has ${key}` ); // a superset
 	for ( const key of Object.keys( a ) ) assert.equal( typeof b[ key ], typeof a[ key ], key );
 	const ra = louvain( g ), rb = leiden( g );
 	for ( const key of Object.keys( ra ) ) assert.ok( key in rb, `leiden() result has ${key}` );

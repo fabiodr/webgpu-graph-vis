@@ -5,40 +5,118 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>dev: data pipeline</title>
 <style>
-html,body{margin:0;height:100%;background:#000;color:#ccc;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+html,body{margin:0;height:100%;background:#000;color:#ccc;font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
 #app{position:fixed;inset:0}
-#hud{position:fixed;left:8px;top:8px;right:8px;white-space:pre-wrap;pointer-events:none;text-shadow:0 0 3px #000}
+#hud{position:fixed;left:8px;top:8px;right:8px;margin:0;white-space:pre;pointer-events:none;text-shadow:0 0 3px #000,0 0 2px #000}
 #bar{position:fixed;left:0;top:0;height:3px;background:#6cf;width:0;transition:width .1s}
+#pick{position:fixed;right:8px;bottom:8px;font:inherit;color:#ccc;background:#111;border:1px solid #444;border-radius:4px;padding:4px 8px}
+body.drag #app{outline:2px dashed #6cf;outline-offset:-6px}
 </style>
 </head>
 <body>
-<div id="app"></div><div id="bar"></div><div id="hud"></div>
+<div id="app"></div><div id="bar"></div><pre id="hud"></pre>
+<label id="pick">open a graph file (or drop one) <input id="file" type="file" hidden /></label>
 <script type="module">
-// Data pipeline dev page: DataClient (module Web Worker) -> generate / fetch / parse, Louvain,
-// prepareGraph -> DebugNodes on the hierarchical seed positions (no force layout here).
+// Data pipeline dev page: DataClient (module Web Worker) -> generate / fetch / parse, clustering,
+// prepareGraph -> DebugNodes on the seed positions (no force layout here). Everything runs in
+// the real worker, so the times printed are worker run times on this machine.
+//
 //   ?ds=<manifest id>        e.g. generated/hsbm-500 (file) or generated/hsbm-20k (generate spec)
 //   ?model=<id>&n=..&...     ad-hoc generator spec (any model param as a query key; seed=)
-//   ?url=/data/imsv/karate.json
+//   ?url=/data/samples/lesmis.gexf
+//   &method=leiden|louvain &resolution=γ &mode=auto|always|never|planted     cluster options
 //   &pos=sphere              show the paper's sphere layout instead of the seed positions
+//
+//   &formats=1               data.formats(), then every file of public/data/samples (one graph
+//                            in each format) through the worker, misnamed files (detection by
+//                            content), two files that must fail with a readable message, and
+//                            the three export formats written and read back
+//   &compare=1               clustering comparison on the loaded graph: data.recluster() with
+//                            Leiden and Louvain at the stops of a resolution slider, 0.25 … 4
+//                            (&gammas=0.5,1,2 to pick): resolution used, levels, communities,
+//                            modularity, agreement (NMI) with the reference partition (the
+//                            generator's ground truth, else the groups of the file, else the
+//                            hierarchy the graph came with), worker times; then five requests in
+//                            a row as a slider sends them
+//   &bundle=paths|mixed      data.bundle() for the loaded graph, with timings
+//   &bundles=1               the bundle table: lesmis, hsbm-500, lfr-2k, hsbm-5k, lfr-10k and
+//                            lfr-20k-dense (384k edges, 3 s budget), mode mixed (&only=a,b to
+//                            pick; &bmode=paths)
+//       &at=stress|seed      positions for bundling: the worker's stress layout (default) or
+//                            the seed positions of prepareGraph
+//   &big=50                  a file of about that many MB, written in the page (&bigformat=
+//                            graphml (default) | edges | gexf; &bignodes=60000), handed to the
+//                            worker as a File: read, parse, cluster and prepare times, progress
+//                            reports and the longest stall of the main thread while it loads.
+//                            &bigformat=edges writes more edges than the viewer takes: the
+//                            friendly "too large" error is the expected result
 //   &supersede=1             first start a 20k/400k generation, then supersede it (checks that
 //                            the older request resolves { cancelled: true } with a real Worker)
+//   Files: the button or drag and drop loads any supported file.
+// window.__report holds the numbers (scripts/shot.mjs --report "window.__report").
 import { createApp } from '../src/app/App.js';
 import { fetchManifest } from '../src/data/load.js';
 import { DataClient } from '../src/data/client.js';
+import { nmi } from '../src/data/partition.js';
 import { DebugNodes } from '../src/debug/DebugNodes.js';
 
 const params = new URLSearchParams( location.search );
 const hud = document.getElementById( 'hud' );
 const bar = document.getElementById( 'bar' );
-const log = [];
-const print = ( line ) => {
+const log = window.__log = [];
+const print = ( line = '' ) => {
 
-	log.push( line );
-	hud.textContent = log.slice( - 24 ).join( '\n' );
+	for ( const l of String( line ).split( '\n' ) ) log.push( l );
+	hud.textContent = log.slice( - 62 ).join( '\n' );
 
 };
 
+/** Rows of cells as an aligned text table (numbers right, text left). */
+function table( head, rows ) {
+
+	const cells = [ head, ...rows ].map( ( r ) => r.map( ( c ) => ( c === null || c === undefined ? '-' : String( c ) ) ) );
+	const width = head.map( ( _, k ) => Math.max( ...cells.map( ( r ) => r[ k ].length ) ) );
+	const numeric = head.map( ( _, k ) => rows.length > 0 && rows.every( ( r ) => r[ k ] === null || r[ k ] === undefined || typeof r[ k ] === 'number' ) );
+	return cells.map( ( r ) => '  ' + r.map( ( c, k ) => ( numeric[ k ] ? c.padStart( width[ k ] ) : c.padEnd( width[ k ] ) ) ).join( '  ' ).trimEnd() ).join( '\n' );
+
+}
+
+const ms = ( v ) => ( v === undefined || v === null ? null : Math.round( v * 10 ) / 10 );
+const num = ( v ) => v.toLocaleString( 'en-US' );
+const sleep = ( t ) => new Promise( ( r ) => setTimeout( r, t ) );
 const report = window.__report = { progress: [] };
+
+/** The partition of level l of a prepared graph, one label per node. */
+function levelOf( g, l ) {
+
+	const out = new Int32Array( g.N );
+	for ( let i = 0; i < g.N; i ++ ) out[ i ] = g.anc[ i * g.D + l ];
+	return out;
+
+}
+
+/** Longest stall of the main thread while a promise is pending (a 5 ms timer as the probe). */
+async function withStallProbe( promise ) {
+
+	let last = performance.now(), worst = 0;
+	const timer = setInterval( () => {
+
+		const t = performance.now();
+		worst = Math.max( worst, t - last );
+		last = t;
+
+	}, 5 );
+	try {
+
+		return { value: await promise, stall: worst };
+
+	} finally {
+
+		clearInterval( timer );
+
+	}
+
+}
 
 try {
 
@@ -47,12 +125,12 @@ try {
 	app.use( new DebugNodes( { size: Number( params.get( 'size' ) || 4 ) } ) );
 
 	const client = window.__client = new DataClient( { baseUrl: '/' } ); // manifest paths are relative to the site root
-	let lastStage = null;
+	let lastStage = null, quiet = false;
 	client.onProgress( ( p ) => {
 
 		bar.style.width = `${( p.fraction * 100 ).toFixed( 1 )}%`;
-		report.progress.push( [ p.stage, + p.fraction.toFixed( 3 ) ] );
-		if ( p.stage !== lastStage ) print( `  ${p.stage.padEnd( 9 )} ${( p.fraction * 100 ).toFixed( 0 ).padStart( 3 )}%  ${p.message}` );
+		if ( report.progress.length < 400 ) report.progress.push( [ p.stage, + p.fraction.toFixed( 3 ) ] );
+		if ( ! quiet && p.stage !== lastStage ) print( `  ${p.stage.padEnd( 9 )} ${( p.fraction * 100 ).toFixed( 0 ).padStart( 3 )}%  ${p.message}` );
 		lastStage = p.stage;
 
 	} );
@@ -66,25 +144,325 @@ try {
 
 	};
 
+	const cluster = {};
+	if ( params.get( 'method' ) ) cluster.method = params.get( 'method' );
+	if ( params.get( 'resolution' ) ) cluster.resolution = Number( params.get( 'resolution' ) );
+	if ( params.get( 'mode' ) ) cluster.mode = params.get( 'mode' );
+	else if ( cluster.method || cluster.resolution ) cluster.mode = 'always';
+	const loadOptions = Object.keys( cluster ).length ? { cluster } : {};
+
+	// ── show a result ────────────────────────────────────────────────────────────────────
+
+	function show( g, positions = null ) {
+
+		app.setGraph( g );
+		let radius;
+		if ( positions ) {
+
+			app.buffers.setPositions( positions );
+			radius = 0;
+			for ( let i = 0; i < g.N; i ++ ) radius = Math.max( radius, Math.hypot( positions[ 4 * i ], positions[ 4 * i + 1 ], positions[ 4 * i + 2 ] ) );
+
+		} else if ( params.get( 'pos' ) === 'sphere' ) {
+
+			const pos = new Float32Array( 4 * g.N );
+			for ( let i = 0; i < g.N; i ++ ) for ( let k = 0; k < 3; k ++ ) pos[ 4 * i + k ] = g.sphereDir[ 4 * i + k ] * g.layoutRadius;
+			app.buffers.setPositions( pos );
+			radius = g.layoutRadius;
+
+		} else radius = app.boundingSphere().radius;
+
+		const inside = ! positions && params.get( 'pos' ) === 'sphere';
+		app.camera.position.set( 0, 0, radius * ( inside ? 0.01 : 2.6 ) );
+		app.camera.lookAt( 0, 0, inside ? radius : 0 );
+		if ( app.controls ) app.controls.target.set( 0, 0, inside ? radius : 0 );
+
+	}
+
+	function describe( r ) {
+
+		const g = r.graph, c = g.clustering, f = r.meta.file || {};
+		const lines = [];
+		lines.push( `${g.name}  (${r.meta.format || r.meta.kind})` );
+		lines.push( `N=${num( g.N )}  E=${num( g.E )}  D=${g.D}  clusters/level=${g.stats.clustersPerLevel.join( '/' )}${g.edgeWeight ? '  weighted' : ''}${f.directed ? '  directed in the file' : ''}` );
+		if ( c ) lines.push( `hierarchy: ${c.detail || c.method}${c.stored ? ' (stored in the file)' : ''}  γ=${c.resolution}  communities=${c.communities}  Q=${c.modularity === null || c.modularity === undefined ? '-' : c.modularity.toFixed( 3 )}  kinds=${( c.kinds || [] ).join( '/' )}` );
+		else lines.push( 'hierarchy: none' );
+		const attrs = Object.entries( g.attributes || {} ).map( ( [ name, a ] ) => ( a.type === 'category' ? `${name} (${a.categories.length} categories)` : `${name} (number)` ) );
+		if ( attrs.length ) lines.push( `attributes: ${attrs.join( ', ' )}` );
+		if ( f.groups ) lines.push( `groups in the file: ${f.groups.count} from ${f.groups.source}` );
+		for ( const note of r.meta.notes || [] ) lines.push( `note: ${note}` );
+		lines.push( `worker ms: ${Object.entries( r.timings ).filter( ( [ k ] ) => k !== 'roundTrip' ).map( ( [ k, v ] ) => `${k} ${Math.round( v )}` ).join( ', ' )}  |  round trip ${Math.round( r.timings.roundTrip )}` );
+		return lines.join( '\n' );
+
+	}
+
+	// ── files: the button and drag and drop ──────────────────────────────────────────────
+
+	const input = document.getElementById( 'file' );
+	input.accept = client.formats().flatMap( ( f ) => f.extensions ).concat( '.gz' ).join( ',' );
+	async function openFile( file ) {
+
+		print( `\nfile ${file.name} (${num( file.size )} bytes)` );
+		try {
+
+			const r = await client.loadFile( file, {}, loadOptions );
+			if ( r.cancelled ) return;
+			print( describe( r ) );
+			show( r.graph );
+
+		} catch ( e ) {
+
+			print( `  cannot load: ${e.message}${e.code ? `  [${e.code}]` : ''}` );
+
+		}
+
+	}
+
+	input.addEventListener( 'change', () => input.files[ 0 ] && openFile( input.files[ 0 ] ) );
+	window.addEventListener( 'dragover', ( e ) => {
+
+		e.preventDefault();
+		document.body.classList.add( 'drag' );
+
+	} );
+	window.addEventListener( 'dragleave', () => document.body.classList.remove( 'drag' ) );
+	window.addEventListener( 'drop', ( e ) => {
+
+		e.preventDefault();
+		document.body.classList.remove( 'drag' );
+		if ( e.dataTransfer.files[ 0 ] ) openFile( e.dataTransfer.files[ 0 ] );
+
+	} );
+
+	// ── a large file ─────────────────────────────────────────────────────────────────────
+
+	/** A File of about `megabytes` MB in the given format: blocks of 200 nodes, 90% of the edges inside. */
+	async function bigFile( megabytes, format, n ) {
+
+		const target = megabytes * 1024 * 1024;
+		let state = 12345;
+		const rand = () => ( ( state = ( Math.imul( state, 1664525 ) + 1013904223 ) >>> 0 ) / 4294967296 );
+		const parts = [];
+		let bytes = 0, piece = '', edges = 0;
+		const flush = async ( force ) => {
+
+			if ( piece.length < 1 << 20 && ! force ) return;
+			parts.push( piece );
+			bytes += piece.length;
+			piece = '';
+			await sleep( 0 );
+
+		};
+
+		const edge = () => {
+
+			const a = Math.floor( rand() * n );
+			const block = a - ( a % 200 );
+			const b = rand() < 0.9 ? Math.min( n - 1, block + Math.floor( rand() * 200 ) ) : Math.floor( rand() * n );
+			return [ a, b, ( 0.5 + rand() * 4.5 ).toFixed( 3 ) ];
+
+		};
+
+		if ( format === 'edges' ) {
+
+			piece += '# source\ttarget\tweight\n';
+			while ( bytes + piece.length < target ) {
+
+				const [ a, b, w ] = edge();
+				piece += `person-${String( a ).padStart( 7, '0' )}\tperson-${String( b ).padStart( 7, '0' )}\t${w}\n`;
+				edges ++;
+				await flush();
+
+			}
+
+		} else if ( format === 'gexf' ) {
+
+			piece += '<?xml version="1.0" encoding="UTF-8"?>\n<gexf xmlns="http://gexf.net/1.3" version="1.3">\n<graph defaultedgetype="undirected">\n<attributes class="node"><attribute id="0" title="team" type="string"/><attribute id="1" title="score" type="double"/></attributes>\n<nodes>\n';
+			for ( let i = 0; i < n; i ++ ) {
+
+				piece += `<node id="n${i}" label="Person ${i}"><attvalues><attvalue for="0" value="team ${i % 12}"/><attvalue for="1" value="${( rand() * 100 ).toFixed( 2 )}"/></attvalues></node>\n`;
+				await flush();
+
+			}
+
+			piece += '</nodes>\n<edges>\n';
+			while ( bytes + piece.length < target ) {
+
+				const [ a, b, w ] = edge();
+				piece += `<edge id="${edges}" source="n${a}" target="n${b}" weight="${w}" label="an edge label that makes the element longer"/>\n`;
+				edges ++;
+				await flush();
+
+			}
+
+			piece += '</edges>\n</graph>\n</gexf>\n';
+
+		} else {
+
+			piece += '<?xml version="1.0" encoding="UTF-8"?>\n<graphml xmlns="http://graphml.graphdrawing.org/xmlns">\n<key id="d0" for="node" attr.name="label" attr.type="string"/>\n<key id="d1" for="node" attr.name="team" attr.type="string"/>\n<key id="d2" for="node" attr.name="score" attr.type="double"/>\n<key id="d3" for="edge" attr.name="weight" attr.type="double"/>\n<key id="d4" for="edge" attr.name="note" attr.type="string"/>\n<graph id="G" edgedefault="undirected">\n';
+			for ( let i = 0; i < n; i ++ ) {
+
+				piece += `<node id="n${i}"><data key="d0">Person ${i}</data><data key="d1">team ${i % 12}</data><data key="d2">${( rand() * 100 ).toFixed( 2 )}</data></node>\n`;
+				await flush();
+
+			}
+
+			while ( bytes + piece.length < target ) {
+
+				const [ a, b, w ] = edge();
+				piece += `<edge source="n${a}" target="n${b}"><data key="d3">${w}</data><data key="d4">seen together</data></edge>\n`;
+				edges ++;
+				await flush();
+
+			}
+
+			piece += '</graph>\n</graphml>\n';
+
+		}
+
+		await flush( true );
+		return { file: new File( parts, `big.${format === 'edges' ? 'tsv' : format}` ), lines: edges };
+
+	}
+
+	// ── every format ─────────────────────────────────────────────────────────────────────
+
+	if ( params.has( 'formats' ) ) {
+
+		quiet = true;
+		print( 'data.formats()' );
+		print( table( [ 'id', 'name', 'extensions' ], client.formats().map( ( f ) => [ f.id, f.name, f.extensions.join( ' ' ) ] ) ) );
+		const index = await ( await fetch( '/data/samples/index.json' ) ).json();
+		const rows = [];
+		report.formats = [];
+		const row = ( file, r ) => {
+
+			const g = r.graph, f = r.meta.file || {};
+			const entry = {
+				file, format: r.meta.format, nodes: g.N, edges: g.E, weighted: !! g.edgeWeight,
+				labels: g.labels ? g.labels[ 0 ] : null,
+				attributes: Object.entries( g.attributes || {} ).map( ( [ name, a ] ) => `${name}:${a.type === 'category' ? a.categories.length : '#'}` ).join( ' ' ),
+				groups: f.groups ? f.groups.count : null, levels: g.D, ms: ms( r.timings.total ),
+			};
+			report.formats.push( entry );
+			rows.push( [ entry.file, entry.format, entry.nodes, entry.edges, entry.weighted ? 'yes' : 'no', entry.labels, entry.attributes || '-', entry.groups, g.stats.clustersPerLevel.join( '/' ), entry.ms ] );
+
+		};
+
+		const texts = {};
+		for ( const file of index.files ) {
+
+			const r = await client.loadUrl( `/data/samples/${file}`, {}, loadOptions );
+			row( file, r );
+
+		}
+
+		// misnamed files: the content decides
+		for ( const [ file, name ] of [ [ 'lesmis.graphml', 'download.txt' ], [ 'lesmis.gexf', 'graph.xml' ], [ 'lesmis.gml', 'noextension' ], [ 'lesmis.net', 'pajek.csv' ], [ 'lesmis.node-link.json', 'data.txt' ] ] ) {
+
+			texts[ file ] = await ( await fetch( `/data/samples/${file}` ) ).text();
+			row( `${name} (is ${file.split( '.' ).slice( 1 ).join( '.' )})`, await client.loadText( texts[ file ], name, {}, loadOptions ) );
+
+		}
+
+		// gzipped files (packed here with CompressionStream): with .gz, and without any hint in the name
+		if ( typeof CompressionStream !== 'undefined' ) {
+
+			for ( const [ file, name ] of [ [ 'lesmis.graphml', 'lesmis.graphml.gz' ], [ 'lesmis.gml', 'packed' ] ] ) {
+
+				const packed = await new Response( new Blob( [ texts[ file ] ] ).stream().pipeThrough( new CompressionStream( 'gzip' ) ) ).blob();
+				row( `${name} (gzip of ${file}, ${num( packed.size )} bytes)`, await client.loadFile( new File( [ packed ], name ), {}, loadOptions ) );
+
+			}
+
+		}
+
+		print( `\npublic/data/samples: expected ${index.nodes} nodes, ${index.edges} edges` );
+		print( table( [ 'file', 'read as', 'N', 'E', 'weights', 'first label', 'attributes', 'groups', 'clusters', 'ms' ], rows ) );
+		report.formatsOk = report.formats.every( ( f ) => f.nodes === index.nodes && f.edges === index.edges );
+
+		// files that cannot be read say why
+		report.errors = [];
+		for ( const [ name, text ] of [
+			[ 'page.xml', '<html><body>not a graph</body></html>' ],
+			[ 'broken.graphml', texts[ 'lesmis.graphml' ].slice( 0, 1500 ) ],
+			[ 'empty.csv', '# nothing here\n' ],
+			[ 'photo.gml', 'GIF89a\u0000\u0001\u0002' ],
+			[ 'deep.dot', 'graph g { ' + '{ '.repeat( 50000 ) ],
+			[ 'cut.graphml.gz', null ],
+			[ '/data/samples/missing.gexf', undefined ],
+		] ) {
+
+			try {
+
+				if ( text === undefined ) await client.loadUrl( name );
+				else if ( text === null ) {
+
+					// the first 300 bytes of a gzip archive
+					const packed = await new Response( new Blob( [ texts[ 'lesmis.graphml' ] ] ).stream().pipeThrough( new CompressionStream( 'gzip' ) ) ).blob();
+					await client.loadFile( new File( [ packed.slice( 0, 300 ) ], name ) );
+
+				} else await client.loadText( text, name );
+				report.errors.push( { name, message: null } );
+				print( `  ${name}: loaded (unexpected)` );
+
+			} catch ( e ) {
+
+				report.errors.push( { name, code: e.code || null, message: e.message } );
+				print( `  ${name}: [${e.code || 'error'}] ${e.message}` );
+
+			}
+
+		}
+
+		// export and read back
+		const base = await client.loadUrl( '/data/samples/lesmis.gexf', {}, loadOptions );
+		const erows = [];
+		report.exports = [];
+		for ( const format of [ 'json', 'graphml', 'csv' ] ) {
+
+			const blob = await client.export( format, { positions: base.graph.initPos } );
+			const back = await client.loadFile( new File( [ blob ], blob.suggestedName ), {}, loadOptions );
+			const entry = { format, name: blob.suggestedName, bytes: blob.size, type: blob.type, nodes: back.graph.N, edges: back.graph.E, weighted: !! back.graph.edgeWeight, repositioned: !! back.meta.repositioned };
+			report.exports.push( entry );
+			erows.push( [ `data.export( '${format}' )`, entry.name, entry.bytes, entry.type, entry.nodes, entry.edges, entry.weighted ? 'yes' : 'no', entry.repositioned ? 'yes' : 'no' ] );
+
+		}
+
+		print( '\nexport, then load the Blob again' );
+		print( table( [ 'call', 'file name', 'bytes', 'type', 'N', 'E', 'weights', 'positions kept' ], erows ) );
+		print();
+		quiet = false;
+
+	}
+
+	// ── the graph to show ────────────────────────────────────────────────────────────────
+
 	let request, label, expect = null;
 	if ( params.get( 'model' ) ) {
 
+		const skip = [ 'model', 'seed', 'pos', 'size', 'supersede', 'method', 'resolution', 'mode', 'formats', 'compare', 'bundle', 'bundles', 'at', 'only', 'bmode', 'quality', 'governor' ];
 		const spec = { model: params.get( 'model' ), params: {}, seed: Number( params.get( 'seed' ) || 1 ) };
-		for ( const [ k, v ] of params ) if ( ! [ 'model', 'seed', 'pos', 'size', 'supersede' ].includes( k ) ) spec.params[ k ] = v === 'true' ? true : v === 'false' ? false : Number( v );
+		for ( const [ k, v ] of params ) if ( ! skip.includes( k ) ) spec.params[ k ] = v === 'true' ? true : v === 'false' ? false : Number( v );
 		label = `generate ${JSON.stringify( spec )}`;
-		request = () => client.generate( spec );
+		request = () => client.generate( spec, {}, loadOptions );
 
 	} else if ( params.get( 'url' ) ) {
 
 		label = `url ${params.get( 'url' )}`;
-		request = () => client.loadUrl( params.get( 'url' ) );
+		request = () => client.loadUrl( params.get( 'url' ), {}, loadOptions );
+
+	} else if ( params.has( 'formats' ) && ! params.get( 'ds' ) ) {
+
+		label = 'url /data/samples/lesmis.gexf with the groups of the file as the top level (mode planted)';
+		request = () => client.loadUrl( '/data/samples/lesmis.gexf', {}, { cluster: { mode: 'planted' } } );
 
 	} else {
 
 		const entry = pick( params.get( 'ds' ) || 'generated/hsbm-500' );
-		expect = entry;
+		expect = Object.keys( cluster ).length ? null : entry;
 		label = `${entry.id} (${entry.file ? 'file ' + entry.file : 'generate ' + JSON.stringify( entry.generate )})`;
-		request = () => client.load( entry );
+		request = () => client.load( entry, {}, loadOptions );
 
 	}
 
@@ -93,7 +471,7 @@ try {
 		print( 'supersede test: starting generated/lfr-20k-dense, superseding after 300 ms' );
 		const t0 = performance.now();
 		const big = client.load( pick( 'generated/lfr-20k-dense' ) );
-		await new Promise( ( r ) => setTimeout( r, 300 ) );
+		await sleep( 300 );
 		const pending = request();
 		const first = await big;
 		report.superseded = { result: first, ms: Math.round( performance.now() - t0 ) };
@@ -104,25 +482,11 @@ try {
 
 	print( label );
 	const t0 = performance.now();
-	const r = await request();
+	let r = await request();
 	if ( r.cancelled ) throw new Error( 'unexpectedly cancelled' );
-	const ms = performance.now() - t0;
-	const g = r.graph;
-	app.setGraph( g );
-
-	let radius;
-	if ( params.get( 'pos' ) === 'sphere' ) {
-
-		const pos = new Float32Array( 4 * g.N );
-		for ( let i = 0; i < g.N; i ++ ) for ( let k = 0; k < 3; k ++ ) pos[ 4 * i + k ] = g.sphereDir[ 4 * i + k ] * g.layoutRadius;
-		app.buffers.setPositions( pos );
-		radius = g.layoutRadius;
-
-	} else radius = app.boundingSphere().radius;
-
-	app.camera.position.set( 0, 0, radius * ( params.get( 'pos' ) === 'sphere' ? 0.01 : 2.6 ) );
-	app.camera.lookAt( 0, 0, params.get( 'pos' ) === 'sphere' ? radius : 0 );
-	if ( params.get( 'pos' ) === 'sphere' && app.controls ) app.controls.target.set( 0, 0, radius );
+	const clientMs = performance.now() - t0;
+	let g = r.graph;
+	show( g );
 
 	const leafSizes = ( () => {
 
@@ -135,20 +499,238 @@ try {
 
 	Object.assign( report, {
 		name: g.name, N: g.N, E: g.E, D: g.D, clustersPerLevel: g.stats.clustersPerLevel, leafSizes,
-		hierarchy: r.meta.hierarchy, format: r.meta.format, kind: r.meta.kind,
+		hierarchy: r.meta.hierarchy, clustering: g.clustering, format: r.meta.format, kind: r.meta.kind,
+		notes: r.meta.notes, attributes: r.meta.attributes, weighted: !! g.edgeWeight,
 		timings: Object.fromEntries( Object.entries( r.timings ).map( ( [ k, v ] ) => [ k, Math.round( v ) ] ) ),
-		clientMs: Math.round( ms ),
+		clientMs: Math.round( clientMs ),
 		matchesManifest: expect ? expect.nodes === g.N && expect.edges === g.E && expect.levels === g.D : null,
 		labels: g.labels ? g.labels.slice( 0, 5 ) : null,
 		typedArrays: Object.values( g ).filter( ( v ) => ArrayBuffer.isView( v ) ).length,
 	} );
 
-	print( '' );
-	print( `${g.name}` );
-	print( `N=${g.N.toLocaleString( 'en-US' )}  E=${g.E.toLocaleString( 'en-US' )}  D=${g.D}  clusters/level=${g.stats.clustersPerLevel.join( '/' )}  leaf ${leafSizes ? `${leafSizes.min}/${leafSizes.median}/${leafSizes.max}` : '-'}` );
-	print( `hierarchy: ${r.meta.hierarchy ? r.meta.hierarchy.method : 'none'}${r.meta.hierarchy?.modularity ? '  Q=' + r.meta.hierarchy.modularity.map( ( q ) => q.toFixed( 3 ) ).join( '/' ) : ''}` );
-	print( `worker ms: ${Object.entries( report.timings ).filter( ( [ k ] ) => k !== 'roundTrip' ).map( ( [ k, v ] ) => `${k} ${v}` ).join( ', ' )}  |  round trip ${Math.round( r.timings.roundTrip )}` );
+	print();
+	print( describe( r ) );
+	if ( leafSizes ) print( `leaf clusters: ${leafSizes.min} / ${leafSizes.median} / ${leafSizes.max} nodes (min / median / max)` );
 	if ( expect ) print( `manifest counts match: ${report.matchesManifest}` );
+
+	// ── clustering comparison ────────────────────────────────────────────────────────────
+
+	if ( params.has( 'compare' ) ) {
+
+		quiet = true;
+		// the reference partition
+		let reference = null, referenceName = null, fine = null;
+		const spec = r.meta.generator;
+		const groups = r.meta.file && r.meta.file.groups;
+		if ( spec && spec.model ) {
+
+			const truth = await client.generate( spec, {}, { cluster: { mode: 'planted' } } );
+			if ( truth.graph.N === g.N && truth.graph.E === g.E && truth.graph.D > 0 && truth.graph.clustering && truth.graph.clustering.method === 'planted' ) {
+
+				reference = levelOf( truth.graph, truth.graph.D - 1 );
+				fine = levelOf( truth.graph, 0 );
+				referenceName = `the generator's ground truth (${truth.graph.stats.clustersPerLevel.slice().reverse().join( ' > ' )} blocks)`;
+
+			}
+
+		}
+
+		if ( ! reference && groups ) {
+
+			const planted = await ( params.get( 'url' ) ? client.loadUrl( params.get( 'url' ), {}, { cluster: { mode: 'planted' } } ) : client.recluster( { mode: 'planted' } ) );
+			if ( ! planted.cancelled && planted.graph.D > 0 ) {
+
+				reference = levelOf( planted.graph, planted.graph.D - 1 );
+				referenceName = `the groups of the file (${groups.count}, ${groups.source})`;
+
+			}
+
+		}
+
+		if ( ! reference && g.D > 0 ) {
+
+			reference = levelOf( g, g.clustering && Number.isInteger( g.clustering.mainLevel ) ? g.clustering.mainLevel : g.D - 1 );
+			referenceName = `the hierarchy the graph came with (${g.clustering ? g.clustering.detail || g.clustering.method : 'file'})`;
+
+		}
+
+		print( `\nclustering comparison, data.recluster( { method, resolution } ); reference: ${referenceName || 'none'}` );
+		const rows = [];
+		report.compare = [];
+		const gammas = ( params.get( 'gammas' ) || '0.25,0.35,0.5,0.7,1,1.4,2,2.8,4' ).split( ',' ).map( Number );
+		for ( const method of [ 'leiden', 'louvain' ] ) {
+
+			for ( const resolution of gammas ) {
+
+				const c = await client.recluster( { method, resolution, mode: 'always' } );
+				const cg = c.graph, info = cg.clustering;
+				const main = Number.isInteger( info.mainLevel ) ? info.mainLevel : cg.D - 1;
+				const entry = {
+					method, resolution, resolutionUsed: info.resolutionUsed, levels: cg.D, clustersPerLevel: cg.stats.clustersPerLevel, communities: info.communities, mainLevel: main,
+					// the level the count belongs to shows exactly that many clusters (next to the dust clusters)
+					shown: cg.D ? cg.stats.clustersPerLevel[ main ] - ( info.dustClusters ? info.dustClusters[ main ] : 0 ) : 0,
+					modularity: info.modularity, nmi: reference && cg.D ? nmi( levelOf( cg, main ), reference ) : null,
+					nmiFine: fine && cg.D ? nmi( levelOf( cg, 0 ), fine ) : null,
+					sameOrder: cg.N === g.N && cg.E === g.E && cg.edges.every( ( v, k ) => v === g.edges[ k ] ),
+					clusterMs: ms( c.timings.cluster ), prepareMs: ms( c.timings.prepare ), totalMs: ms( c.timings.total ), roundTripMs: ms( c.timings.roundTrip ),
+					fetched: c.timings.fetch !== undefined || c.timings.parse !== undefined || c.timings.generate !== undefined,
+				};
+				report.compare.push( entry );
+				rows.push( [ method, resolution, + ( + entry.resolutionUsed ).toFixed( 3 ), entry.levels, entry.clustersPerLevel.map( ( k, l ) => ( l === main ? `[${k}]` : k ) ).join( '/' ), entry.communities, entry.modularity === null || entry.modularity === undefined ? null : + entry.modularity.toFixed( 3 ), entry.nmi === null ? null : + entry.nmi.toFixed( 3 ), entry.nmiFine === null ? null : + entry.nmiFine.toFixed( 3 ), entry.clusterMs, entry.prepareMs, entry.roundTripMs, entry.fetched ? 'yes' : 'no' ] );
+
+			}
+
+		}
+
+		print( table( [ 'method', 'γ', 'γ used', 'levels', 'clusters/level [main]', 'communities', 'Q', 'NMI', 'NMI finest', 'cluster ms', 'prepare ms', 'round trip', 'parsed again' ], rows ) );
+		// the slider promise: the number of communities never falls when the resolution rises
+		report.monotone = {};
+		for ( const method of [ 'leiden', 'louvain' ] ) {
+
+			const entries = report.compare.filter( ( e ) => e.method === method );
+			const counts = entries.map( ( e ) => e.communities );
+			report.monotone[ method ] = { counts, monotone: counts.every( ( c, k ) => k === 0 || c >= counts[ k - 1 ] ), distinct: new Set( counts ).size, shown: entries.every( ( e ) => e.shown === e.communities ), minLevels: Math.min( ...entries.map( ( e ) => e.levels ) ) };
+			print( `  ${method}: communities ${counts.join( ', ' )}: ${report.monotone[ method ].monotone ? 'monotone' : 'NOT monotone'}, ${report.monotone[ method ].distinct} different counts, ${report.monotone[ method ].shown ? 'each is the cluster count of its main level' : 'NOT the cluster count of the main level'}, at least ${report.monotone[ method ].minLevels} levels` );
+
+		}
+
+
+		// a slider: five requests in a row, only the last one is computed to the end
+		const tSlider = performance.now();
+		const burst = [ 0.6, 0.8, 1.2, 1.6, 2 ].map( ( resolution ) => client.recluster( { method: 'leiden', resolution }, { positions: g.initPos } ) );
+		const settled = await Promise.all( burst );
+		const last = settled.at( - 1 );
+		report.slider = { cancelled: settled.filter( ( s ) => s.cancelled ).length, lastResolution: last.cancelled ? null : last.graph.clustering.resolution, ms: Math.round( performance.now() - tSlider ), repositioned: last.cancelled ? null : !! last.meta.repositioned };
+		print( `  five requests in a row (γ 0.6 … 2, with positions): ${report.slider.cancelled} resolved cancelled, the last one (γ=${report.slider.lastResolution}) arrived after ${report.slider.ms} ms, start positions kept: ${report.slider.repositioned}` );
+
+		// back to the default
+		r = await client.recluster( { method: 'leiden', resolution: 1, mode: 'always' } );
+		g = r.graph;
+		show( g );
+		print( `  shown: leiden, γ=1 (${g.stats.clustersPerLevel.join( '/' )})` );
+		quiet = false;
+
+	}
+
+	// ── edge bundling in the worker ──────────────────────────────────────────────────────
+
+	async function positionsFor( graph ) {
+
+		if ( params.get( 'at' ) === 'seed' ) return { positions: graph.initPos, source: 'seed', layoutMs: 0 };
+		const l = await client.layout( 'stress', { graph } );
+		return { positions: l.positions, source: 'stress', layoutMs: ms( l.timings.compute ) };
+
+	}
+
+	async function bundleOnce( graph, mode, positions ) {
+
+		let reports = 0;
+		const { value: b, stall } = await withStallProbe( client.bundle( { graph, positions, mode, onProgress: () => reports ++ } ) );
+		if ( b.cancelled ) throw new Error( 'bundle unexpectedly cancelled' );
+		const s = b.stats, t = b.timings;
+		return {
+			result: b,
+			entry: {
+				mode, edges: graph.E, bundled: s.bundled, bundledRatio: + s.bundledRatio.toFixed( 3 ), inkRatio: s.inkRatio === undefined ? null : + s.inkRatio.toFixed( 3 ),
+				mixed: s.mixed || null, maxLoad: s.maxLoad, maxInterior: b.paths.maxInterior, refs: b.paths.pathRefs.length,
+				budget: s.budget, outOfTime: s.outOfTime, hurried: !! s.hurried, complete: !! s.complete,
+				setupMs: ms( t.setup ), computeMs: ms( t.compute ), resultMs: ms( t.result ), totalMs: ms( t.total ), slices: t.slices,
+				roundTripMs: ms( t.roundTrip ), progressReports: reports, mainThreadStallMs: ms( stall ),
+			},
+		};
+
+	}
+
+	const bundleHead = [ 'graph', 'N', 'E', 'at', 'layout ms', 'mode', 'bundled', 'hierarchy', 'straight', 'max load', 'worker ms', 'compute', 'slices', 'round trip', 'budget', 'cut', 'stall ms' ];
+	const bundleRow = ( name, graph, at, e ) => [ name, graph.N, graph.E, at.source, at.layoutMs, e.mode, e.bundled, e.mixed ? e.mixed.fromHierarchy : null, e.mixed ? e.mixed.straight : graph.E - e.bundled, e.maxLoad, e.totalMs, e.computeMs, e.slices, e.roundTripMs, e.budget === null ? 'none' : `${e.budget} ms`, e.outOfTime ? 'out of time' : e.hurried ? 'hurried' : 'no', e.mainThreadStallMs ];
+
+	if ( params.get( 'bundle' ) ) {
+
+		const mode = params.get( 'bundle' ) === 'mixed' ? 'mixed' : 'paths';
+		const at = await positionsFor( g );
+		const { entry } = await bundleOnce( g, mode, at.positions );
+		report.bundle = { ...entry, at: at.source, layoutMs: at.layoutMs };
+		print( `\ndata.bundle( { positions, mode: '${mode}' } )` );
+		print( table( bundleHead, [ bundleRow( g.name, g, at, entry ) ] ) );
+		show( g, at.positions );
+
+	}
+
+	if ( params.has( 'bundles' ) ) {
+
+		quiet = true;
+		const mode = params.get( 'bmode' ) === 'paths' ? 'paths' : 'mixed';
+		const ids = ( params.get( 'only' ) || 'imsv/lesmis,generated/hsbm-500,generated/lfr-2k,generated/hsbm-5k,generated/lfr-10k,generated/lfr-20k-dense' ).split( ',' );
+		const rows = [];
+		report.bundles = [];
+		print( `\ndata.bundle( { positions, mode: '${mode}' } ) in the worker` );
+		let lastGraph = null, lastAt = null;
+		for ( const id of ids ) {
+
+			const loaded = await client.load( pick( id ) );
+			const graph = loaded.graph;
+			const at = await positionsFor( graph );
+			const { entry } = await bundleOnce( graph, mode, at.positions );
+			// newest wins: a second request while the first is running; how long the worker took to get to it
+			const stale = client.bundle( { graph, positions: at.positions, mode } );
+			await sleep( 60 );
+			const again = await bundleOnce( graph, mode, at.positions );
+			const first = await stale;
+			entry.staleCancelled = first.cancelled === true;
+			entry.switchMs = ms( again.entry.roundTripMs - again.entry.totalMs );
+			report.bundles.push( { id, nodes: graph.N, at: at.source, layoutMs: at.layoutMs, loadMs: ms( loaded.timings.total ), ...entry } );
+			rows.push( bundleRow( id, graph, at, entry ) );
+			print( `  ${id}: ${entry.totalMs} ms` );
+			lastGraph = graph;
+			lastAt = at;
+
+		}
+
+		print( table( bundleHead, rows ) );
+		// (a run that is done within the 60 ms before the newer request cannot be superseded)
+		const slow = report.bundles.filter( ( b ) => b.totalMs >= 60 );
+		print( `  a newer request while one is running: the older one resolved cancelled ${slow.every( ( b ) => b.staleCancelled ) ? `every time (${slow.length} of ${report.bundles.length} runs were still running)` : 'NOT every time'}; the worker switched within ${Math.max( ...report.bundles.map( ( b ) => b.switchMs ) )} ms (round trip minus run time of the newer request)` );
+		if ( lastGraph ) show( lastGraph, lastAt.positions );
+		quiet = false;
+
+	}
+
+	// ── a large file through the worker ──────────────────────────────────────────────────
+
+	if ( params.get( 'big' ) ) {
+
+		const format = params.get( 'bigformat' ) || 'graphml';
+		const { file, lines } = await bigFile( Number( params.get( 'big' ) ), format, Number( params.get( 'bignodes' ) || 60000 ) );
+		print( `\na large file: ${file.name}, ${( file.size / 1048576 ).toFixed( 1 )} MB, ${num( lines )} edge records, loaded with data.loadFile()` );
+		// the page's own longest frame with nothing loading (a software rasterizer draws slowly)
+		const idle = await withStallProbe( sleep( 2000 ) );
+		const stages = new Map();
+		const off = client.onProgress( ( p ) => stages.set( p.stage, ( stages.get( p.stage ) || 0 ) + 1 ) );
+		const t0 = performance.now();
+		let outcome;
+		const probe = await withStallProbe( client.loadFile( file, {}, loadOptions ).then( ( r ) => ( { r } ), ( e ) => ( { e } ) ) );
+		const wall = performance.now() - t0;
+		if ( typeof off === 'function' ) off();
+		if ( probe.value.e ) {
+
+			const e = probe.value.e;
+			outcome = { ok: false, message: e.message, code: e.code || null };
+			print( `  cannot load: ${e.message}${e.code ? `  [${e.code}]` : ''}` );
+
+		} else {
+
+			const r = probe.value.r;
+			outcome = { ok: true, nodes: r.graph.N, edges: r.graph.E, levels: r.graph.D, clustersPerLevel: r.graph.stats.clustersPerLevel, timings: Object.fromEntries( Object.entries( r.timings ).map( ( [ k, v ] ) => [ k, Math.round( v ) ] ) ), notes: r.meta.notes || [], format: r.meta.format, attributes: Object.keys( r.graph.attributes || {} ), weighted: !! r.graph.edgeWeight };
+			print( describe( r ) );
+			show( r.graph );
+
+		}
+
+		report.big = { megabytes: + ( file.size / 1048576 ).toFixed( 1 ), format, records: lines, wallMs: Math.round( wall ), mainThreadStallMs: ms( probe.stall ), idleStallMs: ms( idle.stall ), progressReports: Object.fromEntries( stages ), ...outcome };
+		print( `  wall ${report.big.wallMs} ms; progress reports: ${[ ...stages ].map( ( [ k, v ] ) => `${k} ${v}` ).join( ', ' )}; longest stall of the main thread while loading: ${report.big.mainThreadStallMs} ms (${report.big.idleStallMs} ms with nothing loading)` );
+
+	}
+
 	window.__ready = true;
 
 } catch ( e ) {
