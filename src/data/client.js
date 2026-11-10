@@ -30,6 +30,22 @@
 //                                                  (worker cache: skips fetch, parse and Louvain)
 //   onProgress( cb ) -> unsubscribe                cb({ stage, fraction, message }) for the current
 //                                                  request; stage 'done' (fraction 1) at the end
+//   layout( kind, options? )                       static layout of a prepared graph, computed in
+//                                                  the worker (graph/layouts.js):
+//                                                    'stress'  sparse SGD² stress layout; options
+//                                                              { graph, pivots = 'auto' (200 up to
+//                                                              2000 nodes, 50 above), iters = 30,
+//                                                              seed = 1, dim = 3, radius }
+//                                                    'radial'  BFS shells around options.root
+//                                                              { graph, root, dim = 3, radius }
+//                                                  graph defaults to the last loaded graph. Resolves
+//                                                  { cancelled: false, kind, positions: Float32Array
+//                                                  ( 4N ) (xyz world units, w = 0), depth (radial),
+//                                                  info, timings } or { cancelled: true } when a newer
+//                                                  layout() call superseded it or the worker was
+//                                                  terminated (a load superseding a load, cancel(),
+//                                                  dispose()). Loads and layouts otherwise queue
+//                                                  behind each other; neither cancels the other.
 //   listModels()                                   generator descriptions for the UI form
 //   cancel()                                       resolve the current request as cancelled
 //   busy                                           true while a request is in flight
@@ -110,6 +126,8 @@ export class DataClient {
 		this._nextId = 1;
 		this._listeners = new Set();
 		this._last = null;
+		this._layoutCurrent = null;
+		this._graph = null; // the last graph a load returned (default subject of layout())
 
 	}
 
@@ -189,6 +207,43 @@ export class DataClient {
 
 	}
 
+	/** Static layout of a prepared graph in the worker (see the header). */
+	layout( kind = 'stress', options = {} ) {
+
+		const { graph = this._graph, ...rest } = options || {};
+		if ( ! graph ) return Promise.reject( new Error( 'layout: no graph (load one first or pass options.graph)' ) );
+		const prev = this._layoutCurrent;
+		if ( prev ) {
+
+			// the worker still finishes the stale request (its reply is ignored)
+			this._layoutCurrent = null;
+			prev.resolve( { cancelled: true } );
+
+		}
+
+		const id = this._nextId ++;
+		const g = {
+			N: graph.N, E: graph.E, edges: graph.edges, adjStart: graph.adjStart, degree: graph.degree, adjList: graph.adjList,
+			linkDistance: graph.linkDistance, layoutRadius: graph.layoutRadius,
+		};
+		return new Promise( ( resolve, reject ) => {
+
+			this._layoutCurrent = { id, resolve, reject, t0: now() };
+			try {
+
+				this._ensureWorker().postMessage( { id, type: 'layout', kind, graph: g, options: rest } );
+
+			} catch ( e ) {
+
+				if ( this._layoutCurrent && this._layoutCurrent.id === id ) this._layoutCurrent = null;
+				reject( e );
+
+			}
+
+		} );
+
+	}
+
 	cancel() {
 
 		this._supersede();
@@ -262,6 +317,10 @@ export class DataClient {
 
 	_terminate() {
 
+		// a layout request dies with its worker
+		const lay = this._layoutCurrent;
+		this._layoutCurrent = null;
+		if ( lay ) lay.resolve( { cancelled: true } );
 		if ( ! this._worker ) return;
 		this._worker.onmessage = null;
 		this._worker.onerror = null;
@@ -272,8 +331,10 @@ export class DataClient {
 
 	_fail( error ) {
 
-		const cur = this._current;
+		const cur = this._current, lay = this._layoutCurrent;
+		this._layoutCurrent = null;
 		this._terminate();
+		if ( lay ) lay.reject( error );
 		if ( ! cur ) return;
 		this._current = null;
 		cur.reject( error );
@@ -300,6 +361,16 @@ export class DataClient {
 
 	_onMessage( msg ) {
 
+		const lay = this._layoutCurrent;
+		if ( msg && lay && msg.id === lay.id ) {
+
+			this._layoutCurrent = null;
+			if ( msg.type === 'layout-result' ) lay.resolve( { cancelled: false, kind: msg.kind, positions: msg.positions, depth: msg.depth, info: msg.info, timings: { ...msg.timings, roundTrip: now() - lay.t0 } } );
+			else lay.reject( new Error( msg.message || 'layout failed' ) );
+			return;
+
+		}
+
 		const cur = this._current;
 		if ( ! msg || ! cur || msg.id !== cur.id ) return; // stale message of a superseded request
 		if ( msg.type === 'progress' ) {
@@ -311,6 +382,7 @@ export class DataClient {
 			this._current = null;
 			const timings = { ...msg.timings, roundTrip: now() - cur.t0 };
 			this._emit( { stage: 'done', fraction: 1, message: 'Ready' } );
+			this._graph = msg.graph;
 			cur.resolve( { cancelled: false, graph: msg.graph, meta: msg.meta, timings } );
 
 		} else if ( msg.type === 'error' ) {

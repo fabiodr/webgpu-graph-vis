@@ -9,51 +9,75 @@
 <body>
 <div id="app"></div><div id="hud"></div>
 <script type="module">
-// Dev page for the GPU force layout (src/gpu/ForceLayout.js).
+// Dev page for the GPU layout (src/gpu/ForceLayout.js): debug rendering (sprites + straight
+// lines), quality metrics of the research (src/graph/layoutMetrics.js) and scripted checks.
 //
 // URL params
-//   ds=imsv/lesmis          dataset under /data/ (default)
+//   ds=imsv/lesmis          manifest id (public/data/manifest.json), loaded through the data worker
 //   synth=3000&deg=20&br=10,10   synthetic clustered graph instead (src/debug/synth.js)
-//   theta, charge, gravity, ticks (fixed ticks/frame), leaf (virtual leaf size), maxIter
-//   mode=sphere             start in the paper's sphere layout
-//   nofit                   do not auto-fit the camera to the layout
-// Helpers on window (used by scripts/shot.mjs --eval):
-//   __layout, __app, __graph
-//   __validate()            nodeForce at theta = 0 / 0.5 / 0.8 vs a CPU brute-force reference
-//   __dragTest()            drag a node, check neighbours follow, pin keeps it fixed
-//   __bench(ticks)          wall-clock ms per tick (full tick and repulsion only)
+//   mode=force|flat|sphere|radial|stress   layout mode after loading (root=<node> for radial)
+//   lambda, kappa, hub, size, damping, beta, preset, budget     model parameters
+//   theta, ticks (fixed ticks per frame), leaf (virtual leaf size), maxIter
+//   paused                  start paused (drive the layout with __advance)
+//   nofit, noedges, noreadback (App option: the layout then reads positions itself)
+// Helpers on window (for scripts/shot.mjs --eval / --report; all async unless noted):
+//   __layout, __app, __graph, __data
+//   __settle( timeoutMs )   wait until layout.settled -> { settled, ticks, seconds }
+//   __metrics()             stress, np, sil, ext, overlaps, nan, … of the current positions
+//   __quality()             __settle + __metrics + rest check (ticks and positions stay put)
+//   __advance( ticks )      run exactly `ticks` ticks (the layout is paused in between)
+//   __dragTest( { hold, move, reheat } )   the research's drag test (node moved 0.5·R in `move`
+//                           ticks, held `hold` ticks): follow, settle, settleAll, farDrift; then
+//                           rest while held, pin (+ full reheat), unpin, rest
+//   __transition( mode, frames )   per-frame steps of a mode switch (smoothness)
+//   __modes( list )         switch through layout modes, per mode: settle, metrics, target error
+//   __pinScale( { pins, size, beta } )   auto-scale with pinned nodes: layoutSize, repulsion and the
+//                           legacy linkDistance are changed with `pins` nodes pinned -> extent of
+//                           the free nodes, drift of the pins
+//   __resetCheck()          resetPositions( positions read back with a pinned node ) clears the pin
+//   __sizeModes( size )     layoutSize / linkDistance in the radial and stress layouts -> extents
+//   __validate()            GPU passes vs the CPU mirror and vs brute force
+//   __bindings()            storage buffers per kernel (from the generated WGSL)
+//   __bench( ticks )        wall-clock ms per tick (full tick and repulsion only)
 //   __positions()           Float32Array of current node positions (GPU readback)
-//   __fit()                 fit the camera to the current positions
+//   __fit()                 fit the camera to the current positions (sync)
 import * as THREE from 'three/webgpu';
-import { uniform, instancedArray, Fn, instanceIndex, vertexIndex, select, float } from 'three/tsl';
+import { vertexIndex, select, float } from 'three/tsl';
 import { createApp } from '../src/app/App.js';
-import { loadPrepared } from '../src/data/load.js';
+import { DataClient } from '../src/data/client.js';
 import { prepareGraph } from '../src/graph/prepare.js';
 import { synthGraph } from '../src/debug/synth.js';
 import { normalizeGraph } from '../src/data/format.js';
 import { DebugNodes } from '../src/debug/DebugNodes.js';
-import { ForceLayout } from '../src/gpu/ForceLayout.js';
-import { aggregateCPU, repulsionCPU } from '../src/gpu/forceKernels.js';
+import { ForceLayout, LAYOUT_MODES } from '../src/gpu/ForceLayout.js';
+import { aggregateCPU, repulsionCPU, linksCPU, packLinks, flatRadius, rmsRadius, MASS_ONE } from '../src/gpu/forceKernels.js';
+import { prepareEval, layoutMetrics, bfsDistances } from '../src/graph/layoutMetrics.js';
 
 const params = new URLSearchParams( location.search );
 const num = ( k, d ) => ( params.has( k ) ? Number( params.get( k ) ) : d );
 const sleep = ( ms ) => new Promise( ( r ) => setTimeout( r, ms ) );
+const round = ( v, d = 4 ) => ( Number.isFinite( v ) ? + v.toFixed( d ) : v );
 
 try {
 
 	const app = await createApp( document.getElementById( 'app' ) );
 	window.__app = app;
+	const data = window.__data = new DataClient( { baseUrl: '/' } ); // manifest paths are relative to the site root
 	let graph;
 	if ( params.has( 'synth' ) ) {
 
 		const br = ( params.get( 'br' ) || '10,10' ).split( ',' ).map( Number ).filter( ( x ) => x > 0 );
-		const t0 = performance.now();
 		graph = prepareGraph( synthGraph( { n: num( 'synth', 3000 ), avgDegree: num( 'deg', 20 ), branching: br.length ? br : [ 1 ] } ) );
-		console.info( `synth prepared in ${( performance.now() - t0 ).toFixed( 0 )} ms` );
 
 	} else {
 
-		graph = await loadPrepared( `/data/${params.get( 'ds' ) || 'imsv/lesmis'}.json` );
+		const id = params.get( 'ds' ) || 'imsv/lesmis';
+		const manifest = await ( await fetch( '/data/manifest.json' ) ).json();
+		const entry = manifest.datasets.find( ( d ) => d.id === id );
+		if ( ! entry ) throw new Error( `dataset ${id} is not in the manifest` );
+		const r = await data.load( entry );
+		graph = r.graph;
+		window.__timings = r.timings;
 
 	}
 
@@ -61,9 +85,11 @@ try {
 	// for edge-case tests: __setGraph( __prepare( { nodeCount, edges, hierarchy } ) ), __synth( {...} )
 	window.__prepare = ( raw ) => prepareGraph( normalizeGraph( raw ) );
 	window.__synth = ( o ) => prepareGraph( synthGraph( o ) );
+	let evalCache = null;
 	window.__setGraph = ( g ) => {
 
 		window.__graph = graph = g;
+		evalCache = null;
 		app.setGraph( g );
 
 	};
@@ -97,15 +123,23 @@ try {
 
 	}
 
-	const opts = {};
-	for ( const [ k, key ] of [ [ 'theta', 'theta' ], [ 'charge', 'charge' ], [ 'gravity', 'gravity' ], [ 'ticks', 'ticksPerFrame' ], [ 'leaf', 'leafSize' ], [ 'maxIter', 'maxIterations' ] ] ) if ( params.has( k ) ) opts[ key ] = num( k );
+	const opts = { data, autoStart: ! params.has( 'paused' ) };
+	for ( const [ k, key ] of [
+		[ 'theta', 'theta' ], [ 'ticks', 'ticksPerFrame' ], [ 'leaf', 'leafSize' ], [ 'maxIter', 'maxIterations' ],
+		[ 'lambda', 'clusterSeparation' ], [ 'kappa', 'cohesion' ], [ 'hub', 'hubSpacing' ], [ 'size', 'layoutSize' ],
+		[ 'damping', 'damping' ], [ 'beta', 'repulsion' ], [ 'budget', 'tickBudget' ], [ 'charge', 'charge' ], [ 'gravity', 'gravity' ],
+	] ) if ( params.has( k ) ) opts[ key ] = num( k );
 	const layout = new ForceLayout( opts );
 	window.__layout = layout;
+	const layoutEvents = window.__layoutEvents = [];
+	app.events.addEventListener( 'layout', ( e ) => layoutEvents.push( { ...e.detail, ticks: layout.ticks } ) );
 	app.use( layout );
 	app.use( new DebugEdges() );
 	app.use( new DebugNodes( { size: graph.N > 5000 ? 3 : 5 } ) );
 	app.setGraph( graph );
-	if ( params.get( 'mode' ) === 'sphere' ) layout.setLayoutMode( 'sphere' );
+	if ( params.has( 'preset' ) ) layout.setPreset( params.get( 'preset' ) );
+	if ( params.has( 'mode' ) ) layout.setLayoutMode( params.get( 'mode' ), params.has( 'root' ) ? { root: num( 'root' ) } : {} );
+	if ( params.has( 'paused' ) ) layout.pause();
 
 	const fit = ( smooth = 0 ) => {
 
@@ -136,163 +170,555 @@ try {
 	window.__fit = () => fit( 0 );
 	fit( 0 );
 
-	window.__positions = async () => new Float32Array( await app.renderer.getArrayBufferAsync( app.buffers.nodePos.value ) );
+	const positions = window.__positions = async () => new Float32Array( ( await app.renderer.getArrayBufferAsync( app.buffers.nodePos.value ) ).slice( 0 ) );
+	const nextFrame = () => new Promise( ( r ) => app.events.addEventListener( 'frame', r, { once: true } ) );
 
-	// ── force accuracy check ───────────────────────────────────────────────────────────────
-	window.__validate = async ( thetas = [ 0, 0.5, 0.8 ] ) => {
+	// ── run control ────────────────────────────────────────────────────────────────────────
+	window.__settle = async ( timeoutMs = 200000 ) => {
 
-		const wasPaused = layout.paused;
-		layout.pause();
-		await sleep( 100 );
-		const pos = await window.__positions();
-		const N = graph.N;
-		const charge = layout.charge, dmin2 = layout.distanceMin * layout.distanceMin;
-		const ref = new Float64Array( 3 * N );
-		const t0 = performance.now();
-		for ( let i = 0; i < N; i ++ ) {
+		const t0 = performance.now(), ticks0 = layout.ticks;
+		while ( ! layout.settled && performance.now() - t0 < timeoutMs ) await nextFrame();
+		return { settled: layout.settled, ticks: layout.ticks - ticks0, seconds: round( ( performance.now() - t0 ) / 1000, 1 ) };
 
-			let fx = 0, fy = 0, fz = 0;
-			const px = pos[ 4 * i ], py = pos[ 4 * i + 1 ], pz = pos[ 4 * i + 2 ];
-			for ( let j = 0; j < N; j ++ ) {
+	};
 
-				if ( j === i ) continue;
-				const dx = pos[ 4 * j ] - px, dy = pos[ 4 * j + 1 ] - py, dz = pos[ 4 * j + 2 ] - pz;
-				let l2 = dx * dx + dy * dy + dz * dz;
-				if ( l2 < 1e-12 ) continue;
-				if ( l2 < dmin2 ) l2 = Math.sqrt( dmin2 * l2 );
-				fx += ( dx * charge ) / l2; fy += ( dy * charge ) / l2; fz += ( dz * charge ) / l2;
+	// exactly `ticks` ticks (fewer when the layout has nothing left to do); paused before and after
+	const advance = window.__advance = async ( ticks, perFrame = 1 ) => {
 
-			}
+		const fixed = layout.ticksPerFrame;
+		let done = 0;
+		while ( done < ticks ) {
 
-			ref[ 3 * i ] = fx; ref[ 3 * i + 1 ] = fy; ref[ 3 * i + 2 ] = fz;
+			const k = Math.min( perFrame, ticks - done ), before = layout.ticks;
+			layout.ticksPerFrame = k;
+			layout.resume();
+			await new Promise( ( r ) => app.events.addEventListener( 'frame', () => {
+
+				layout.pause();
+				r();
+
+			}, { once: true } ) );
+			if ( layout.ticks === before ) break;
+			done += layout.ticks - before;
 
 		}
 
-		const cpuMs = performance.now() - t0;
-		const out = { N, cpuBruteForceMs: Math.round( cpuMs ), bh: layout.stats.bh, maxIterations: layout.maxIterations };
-		for ( const th of thetas ) {
+		layout.ticksPerFrame = fixed;
+		return done;
 
-			const f = await layout.readForces( { theta: th } );
+	};
+
+	// ── metrics ────────────────────────────────────────────────────────────────────────────
+	const metricsOf = ( pos ) => {
+
+		evalCache = evalCache || prepareEval( graph );
+		const m = layoutMetrics( evalCache, pos, 4 );
+		const R = graph.layoutRadius;
+		let maxZ = 0;
+		for ( let i = 0; i < graph.N; i ++ ) maxZ = Math.max( maxZ, Math.abs( pos[ 4 * i + 2 ] ) );
+		const s = layout.stats;
+		return {
+			stress: round( m.stress ), np: round( m.np, 3 ), sil: round( m.sil, 3 ), ext: round( m.ext, 3 ),
+			// extent against the disc of the flat mode (1 = on target there)
+			extFlat: round( ( m.ext * Math.sqrt( 0.6 ) * R ) / ( Math.SQRT1_2 * flatRadius( R, graph.N ) ), 3 ),
+			overlaps: m.overlaps, hubNN: round( m.hubNN, 2 ), edgeCV: round( m.edgeCV, 2 ), nan: m.nan,
+			maxAbsZ: round( maxZ / R, 5 ), unitOverL: round( s.unit / ( graph.linkDistance ?? 30 ), 2 ),
+			mode: s.mode, alpha: round( s.alpha, 5 ), ticks: s.ticks,
+		};
+
+	};
+
+	window.__metrics = async () => metricsOf( await positions() );
+
+	// at rest: no ticks and no movement over a number of frames
+	const restCheck = async ( frames = 20 ) => {
+
+		const t0 = layout.ticks, p0 = await positions();
+		for ( let f = 0; f < frames; f ++ ) await nextFrame();
+		const p1 = await positions();
+		let move = 0;
+		for ( let k = 0; k < p0.length; k ++ ) move = Math.max( move, Math.abs( p1[ k ] - p0[ k ] ) );
+		return { ticksWhileResting: layout.ticks - t0, maxMove: move, running: layout.running, settled: layout.settled };
+
+	};
+
+	window.__quality = async ( timeoutMs = 200000 ) => {
+
+		const run = await window.__settle( timeoutMs );
+		const metrics = await window.__metrics();
+		const rest = await restCheck();
+		return { graph: graph.name, N: graph.N, E: graph.E, D: graph.D, run, metrics, rest, events: layoutEvents.slice( - 6 ) };
+
+	};
+
+	// ── drag / pin (the drag test of the layout research, on the GPU) ──────────────────────
+	window.__dragTest = async ( { hold = 300, move = 30, reheat = true } = {} ) => {
+
+		await window.__settle();
+		layout.pause();
+		const N = graph.N, R = graph.layoutRadius;
+		// mid-degree node: median degree among nodes with degree >= 2, lowest index on ties
+		const cand = Array.from( { length: N }, ( _, i ) => i ).filter( ( i ) => graph.degree[ i ] >= 2 ).sort( ( a, b ) => graph.degree[ a ] - graph.degree[ b ] || a - b );
+		const node = cand[ cand.length >> 1 ];
+		const D = 0.5 * R, u = [ 0.6, 0.64, 0.48 ];
+		const nb = Array.from( graph.adjList.subarray( graph.adjStart[ node ], graph.adjStart[ node ] + graph.degree[ node ] ) );
+		const dist = bfsDistances( graph, node );
+		const far = [];
+		for ( let i = 0; i < N; i ++ ) if ( dist[ i ] >= 3 && dist[ i ] !== 65535 ) far.push( i );
+		const pos0 = await positions();
+		const start = [ pos0[ 4 * node ], pos0[ 4 * node + 1 ], pos0[ 4 * node + 2 ] ];
+		const centroid = ( p ) => {
+
+			const c = [ 0, 0, 0 ];
+			for ( const j of nb ) for ( let a = 0; a < 3; a ++ ) c[ a ] += p[ 4 * j + a ] / nb.length;
+			return c;
+
+		};
+
+		const c0 = centroid( pos0 );
+		let prev = pos0;
+		const nbDisp = [], allDisp = [];
+		const record = ( p ) => {
+
+			let sn = 0, sa = 0;
+			for ( let i = 0; i < N; i ++ ) if ( i !== node ) sa += Math.hypot( p[ 4 * i ] - prev[ 4 * i ], p[ 4 * i + 1 ] - prev[ 4 * i + 1 ], p[ 4 * i + 2 ] - prev[ 4 * i + 2 ] );
+			for ( const j of nb ) sn += Math.hypot( p[ 4 * j ] - prev[ 4 * j ], p[ 4 * j + 1 ] - prev[ 4 * j + 1 ], p[ 4 * j + 2 ] - prev[ 4 * j + 2 ] );
+			nbDisp.push( sn / nb.length ); allDisp.push( sa / ( N - 1 ) );
+			prev = p;
+
+		};
+
+		const alpha0 = layout.alpha, ticks0 = layout.ticks;
+		layout.startDrag( node );
+		for ( let t = 1; t <= move; t ++ ) {
+
+			const f = t / move;
+			layout.drag( node, new THREE.Vector3( start[ 0 ] + u[ 0 ] * D * f, start[ 1 ] + u[ 1 ] * D * f, start[ 2 ] + u[ 2 ] * D * f ) );
+			await advance( 1 );
+			record( await positions() );
+
+		}
+
+		const holdStart = nbDisp.length;
+		let held = 0;
+		for ( let t = 0; t < hold; t ++ ) {
+
+			if ( await advance( 1 ) === 0 ) break; // the layout came to rest while holding
+			held ++;
+			record( await positions() );
+
+		}
+
+		const pHold = prev;
+		const settleOf = ( arr, thr ) => {
+
+			let s = arr.length - holdStart;
+			for ( let k = arr.length - 1; k >= holdStart; k -- ) {
+
+				if ( arr[ k ] < thr ) s = k - holdStart;
+				else break;
+
+			}
+
+			return s;
+
+		};
+
+		const c1 = centroid( pHold );
+		const follow = ( ( c1[ 0 ] - c0[ 0 ] ) * u[ 0 ] + ( c1[ 1 ] - c0[ 1 ] ) * u[ 1 ] + ( c1[ 2 ] - c0[ 2 ] ) * u[ 2 ] ) / D;
+		let farDrift = 0, farMax = 0;
+		for ( const i of far ) {
+
+			const d = Math.hypot( pHold[ 4 * i ] - pos0[ 4 * i ], pHold[ 4 * i + 1 ] - pos0[ 4 * i + 1 ], pHold[ 4 * i + 2 ] - pos0[ 4 * i + 2 ] );
+			farDrift += d; farMax = Math.max( farMax, d );
+
+		}
+
+		const target = [ start[ 0 ] + u[ 0 ] * D, start[ 1 ] + u[ 1 ] * D, start[ 2 ] + u[ 2 ] * D ];
+		const errTo = ( p, q ) => Math.hypot( p[ 4 * node ] - q[ 0 ], p[ 4 * node + 1 ] - q[ 1 ], p[ 4 * node + 2 ] - q[ 2 ] );
+		const out = {
+			node, degree: graph.degree[ node ], dragDistance: round( D, 1 ), farNodes: far.length, heldTicks: held,
+			alphaBefore: round( alpha0, 5 ), alphaAfterDrag: round( layout.alpha, 5 ),
+			nodeErrWhileHeld: round( errTo( pHold, target ) / D, 5 ),
+			follow: round( follow, 3 ),
+			settle: settleOf( nbDisp, 0.001 * D ), settleAll: settleOf( allDisp, 0.0002 * D ),
+			farDrift: round( far.length ? farDrift / far.length / D : 0, 4 ), farMax: round( farMax / D, 4 ),
+			endNbDisp: round( nbDisp[ nbDisp.length - 1 ] / D, 6 ),
+		};
+
+		// keep holding without moving: the idle policy lets the layout come to rest (free running)
+		layout.resume();
+		const idle = await window.__settle( 60000 );
+		out.restWhileHeld = { ...idle, ...( await restCheck( 10 ) ) };
+
+		// release with a pin: the node must stay exactly where it was dropped
+		layout.endDrag( node, { pin: true } );
+		out.afterPin = await window.__settle( 60000 );
+		const pPin = await positions();
+		out.pinnedDrift = round( errTo( pPin, target ) / D, 6 );
+		out.pinnedFlag = pPin[ 4 * node + 3 ];
+		out.pinnedCount = layout.pinnedCount;
+		// a full reheat with the pin in place: the pin holds, the extent stays (no auto-scale)
+		if ( reheat ) {
+
+			layout.reheat( 1 );
+			await window.__settle( 120000 );
+			const pPin2 = await positions();
+			out.pinnedDriftAfterReheat = round( errTo( pPin2, target ) / D, 6 );
+			out.metricsPinned = metricsOf( pPin2 );
+
+		}
+
+		// unpin: local heat lets it relax back toward its neighbours, then rest again
+		layout.setPinned( node, false );
+		out.afterUnpin = await window.__settle( 60000 );
+		const pFree = await positions();
+		out.movedAfterUnpin = round( errTo( pFree, target ) / D, 4 );
+		out.unpinnedFlag = pFree[ 4 * node + 3 ];
+		out.rest = await restCheck( 10 );
+		out.metricsAfter = metricsOf( pFree );
+		return out;
+
+	};
+
+	// ── layout modes ───────────────────────────────────────────────────────────────────────
+	window.__modes = async ( list = [ 'flat', 'force', 'sphere', 'radial', 'stress', 'flat', 'sphere', 'force' ], timeoutMs = 120000 ) => {
+
+		const out = [];
+		const R = graph.layoutRadius;
+		for ( const mode of list ) {
+
+			const t0 = performance.now(), ticks0 = layout.ticks;
+			layout.setLayoutMode( mode );
+			// follow the transition: largest step between frames relative to R (a jump would show here)
+			let prev = app.positions ? new Float32Array( app.positions ) : null, maxStep = 0;
+			while ( ! layout.settled && performance.now() - t0 < timeoutMs ) {
+
+				await nextFrame();
+				const p = app.positions;
+				if ( prev && p && p.length === prev.length ) {
+
+					for ( let i = 0; i < graph.N; i ++ ) maxStep = Math.max( maxStep, Math.hypot( p[ 4 * i ] - prev[ 4 * i ], p[ 4 * i + 1 ] - prev[ 4 * i + 1 ], p[ 4 * i + 2 ] - prev[ 4 * i + 2 ] ) );
+					prev.set( p );
+
+				}
+
+			}
+
+			const pos = await positions();
+			const m = metricsOf( pos );
+			const s = layout.stats;
+			const r = {
+				mode, settled: layout.settled, seconds: round( ( performance.now() - t0 ) / 1000, 1 ), ticks: layout.ticks - ticks0,
+				targetBlend: round( app.buffers.uniforms.targetBlend.value, 3 ), layoutBlend: round( app.buffers.uniforms.layoutBlend.value, 3 ), flat: round( s.flat, 3 ),
+				maxStepPerFrame: round( maxStep / R, 3 ),
+				stress: m.stress, np: m.np, sil: m.sil, ext: m.ext, extFlat: m.extFlat, overlaps: m.overlaps, nan: m.nan, maxAbsZ: m.maxAbsZ,
+			};
+			if ( s.targetBlend >= 1 ) {
+
+				// pure target layouts: nodes sit on their targets
+				const tg = app.buffers.nodeTarget.value.array;
+				const sel = app.buffers.uniforms.selectedIndex.value;
+				let err = 0;
+				for ( let i = 0; i < graph.N; i ++ ) if ( i !== sel || mode !== 'sphere' ) err = Math.max( err, Math.hypot( pos[ 4 * i ] - tg[ 4 * i ], pos[ 4 * i + 1 ] - tg[ 4 * i + 1 ], pos[ 4 * i + 2 ] - tg[ 4 * i + 2 ] ) );
+				r.maxTargetError = round( err / R, 5 );
+				if ( mode === 'radial' ) r.radial = { root: layout.radialRoot, ...layout.radialInfo };
+				if ( mode === 'stress' ) r.stressInfo = layout.stressInfo;
+
+			}
+
+			r.rest = await restCheck( 8 );
+			out.push( r );
+
+		}
+
+		return out;
+
+	};
+
+	// ── pins and the auto-scale; resetPositions; the size parameters in target layouts ─────
+	const frames = async ( n ) => {
+
+		for ( let f = 0; f < n; f ++ ) await nextFrame();
+
+	};
+
+	// extent of the free nodes (w = pin flag) relative to the 3D reference
+	const freeExtent = ( p ) => round( rmsRadius( p, graph.N, true ) / ( Math.sqrt( 0.6 ) * graph.layoutRadius ), 3 );
+
+	window.__pinScale = async ( { pins = 5, size = 1.5, beta = 32 } = {} ) => {
+
+		await window.__settle();
+		const N = graph.N, R = graph.layoutRadius;
+		const was = { size: layout.layoutSize, beta: layout.repulsion };
+		const ids = Array.from( { length: Math.min( pins, N ) }, ( _, q ) => Math.floor( ( ( q + 0.5 ) * N ) / pins ) );
+		for ( const i of ids ) layout.setPinned( i, true );
+		await frames( 3 );
+		const p0 = await positions();
+		const step = async ( label, change ) => {
+
+			change();
+			const run = await window.__settle( 150000 );
+			const p = await positions();
+			const m = metricsOf( p );
+			let drift = 0;
+			for ( const i of ids ) drift = Math.max( drift, Math.hypot( p[ 4 * i ] - p0[ 4 * i ], p[ 4 * i + 1 ] - p0[ 4 * i + 1 ], p[ 4 * i + 2 ] - p0[ 4 * i + 2 ] ) );
+			return { label, settled: run.settled, ticks: run.ticks, extFree: freeExtent( p ), extAll: m.ext, unitOverL: m.unitOverL, pinDrift: drift, pinFlags: ids.filter( ( i ) => p[ 4 * i + 3 ] > 0.5 ).length, stress: m.stress, nan: m.nan };
+
+		};
+
+		const out = { pinned: ids.length, pinnedCount: layout.pinnedCount, steps: [] };
+		out.steps.push( await step( 'pinned', () => {} ) );
+		out.steps.push( await step( `layoutSize ${size}`, () => ( layout.layoutSize = size ) ) );
+		out.steps.push( await step( `repulsion ${beta}`, () => ( layout.repulsion = beta ) ) );
+		// the legacy parameter, set the way main.js does it (no reheat of its own)
+		out.steps.push( await step( 'linkDistance x2, layoutSize 1', () => {
+
+			layout.layoutSize = 1;
+			layout.linkDistance = 2 * ( graph.linkDistance ?? 30 );
+			layout.reheat( 0.3 );
+
+		} ) );
+		out.steps.push( await step( 'back', () => {
+
+			layout.linkDistance = null;
+			layout.repulsion = was.beta;
+			layout.layoutSize = was.size;
+
+		} ) );
+		// one pin released (local heat only), then all
+		layout.setPinned( ids[ 0 ], false );
+		const one = await window.__settle( 60000 );
+		const p1 = await positions();
+		out.afterOneUnpin = { ...one, extFree: freeExtent( p1 ), pinnedCount: layout.pinnedCount };
+		layout.unpinAll();
+		const all = await window.__settle( 60000 );
+		const p2 = await positions();
+		out.afterUnpinAll = { ...all, ext: metricsOf( p2 ).ext, pinnedCount: layout.pinnedCount, flags: p2.filter( ( v, k ) => k % 4 === 3 && v > 0.5 ).length };
+		return out;
+
+	};
+
+	window.__resetCheck = async ( node = 5 ) => {
+
+		await window.__settle();
+		const N = graph.N;
+		node = Math.min( node, N - 1 );
+		layout.setPinned( node, true );
+		await frames( 3 );
+		const p = await positions(); // a readback carries the pin flag in w
+		const out = { node, flagInReadback: p[ 4 * node + 3 ], pinnedBefore: layout.isPinned( node ) };
+		const copy = new Float32Array( p );
+		layout.resetPositions( p );
+		out.callerArrayUntouched = p.every( ( v, k ) => v === copy[ k ] );
+		out.isPinned = layout.isPinned( node );
+		out.pinnedCount = layout.pinnedCount;
+		await frames( 3 );
+		out.flagOnGpu = ( await positions() )[ 4 * node + 3 ];
+		out.run = await window.__settle( 150000 );
+		const q = await positions();
+		const moved = ( i ) => Math.hypot( q[ 4 * i ] - p[ 4 * i ], q[ 4 * i + 1 ] - p[ 4 * i + 1 ], q[ 4 * i + 2 ] - p[ 4 * i + 2 ] );
+		let others = 0;
+		for ( let i = 0; i < N; i ++ ) if ( i !== node ) others = Math.max( others, moved( i ) );
+		out.nodeMoved = round( moved( node ), 2 );
+		out.maxMovedOthers = round( others, 2 );
+		out.metrics = metricsOf( q );
+		return out;
+
+	};
+
+	window.__sizeModes = async ( size = 2 ) => {
+
+		await window.__settle();
+		const R = graph.layoutRadius;
+		const out = [];
+		const step = async ( label, change ) => {
+
+			change();
+			const run = await window.__settle( 150000 );
+			const p = await positions();
+			const tg = app.buffers.nodeTarget.value.array;
+			let err = 0;
+			if ( layout.stats.targetBlend >= 1 ) for ( let i = 0; i < graph.N; i ++ ) err = Math.max( err, Math.hypot( p[ 4 * i ] - tg[ 4 * i ], p[ 4 * i + 1 ] - tg[ 4 * i + 1 ], p[ 4 * i + 2 ] - tg[ 4 * i + 2 ] ) );
+			const m = metricsOf( p );
+			out.push( { label, mode: layout.layoutMode, settled: run.settled, pending: layout.pending, radius: round( layout.stats.radius / R, 3 ), ext: m.ext, maxTargetError: round( err / R, 5 ), stress: m.stress, nan: m.nan } );
+
+		};
+
+		await step( 'radial, size 1', () => layout.setLayoutMode( 'radial', { root: 0 } ) );
+		await step( `radial, layoutSize ${size}`, () => ( layout.layoutSize = size ) );
+		await step( `stress, requested at size ${size}`, () => layout.setLayoutMode( 'stress' ) );
+		await step( 'stress, layoutSize 1 (rescaled)', () => ( layout.layoutSize = 1 ) );
+		await step( 'radial again, size 1', () => layout.setLayoutMode( 'radial', { root: 0 } ) );
+		await step( 'stress from the cache, size 1', () => layout.setLayoutMode( 'stress' ) );
+		await step( 'stress, linkDistance x2 (legacy)', () => ( layout.linkDistance = 2 * ( graph.linkDistance ?? 30 ) ) );
+		await step( 'sphere (own radius), linkDistance x2', () => layout.setLayoutMode( 'sphere' ) );
+		await step( 'force, linkDistance default', () => {
+
+			layout.linkDistance = null;
+			layout.setLayoutMode( 'force' );
+
+		} );
+		return out;
+
+	};
+
+	// per-frame movement during a mode switch, one tick per frame: mean and max step of a frame
+	// relative to the layout radius (a jump would show as a single large step)
+	window.__transition = async ( mode, frames = 40, options = {} ) => {
+
+		await window.__settle();
+		const fixed = layout.ticksPerFrame;
+		layout.ticksPerFrame = 1;
+		const R = graph.layoutRadius, N = graph.N;
+		let prev = await positions();
+		const start = prev;
+		layout.setLayoutMode( mode, options );
+		const mean = [], max = [];
+		for ( let f = 0; f < frames; f ++ ) {
+
+			layout.resume();
+			await new Promise( ( r ) => app.events.addEventListener( 'frame', () => {
+
+				layout.pause();
+				r();
+
+			}, { once: true } ) );
+			const p = await positions();
+			let s = 0, m = 0;
+			for ( let i = 0; i < N; i ++ ) {
+
+				const d = Math.hypot( p[ 4 * i ] - prev[ 4 * i ], p[ 4 * i + 1 ] - prev[ 4 * i + 1 ], p[ 4 * i + 2 ] - prev[ 4 * i + 2 ] );
+				s += d; m = Math.max( m, d );
+
+			}
+
+			mean.push( round( s / N / R, 3 ) ); max.push( round( m / R, 3 ) );
+			prev = p;
+
+		}
+
+		let total = 0;
+		for ( let i = 0; i < N; i ++ ) total += Math.hypot( prev[ 4 * i ] - start[ 4 * i ], prev[ 4 * i + 1 ] - start[ 4 * i + 1 ], prev[ 4 * i + 2 ] - start[ 4 * i + 2 ] );
+		layout.ticksPerFrame = fixed;
+		layout.resume();
+		return { mode, frameDt: round( app.frameMs / 1000, 3 ), meanTravel: round( total / N / R, 3 ), meanStep: mean, maxStep: max, nan: prev.some( ( v ) => ! Number.isFinite( v ) ) };
+
+	};
+
+	// ── GPU passes vs the CPU mirror and vs brute force ────────────────────────────────────
+	window.__validate = async ( thetas = [ 0, 0.8 ] ) => {
+
+		const wasPaused = layout.paused;
+		layout.pause();
+		await nextFrame(); await nextFrame();
+		const pos = await positions();
+		const N = graph.N, s = layout.stats, struct = layout.struct;
+		const beta = s.beta, unit = s.unit, iu2 = 1 / ( unit * unit );
+		const mass = struct.nodeMass;
+		const out = { N, beta, unit: round( unit, 3 ), bh: s.bh, maxIterations: layout.maxIterations };
+		const cmp = ( f, ref, stride ) => {
+
 			const rel = new Float64Array( N );
 			let nan = 0;
 			for ( let i = 0; i < N; i ++ ) {
 
-				const ex = ref[ 3 * i ], ey = ref[ 3 * i + 1 ], ez = ref[ 3 * i + 2 ];
-				const dx = f[ 4 * i ] - ex, dy = f[ 4 * i + 1 ] - ey, dz = f[ 4 * i + 2 ] - ez;
-				if ( ! Number.isFinite( f[ 4 * i ] + f[ 4 * i + 1 ] + f[ 4 * i + 2 ] ) ) nan ++;
-				rel[ i ] = Math.hypot( dx, dy, dz ) / Math.max( 1e-9, Math.hypot( ex, ey, ez ) );
+				const ex = ref[ stride * i ], ey = ref[ stride * i + 1 ], ez = ref[ stride * i + 2 ];
+				if ( ! Number.isFinite( f[ 4 * i ] + f[ 4 * i + 1 ] + f[ 4 * i + 2 ] + f[ 4 * i + 3 ] ) ) nan ++;
+				rel[ i ] = Math.hypot( f[ 4 * i ] - ex, f[ 4 * i + 1 ] - ey, f[ 4 * i + 2 ] - ez ) / Math.max( 1e-9, Math.hypot( ex, ey, ez ) );
 
 			}
 
 			rel.sort();
-			const q = ( p ) => rel[ Math.min( N - 1, Math.floor( p * N ) ) ];
-			out[ 'theta' + th ] = { median: + q( 0.5 ).toExponential( 3 ), p95: + q( 0.95 ).toExponential( 3 ), max: + rel[ N - 1 ].toExponential( 3 ), nan };
+			let above = 0; // nodes off by more than 1e-3 (borderline acceptance decisions: float32 vs float64)
+			for ( let i = 0; i < N; i ++ ) if ( rel[ i ] > 1e-3 ) above ++;
+			return { median: + rel[ N >> 1 ].toExponential( 2 ), p95: + rel[ Math.min( N - 1, Math.floor( 0.95 * N ) ) ].toExponential( 2 ), max: + rel[ N - 1 ].toExponential( 2 ), above1e3: above, nan };
 
-		}
+		};
 
-		// GPU vs the CPU mirror of the same walk (same tree, same acceptance) at the default theta
-		{
+		// brute force of the model's repulsion (force xyz and stiffness S)
+		if ( N <= 6000 ) {
 
-			const f = await layout.readForces( { theta: layout.theta } );
-			const bh = aggregateCPU( graph, layout.struct, pos );
-			const m = repulsionCPU( layout.struct, pos, bh, { theta: layout.theta, charge, distanceMin: layout.distanceMin, maxIterations: layout.maxIterations } ).force;
-			let worst = 0;
-			const rel = new Float64Array( N );
+			const ref = new Float64Array( 4 * N );
 			for ( let i = 0; i < N; i ++ ) {
 
-				const e = Math.hypot( f[ 4 * i ] - m[ 4 * i ], f[ 4 * i + 1 ] - m[ 4 * i + 1 ], f[ 4 * i + 2 ] - m[ 4 * i + 2 ] );
-				rel[ i ] = e / Math.max( 1e-9, Math.hypot( m[ 4 * i ], m[ 4 * i + 1 ], m[ 4 * i + 2 ] ) );
-				worst = Math.max( worst, rel[ i ] );
+				let fx = 0, fy = 0, fz = 0, S = 0;
+				for ( let j = 0; j < N; j ++ ) {
+
+					if ( j === i ) continue;
+					const dx = pos[ 4 * j ] - pos[ 4 * i ], dy = pos[ 4 * j + 1 ] - pos[ 4 * i + 1 ], dz = pos[ 4 * j + 2 ] - pos[ 4 * i + 2 ];
+					const q = 1 + ( dx * dx + dy * dy + dz * dz ) * iu2;
+					const w = ( beta * mass[ i ] * mass[ j ] ) / ( MASS_ONE * MASS_ONE * q * q );
+					fx -= dx * w; fy -= dy * w; fz -= dz * w; S += w;
+
+				}
+
+				ref[ 4 * i ] = fx; ref[ 4 * i + 1 ] = fy; ref[ 4 * i + 2 ] = fz; ref[ 4 * i + 3 ] = S;
 
 			}
 
-			rel.sort();
-			out.gpuVsCpuMirror = { theta: layout.theta, median: + rel[ N >> 1 ].toExponential( 2 ), max: + worst.toExponential( 2 ) };
+			// theta 0 visits every tree entry: lift the iteration cap for this comparison
+			const cap = layout.maxIterations;
+			layout.maxIterations = Math.max( cap, 4 * struct.TT );
+			for ( const th of thetas ) {
+
+				const f = await layout.readForces( { theta: th } );
+				let sErr = 0;
+				for ( let i = 0; i < N; i ++ ) sErr = Math.max( sErr, Math.abs( f[ 4 * i + 3 ] - ref[ 4 * i + 3 ] ) / Math.max( 1e-9, ref[ 4 * i + 3 ] ) );
+				out[ 'bruteForce.theta' + th ] = { ...cmp( f, ref, 4 ), stiffnessMaxRel: + sErr.toExponential( 2 ) };
+
+			}
+
+			layout.maxIterations = cap;
 
 		}
 
+		// the CPU mirror of the same walk (same tree, same acceptance) and of the links pass
+		const bh = aggregateCPU( graph, struct, pos );
+		const mirror = repulsionCPU( struct, pos, bh, { theta: layout.theta, beta, unit, maxIterations: layout.maxIterations } ).force;
+		const gpuRep = await layout.readForces( { theta: layout.theta } );
+		let sErr = 0;
+		for ( let i = 0; i < N; i ++ ) sErr = Math.max( sErr, Math.abs( gpuRep[ 4 * i + 3 ] - mirror[ 4 * i + 3 ] ) / Math.max( 1e-9, mirror[ 4 * i + 3 ] ) );
+		out.repulsionVsMirror = { theta: layout.theta, ...cmp( gpuRep, mirror, 4 ), stiffnessMaxRel: + sErr.toExponential( 2 ) };
+		const U = layout.U, heatWas = U.heatActive.value;
+		U.heatActive.value = 0;
+		const gpuLinks = await layout.readForces( { theta: layout.theta, links: true } );
+		U.heatActive.value = heatWas;
+		const cpuLinks = linksCPU( graph, packLinks( graph ), pos, new Float32Array( mirror ), bh, new Float32Array( 4 * N ), { lcaWeights: U.lcaWeight.array, kappa: U.kappa.value, gravity: U.gravity.value, heatActive: false } );
+		out.linksVsMirror = cmp( gpuLinks, cpuLinks, 4 );
+		// cluster centres: GPU aggregation vs the mirror (relative to the layout radius)
+		const cp = new Float32Array( await app.renderer.getArrayBufferAsync( app.buffers.clusterPos.value ) );
+		let cErr = 0;
+		for ( let c = 0; c < graph.C; c ++ ) for ( let a = 0; a < 4; a ++ ) cErr = Math.max( cErr, Math.abs( cp[ 4 * c + a ] - bh[ 4 * c + a ] ) );
+		out.clusterPosMaxError = + ( cErr / graph.layoutRadius ).toExponential( 2 );
 		if ( ! wasPaused ) layout.resume();
 		return out;
 
 	};
 
-	// ── drag / pin check ───────────────────────────────────────────────────────────────────
-	window.__dragTest = async () => {
-
-		const N = graph.N;
-		let best = 0;
-		for ( let i = 0; i < N; i ++ ) if ( graph.degree[ i ] > graph.degree[ best ] ) best = i;
-		const i = best;
-		const nbrs = Array.from( graph.adjList.subarray( graph.adjStart[ i ], graph.adjStart[ i ] + graph.degree[ i ] ) );
-		const p0 = await window.__positions();
-		const at = ( p, k ) => new THREE.Vector3( p[ 4 * k ], p[ 4 * k + 1 ], p[ 4 * k + 2 ] );
-		const mean = ( p, ks ) => ks.reduce( ( a, k ) => a.add( at( p, k ) ), new THREE.Vector3() ).multiplyScalar( 1 / ks.length );
-		const start = at( p0, i );
-		const offset = new THREE.Vector3( graph.layoutRadius * 0.8, graph.layoutRadius * 0.3, 0 );
-		const target = start.clone().add( offset );
-		const nbr0 = mean( p0, nbrs );
-		layout.startDrag( i );
-		const steps = 20;
-		for ( let s = 1; s <= steps; s ++ ) {
-
-			layout.drag( i, start.clone().lerp( target, s / steps ) );
-			await sleep( 50 );
-
-		}
-
-		await sleep( 1500 );
-		const p1 = await window.__positions();
-		const nodeErr = at( p1, i ).distanceTo( target );
-		const nbr1 = mean( p1, nbrs );
-		const followed = nbr1.clone().sub( nbr0 ).dot( offset ) / offset.length();
-		layout.endDrag( i, { pin: true } );
-		await sleep( 1500 );
-		const p2 = await window.__positions();
-		const pinnedDrift = at( p2, i ).distanceTo( target );
-		const pinnedFlag = p2[ 4 * i + 3 ];
-		// release: unpin, the node should move again (pulled back by its neighbours)
-		layout.setPinned( i, false );
-		layout.reheat( 0.3 );
-		await sleep( 1500 );
-		const p3 = await window.__positions();
-		const releasedMove = at( p3, i ).distanceTo( target );
-		return {
-			node: i, degree: graph.degree[ i ], dragDistance: + offset.length().toFixed( 1 ),
-			nodeErrWhileDragging: + nodeErr.toFixed( 4 ),
-			neighbourMeanMovedAlongDrag: + followed.toFixed( 1 ),
-			pinnedDriftAfterRelease: + pinnedDrift.toFixed( 4 ), pinnedFlag,
-			movedAfterUnpin: + releasedMove.toFixed( 1 ), unpinnedFlag: p3[ 4 * i + 3 ],
-		};
-
-	};
-
-	// per-call uniform upload check: 3 compute calls in one JS turn with u = 1, 2, 3 -> expect 6
-	window.__uniformTest = async () => {
-
-		const u = uniform( 0 );
-		const buf = instancedArray( 1, 'float' );
-		const k = Fn( () => {
-
-			buf.element( instanceIndex ).addAssign( u );
-
-		} )().compute( 1 );
-		for ( let i = 1; i <= 3; i ++ ) {
-
-			u.value = i;
-			app.renderer.compute( k );
-
-		}
-
-		return new Float32Array( await app.renderer.getArrayBufferAsync( buf.value ) )[ 0 ];
-
-	};
-
-	// generated WGSL of a layout kernel, e.g. __wgsl( 'repulsion' )
-	window.__wgsl = ( name = 'repulsion' ) => {
+	// generated WGSL of a layout kernel, e.g. __wgsl( 'repulsion' ) (sync)
+	window.__wgsl = ( name = 'repulsion', index = 0 ) => {
 
 		const k = layout.kernels[ name ];
-		const node = Array.isArray( k ) ? k[ 0 ] : k;
+		const node = Array.isArray( k ) ? k[ index ] : k;
 		return app.renderer._nodes.getForCompute( node ).computeShader;
+
+	};
+
+	// storage buffers bound by every kernel (WebGPU guarantees 8 per stage)
+	window.__bindings = () => {
+
+		const out = {};
+		for ( const [ name, k ] of Object.entries( layout.kernels ) ) {
+
+			const list = Array.isArray( k ) ? k : [ k ];
+			let most = 0;
+			for ( const node of list ) most = Math.max( most, ( app.renderer._nodes.getForCompute( node ).computeShader.match( /var<storage/g ) || [] ).length );
+			out[ name ] = most;
+
+		}
+
+		return out;
 
 	};
 
@@ -324,9 +750,12 @@ try {
 			const s = layout.stats;
 			const bs = app.boundingSphere();
 			hud.textContent = `${graph.name}  N=${graph.N} E=${graph.E} D=${graph.D}  fps=${app.fps.toFixed( 1 )}\n` +
-				`${s.mode} blend=${s.blend.toFixed( 2 )} alpha=${s.alpha.toFixed( 4 )} running=${s.running} ticks=${s.ticks} k=${s.ticksPerFrame} (static ${s.kStatic}, dyn ${s.kDynamic})\n` +
-				`radius=${bs.radius.toFixed( 0 )} (layoutRadius ${graph.layoutRadius.toFixed( 0 )})  gravity=${s.gravity.toFixed( 4 )}\n` +
-				`BH: tree ${s.bh.treeSize}, virtual ${s.bh.virtualClusters} (${s.bh.virtualHeights} heights), visits/node ≈ ${s.bh.visitsPerNode.toFixed( 0 )}`;
+				`${s.mode}${s.pending ? ' (pending)' : ''}  target=${s.targetBlend.toFixed( 2 )} sphere=${s.blend.toFixed( 2 )} flat=${s.flat.toFixed( 2 )}  preset=${s.preset}\n` +
+				`alpha=${s.alpha.toFixed( 4 )} running=${s.running} settled=${s.settled} ticks=${s.ticks} k=${s.ticksPerFrame} (static ${s.kStatic}, dyn ${s.kDynamic})\n` +
+				`radius=${bs.radius.toFixed( 0 )} (layoutRadius ${graph.layoutRadius.toFixed( 0 )})  extent=${s.extent.toFixed( 3 )} u/L=${( s.unit / ( graph.linkDistance ?? 30 ) ).toFixed( 2 )} f=${s.scale.toFixed( 4 )}\n` +
+				`drag=${s.dragging} alphaDrag=${s.alphaDrag.toFixed( 3 )} heatTicks=${s.heatTicks} pinned=${s.pinned}\n` +
+				`BH: tree ${s.bh.treeSize}, virtual ${s.bh.virtualClusters} (${s.bh.virtualHeights} heights), visits/node ≈ ${s.bh.visitsPerNode.toFixed( 0 )}\n` +
+				`modes: ${LAYOUT_MODES.map( ( m ) => m.id ).join( ' ' )}`;
 
 		}
 

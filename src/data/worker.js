@@ -15,8 +15,15 @@
 //      key      cache key; the last few canonical graphs (after clustering) are kept so a
 //               repeated request (e.g. new palette) skips fetch, parse and Louvain.
 //  main → worker  { type: 'clear-cache' }
+//  main → worker  { id, type: 'layout', kind: 'stress' | 'radial', graph, options }
+//      graph    { N, E, edges, adjStart, degree, adjList, linkDistance, layoutRadius } of a
+//               PreparedGraph (structured-cloned: the main thread keeps its arrays)
+//      options  stress: { pivots, iters, eps, seed, dim, radius }   (sgd2Layout, graph/layouts.js)
+//               radial: { root, dim, radius, shellGap, minSpacing } (radialLayout)
 //  worker → main  { id, type: 'progress', stage, fraction, message }   fraction: 0..1 overall
 //                 { id, type: 'result', graph, meta, timings }          graph: PreparedGraph
+//                 { id, type: 'layout-result', kind, positions, depth, info, timings }
+//                                positions: Float32Array( 4N ) (transferred), depth: radial only
 //                 { id, type: 'error', message }
 //  Stages: fetch | read | parse | generate | cluster | prepare | transfer.
 //
@@ -27,6 +34,7 @@
 //
 // ─── Exports (for inline use / tests) ───────────────────────────────────────────────────────
 //  runRequest( msg, onProgress ) -> Promise<{ graph, meta, timings }>
+//  runLayout( msg ) -> { kind, positions, depth, info, timings }      static layout request
 //  handleMessage( msg, post )     post( data, transfer ) receives progress/result/error messages
 //  parseGraphText( text, name ) -> { graph, format }
 //  transferables( preparedGraph ) -> ArrayBuffer[]
@@ -36,6 +44,7 @@ import { parseEdgeList, looksLikeEdgeList } from './edgelist.js';
 import { generate } from './generators.js';
 import { ensureHierarchy } from './louvain.js';
 import { prepareGraph } from '../graph/prepare.js';
+import { sgd2Layout, radialLayout } from '../graph/layouts.js';
 
 const CACHE_SIZE = 3;
 const cache = new Map(); // key -> canonical graph with hierarchy
@@ -338,6 +347,33 @@ export function transferables( graph ) {
 
 }
 
+/**
+ * Static layout request ({ kind, graph, options }, see the protocol): the sparse stress layout
+ * ('stress', seconds on large graphs, the reason it runs here) or the radial focus layout
+ * ('radial'; cheap, offered for symmetry).
+ */
+export function runLayout( msg ) {
+
+	const g = msg.graph, options = msg.options || {};
+	if ( ! g || ! Number.isInteger( g.N ) || ! g.adjStart || ! g.degree || ! g.adjList ) throw new Error( 'layout: graph needs N, adjStart, degree, adjList' );
+	const t0 = now();
+	let r;
+	if ( msg.kind === 'stress' ) {
+
+		if ( ! g.edges || ! Number.isInteger( g.E ) ) throw new Error( 'layout: the stress layout needs E and edges' );
+		r = sgd2Layout( g, options );
+
+	} else if ( msg.kind === 'radial' ) {
+
+		const root = Number.isInteger( options.root ) && options.root >= 0 && options.root < g.N ? options.root : 0;
+		r = radialLayout( g, root, options );
+
+	} else throw new Error( `layout: unknown kind "${msg.kind}"` );
+
+	return { kind: msg.kind, positions: r.positions, depth: r.depth || null, info: r.info, timings: { compute: now() - t0 } };
+
+}
+
 /** Handles one protocol message; post( data, transfer? ) sends the replies. */
 export async function handleMessage( msg, post ) {
 
@@ -345,6 +381,23 @@ export async function handleMessage( msg, post ) {
 	if ( msg.type === 'clear-cache' ) {
 
 		cache.clear();
+		return;
+
+	}
+
+	if ( msg.type === 'layout' ) {
+
+		try {
+
+			const r = runLayout( msg );
+			post( { id: msg.id, type: 'layout-result', ...r }, [ r.positions.buffer, ...( r.depth ? [ r.depth.buffer ] : [] ) ] );
+
+		} catch ( e ) {
+
+			post( { id: msg.id, type: 'error', message: ( e && e.message ) || String( e ) } );
+
+		}
+
 		return;
 
 	}

@@ -21,6 +21,7 @@
 //  traversal is: i = 0; while (i < T) { if (leaf or accepted) { use; i = skip } else i++ }.
 
 import { paletteColor } from '../util/color.js';
+import { stressSeed } from './layouts.js';
 
 export const DEFAULT_PREPARE_OPTIONS = {
 	palette: 'paper',
@@ -236,9 +237,15 @@ export function prepareGraph( g, options = {} ) {
 	const radii = new Float32Array( N );
 	for ( let i = 0; i < N; i ++ ) radii[ i ] = 0.7 + 0.9 * Math.sqrt( degree[ i ] / Math.max( 1, maxDegree ) );
 
-	// ── initial positions (hierarchical seeding) and the paper's spherical layout ───────────
+	// ── initial positions and the paper's spherical layout ─────────────────────────────────
+	// Stress seed (layouts.js): clusters are placed by a stress layout of the quotient graph, so
+	// connected communities start next to each other. Graphs without a hierarchy (D = 0), or with
+	// more than 400 clusters on every level, keep the purely hierarchical seed.
 	const R = layoutRadius( N, opts.linkDistance );
-	const initPos = seedPositions( { N, C, root, childStart, childCount, childRefs, clusterMass, R, seed: opts.seed } );
+	const initPos = stressSeed( {
+		N, D, E, edges, anc, levelOffset, clusterMass, childRefs, layoutRadius: R,
+		clusterChildStart: childStart, clusterChildCount: childCount,
+	}, { seed: opts.seed } ) || seedPositions( { N, C, root, childStart, childCount, childRefs, clusterMass, R, seed: opts.seed } );
 	const sphereDir = sphereLayout( { N, C, root, childStart, childCount, childRefs, seed: opts.seed, ...opts.sphere } );
 
 	const clustersPerLevel = K.slice();
@@ -298,9 +305,10 @@ function fibonacciSphere( k, m, out ) {
 }
 
 /**
- * Hierarchical seeding: children of a cluster are spread on a sphere around its center with radii
- * proportional to cube roots of their masses, so clusters start spatially compact. This makes the
- * hierarchy-based Barnes–Hut repulsion efficient from the first iteration and speeds convergence.
+ * Hierarchical seeding (fallback of the stress seed, see prepareGraph): children of a cluster are
+ * spread on a sphere around its center with radii proportional to cube roots of their masses, so
+ * clusters start spatially compact. This makes the hierarchy-based Barnes–Hut repulsion efficient
+ * from the first iteration and speeds convergence.
  */
 function seedPositions( { N, root, childStart, childCount, childRefs, clusterMass, R, seed } ) {
 

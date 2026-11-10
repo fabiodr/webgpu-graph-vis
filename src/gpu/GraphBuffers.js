@@ -7,10 +7,17 @@
 // │ field             │ type  │ count │ meaning                                            │
 // ├───────────────────┼───────┼───────┼────────────────────────────────────────────────────┤
 // │ nodePos           │ vec4  │ N     │ xyz world position, w = pinned (1) / free (0)       │
-// │ nodeVel           │ vec4  │ N     │ xyz velocity (force layout), w unused               │
-// │ nodeForce         │ vec4  │ N     │ scratch: repulsion accumulated by the layout        │
-// │ nodeTarget        │ vec4  │ N     │ unit direction of the paper's sphere layout         │
-// │ nodeInfo          │ uvec4 │ N     │ (adjStart, adjCount, 0, 0)                          │
+// │ nodeVel           │ vec4  │ N     │ xyz velocity per tick (force layout), w = heat 0..1 │
+// │                   │       │       │   (local re-activation around a dragged node)       │
+// │ nodeForce         │ vec4  │ N     │ scratch of the layout: (repulsion, stiffness), then │
+// │                   │       │       │   (preconditioned force, heat)                      │
+// │ nodeTarget        │ vec4  │ N     │ ABSOLUTE target position xyz (world units) of the   │
+// │                   │       │       │   current target layout (sphere, radial, stress, …), │
+// │                   │       │       │   w = weight 0..1 of the pull. Written by the layout │
+// │                   │       │       │   module; initially the paper's sphere layout        │
+// │                   │       │       │   (sphereDir · layoutRadius, w = 1)                  │
+// │ nodeInfo          │ uvec4 │ N     │ (adjStart, adjCount, finest cluster id, layout mass │
+// │                   │       │       │   in 1/256 units: round(256·(1 + deg/avgDeg)^p))     │
 // │ nodeColor         │ vec4  │ N     │ linear RGB, w = radius factor (≈0.7..1.6). Animated: │
 // │                   │       │       │   eased toward nodeColorTarget every frame          │
 // │ nodeColorTarget   │ vec4  │ N     │ CPU-written targets for nodeColor (setColors)       │
@@ -76,12 +83,27 @@ export class GraphBuffers {
 		this.nodePrev.value.array.set( g.initPos );
 		const fx = this.nodeFx.value.array;
 		for ( let i = 0; i < N; i ++ ) fx[ 4 * i ] = fx[ 4 * i + 1 ] = - 1;
-		this.nodeTarget.value.array.set( g.sphereDir );
+		// absolute targets, initially the paper's sphere layout; the layout module rewrites them
+		const target = this.nodeTarget.value.array;
+		for ( let i = 0; i < N; i ++ ) {
+
+			target[ 4 * i ] = g.sphereDir[ 4 * i ] * g.layoutRadius;
+			target[ 4 * i + 1 ] = g.sphereDir[ 4 * i + 1 ] * g.layoutRadius;
+			target[ 4 * i + 2 ] = g.sphereDir[ 4 * i + 2 ] * g.layoutRadius;
+			target[ 4 * i + 3 ] = 1;
+
+		}
+
+		// z: finest cluster of the node (the root when there is no hierarchy); w: layout mass for
+		// hub spacing 1 (fixed point, 256 = 1; the layout module rewrites it for other exponents)
 		const info = this.nodeInfo.value.array;
+		const avgDegree = N ? Math.max( 1e-9, ( 2 * E ) / N ) : 1;
 		for ( let i = 0; i < N; i ++ ) {
 
 			info[ 4 * i ] = g.adjStart[ i ];
 			info[ 4 * i + 1 ] = g.degree[ i ];
+			info[ 4 * i + 2 ] = D > 0 ? g.anc[ i * D ] : g.root;
+			info[ 4 * i + 3 ] = Math.max( 1, Math.round( 256 * ( 1 + g.degree[ i ] / avgDegree ) ) );
 
 		}
 
@@ -114,7 +136,8 @@ export class GraphBuffers {
 
 		/**
 		 * Shared uniforms.
-		 *  layoutBlend   0 = force layout, 1 = paper sphere layout (animated by the layout module)
+		 *  layoutBlend   0..1 "sphere-ness": 1 only in the paper's sphere layout (animated by the
+		 *                layout module; edge curves and the sphere guide follow it)
 		 *  sphereRadius  radius of the sphere layout in world units
 		 *  focus         0..1 eased; 1 while a selection exists (drives context dimming)
 		 *  hoverIndex    hovered node or -1
