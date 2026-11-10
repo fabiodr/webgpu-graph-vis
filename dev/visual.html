@@ -22,7 +22,7 @@ html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui
 //    straightened by beta) drawn as additive LineSegments; straight lines for big graphs.
 // Query: ds=imsv/lesmis | synth&n=20000, nodes=renderer|debug, tone=agx|neutral|aces|none,
 //        bloom=0.8, labels=auto|all|off, layout=force|sphere, sel=<index|label>, hover=<index|label>,
-//        edges=bundled|straight|none, post=0, quality=high|low|auto, zoom=1, yaw=0, pitch=0,
+//        edges=bundled|straight|none, post=0, quality=auto|low|medium|high|ultra, zoom=1, yaw=0, pitch=0,
 //        size=1, palette=paper|rainbow|aurora|ember
 import * as THREE from 'three/webgpu';
 import { Fn, instanceIndex, mix, uniform, If, uint } from 'three/tsl';
@@ -300,7 +300,8 @@ try {
 	const bg = app.use( new Background() );
 	const nodes = P( 'nodes', 'renderer' ) === 'debug' ? app.use( new DebugNodes() ) : app.use( new NodeRenderer( { size: + P( 'size', 1 ) } ) );
 	const labels = app.use( new Labels( { mode: P( 'labels', 'auto' ) } ) );
-	const post = + P( 'post', 1 ) ? app.use( new PostFX( { bloom: + P( 'bloom', 0.8 ), quality: P( 'quality', 'auto' ), toneMapping: P( 'tone', 'neutral' ) } ) ) : null;
+	// post=0 and quality=… are read by the App itself (parseGfxParams); PostFX is the adapter over app.gfx
+	const post = app.use( new PostFX( { bloom: + P( 'bloom', 0.8 ), toneMapping: P( 'tone', 'neutral' ) } ) );
 	Object.assign( window, { __layout: layout, __bg: bg, __nodes: nodes, __labels: labels, __post: post } );
 
 	const ds = P( 'ds', 'imsv/lesmis' );

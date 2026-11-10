@@ -22,9 +22,11 @@ html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui
 //   labels=auto|all|off       max=300  neighbors=40  fs=<CSS px>  weight=500  family=<css font-family>
 //   html=1                    the HTML labels of src/render/Labels.js instead (legibility reference)
 //   comp=scene|overlay|direct scene: labels.mesh inside app.scene (HDR pass, depth test, tone mapped
-//                             and bloomed with the rest); overlay: own pass after tone mapping,
-//                             display-referred sRGB, soft occlusion from the scene depth texture
-//   post=0                    no PostFX (plain tone mapped output)
+//                             and bloomed with the rest); overlay: the overlay pass of app.gfx
+//                             (what the app uses): after tone mapping, display-referred sRGB, soft
+//                             occlusion from the scene depth texture
+//   post=0                    no post effects (plain tone mapped output); quality=… and the other
+//                             graphics switches of the App work here as well
 //   sel=<index|label>  hover=<index|label>
 //   zoom=1  yaw=0  pitch=0  target=<index|label>   camera relative to the fitted view (target: look at a node)
 //   settle=6000               ms to let the layout run before fitting the camera
@@ -39,7 +41,6 @@ html,body{margin:0;height:100%;background:#000;color:#9aa6bd;font:12px system-ui
 //   cap=<n> maxglyphs=<n>     initial / maximum glyph buffer capacity (growth and compaction tests)
 //   trim=<n>                  glyph count above which the glyphs of gone labels are dropped
 import * as THREE from 'three/webgpu';
-import { Fn, pass, vec4 } from 'three/tsl';
 import { createApp } from '../src/app/App.js';
 import { fetchManifest } from '../src/data/load.js';
 import { DataClient } from '../src/data/client.js';
@@ -74,7 +75,8 @@ try {
 	const edges = app.use( new EdgeRenderer() );
 	const nodes = app.use( new NodeRenderer( { size: + P( 'size', 1 ) } ) );
 	app.use( new Background() );
-	const post = + P( 'post', 1 ) ? app.use( new PostFX( { bloom: + P( 'bloom', 0.8 ), quality: 'high' } ) ) : null;
+	// post=0 and quality=… are read by the App (parseGfxParams); the adapter only forwards the bloom strength
+	const post = app.use( new PostFX( { bloom: + P( 'bloom', 0.8 ) } ) );
 	const interaction = new Interaction( { layout, rig } );
 	interaction.picking.setRadiusFunction( ( i ) => nodes.worldRadius( i ) );
 	app.use( interaction );
@@ -109,21 +111,11 @@ try {
 
 		if ( comp === 'overlay' ) {
 
-			// (b) overlay pass after tone mapping: 8-bit display-referred target, no depth buffer,
-			// soft occlusion from the scene pass depth texture, composited over the PostFX output
-			const overlayScene = new THREE.Scene();
-			overlayScene.add( labels.mesh );
-			const overlayPass = pass( overlayScene, app.camera, { type: THREE.UnsignedByteType, samples: 0, depthBuffer: false } );
-			app.renderer.setClearColor( 0x000000, 0 ); // the overlay scene has no background: clear to transparent
-			labels.depthTest = false;
-			labels.output = 'srgb';
-			if ( + P( 'depth', 1 ) ) labels.setSceneDepth( app.scenePass.getTextureNode( 'depth' ) );
-			if ( ! post ) throw new Error( 'comp=overlay needs PostFX (post=1) in this dev page' );
-			const base = app.pipeline.outputNode; // PostFX output: tone mapped, sRGB encoded
-			const over = overlayPass.getTextureNode( 'output' );
-			app.pipeline.outputNode = Fn( () => vec4( base.rgb.mul( over.a.oneMinus() ).add( over.rgb ), 1 ) )();
-			app.pipeline.needsUpdate = true;
-			window.__overlayPass = overlayPass;
+			// (b) the overlay pass of the render graph: after tone mapping, 8-bit display-referred
+			// target at full resolution, no depth buffer, soft occlusion from the scene depth texture
+			app.gfx.attachLabels( labels );
+			if ( ! + P( 'depth', 1 ) ) labels.setSceneDepth( null );
+			window.__overlayPass = app.gfx.overlayPass;
 
 		} else if ( comp === 'direct' ) {
 

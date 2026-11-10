@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>dev: render pipeline</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#aab4c8;font:12px/1.35 system-ui,sans-serif;overflow:hidden}
+#app{position:fixed;inset:0}
+#ui{position:fixed;left:8px;top:8px;z-index:2;width:236px;max-height:calc(100% - 16px);overflow:auto;padding:8px 10px;border-radius:10px;
+	background:rgba(10,13,20,.78);border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(8px)}
+#ui h2{margin:8px 0 4px;font:600 10px system-ui;letter-spacing:.08em;text-transform:uppercase;color:#6f7b93}
+#ui h2:first-child{margin-top:0}
+.seg{display:flex;gap:2px;flex-wrap:wrap}
+.seg button{flex:1 1 auto;padding:3px 5px;border-radius:5px;border:1px solid rgba(255,255,255,.1);background:none;color:inherit;font:inherit;cursor:pointer}
+.seg button.on{background:#2b6cff;border-color:#2b6cff;color:#fff}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:1px 8px}
+label{display:flex;align-items:center;gap:5px;white-space:nowrap}
+label.tier{color:#6f7b93}
+.sl{display:grid;grid-template-columns:74px 1fr 34px;align-items:center;gap:6px}
+.sl input{width:100%;min-width:0}
+#stats{margin-top:6px;white-space:pre;font:11px/1.4 ui-monospace,monospace;color:#8f9bb3}
+#ui button.act{margin-top:6px;padding:3px 8px;border-radius:5px;border:1px solid rgba(255,255,255,.14);background:none;color:inherit;font:inherit;cursor:pointer}
+#err{position:fixed;left:8px;bottom:8px;color:#ff7a7a;white-space:pre-wrap;z-index:3}
+</style>
+</head>
+<body>
+<div id="app"></div><div id="ui"></div><div id="err"></div>
+<script type="module">
+// Dev page for the render pipeline (src/render/gfx/RenderGraph.js, src/app/Quality.js) on the real
+// modules: ForceLayout, EdgeRenderer, NodeRenderer, Background, TextLabels (overlay pass),
+// Interaction, CameraRig. Every switch of the panel calls app.gfx.setQuality() / app.gfx.set().
+//
+// Query (all optional):
+//   ds=imsv/lesmis            any id of public/data/manifest.json (e.g. generated/lfr-2k, generated/hsbm-5k)
+//   quality=auto|low|medium|high|ultra      governor=0|1 (default: off under automation)
+//   ao= dof= shadows= traa= sharpen= streak= vignette= grain= ca= post= dynres=   0|1, tier default when absent
+//   scale=<number>            fixed scene-pass resolution scale (no pixel cap, no governor)
+//   debug=ao|depth|velocity|coc|none
+//   bloom=0.8  aoStrength=1  aoRadius=3.5  dofStrength=<0..1>  dofMaxBlur=<CSS px>  exposure=1
+//   sharpness=0.4  tone=neutral|agx|aces|none
+//   focus=<distance>[,<range>]   fixed focus (world units) instead of the automatic one
+//   labels=auto|all|off       sel=<index|label>  hover=<index|label>
+//   zoom=1  yaw=0  pitch=0    camera relative to the fitted view;  target=<index|label> looks at a node
+//   settle=6000               ms the layout may run before the camera is fitted
+//   pause=1                   pause the layout afterwards (an image at rest; pause=0 keeps it running)
+//   frames=6                  frames rendered after the setup before window.__ready
+//   insets=<left px>          camera view offset as the settings panel of the app sets it (TRAA jitter test)
+//   probe=<n>                 adds n real, lit, depth-writing spheres in a clump at the graph centre
+//                             (with a light of their own): geometry with true depth for the AO,
+//                             depth-of-field and TRAA checks, whatever the node renderer draws
+//   graph=0                   hides the node and edge renderers (probe spheres only)
+//   labeldepth=live           labels are cut against the live scene depth also in TRAA tiers (the
+//                             jittered one; for comparisons with overlayDiff(), default: the resting copy)
+//   ui=0                      hide the controls (clean screenshots)
+//
+// For scripted checks (scripts/shot.mjs --eval / --report), window.__pipeline has:
+//   frames( n )               Promise: n rendered frames
+//   memory()                  { textures, textureMB, renderTargets, programs, … } of renderer.info.memory
+//   leakCheck( cycles, order ) Promise<rows>: switches through the tiers `cycles` times and records
+//                             memory() after every full cycle (the rows must not grow) and before /
+//                             after the whole run in the starting tier (rows 'start' and 'end')
+//   targets()                 sizes of the scene pass and the main intermediate targets
+//   state()                   { config, gfxState, stats, pxScale, camera, focus, sphere, governor }
+//   overlayDiff( n, t )       Promise: reads the overlay target in n consecutive frames and counts,
+//                             per frame pair, the pixels that changed by more than t / 255 (a still
+//                             picture must give zeros: label shimmer under TRAA shows up here)
+import * as THREE from 'three/webgpu';
+import { createApp } from '../src/app/App.js';
+import { fetchManifest } from '../src/data/load.js';
+import { DataClient } from '../src/data/client.js';
+import { ForceLayout } from '../src/gpu/ForceLayout.js';
+import { NodeRenderer } from '../src/render/NodeRenderer.js';
+import { EdgeRenderer } from '../src/render/EdgeRenderer.js';
+import { Background } from '../src/render/Background.js';
+import { TextLabels } from '../src/render/TextLabels.js';
+import { CameraRig } from '../src/interact/CameraRig.js';
+import { Interaction } from '../src/interact/Interaction.js';
+import { gfxUniforms, gfxState } from '../src/render/gfx/shared.js';
+import { TIER_ORDER, DEBUG_VIEWS } from '../src/app/Quality.js';
+
+const params = new URLSearchParams( location.search );
+const P = ( k, d ) => ( params.has( k ) ? params.get( k ) : d );
+const sleep = ( ms ) => new Promise( ( r ) => setTimeout( r, ms ) );
+const frames = ( app, n ) => new Promise( ( resolve ) => {
+
+	const f0 = app.frame;
+	const check = () => ( app.frame - f0 >= n ? resolve() : requestAnimationFrame( check ) );
+	check();
+
+} );
+
+try {
+
+	const app = await createApp( document.getElementById( 'app' ) ); // graphics switches come from the URL
+	const gfx = app.gfx;
+	window.__app = app;
+
+	const rig = new CameraRig( { autoRotate: false } );
+	const layout = app.use( new ForceLayout() );
+	const edges = app.use( new EdgeRenderer() );
+	const nodes = app.use( new NodeRenderer() );
+	app.use( new Background() );
+	const labels = app.use( new TextLabels( { mode: P( 'labels', 'auto' ) } ) );
+	gfx.attachLabels( labels );
+	if ( P( 'labeldepth', '' ) === 'live' ) {
+
+		// the comparison case: straight from the scene pass, as before the resting copy existed
+		const live = () => labels.setSceneDepth( gfx.chain.depth );
+		app.events.addEventListener( 'gfx', live );
+		live();
+
+	}
+	const interaction = new Interaction( { layout, rig } );
+	interaction.picking.setRadiusFunction( ( i ) => nodes.worldRadius( i ) );
+	app.use( interaction );
+	app.use( rig );
+	if ( params.has( 'insets' ) ) rig.setInsets( { left: + P( 'insets' ) }, { animate: false } );
+
+	for ( const key of [ 'bloom', 'aoStrength', 'aoRadius', 'dofStrength', 'dofMaxBlur', 'exposure', 'sharpness' ] ) if ( params.has( key ) ) gfx.set( key, + P( key ) );
+	if ( params.has( 'tone' ) ) gfx.set( 'toneMapping', P( 'tone' ) );
+	if ( params.has( 'focus' ) ) {
+
+		const [ distance, range ] = P( 'focus' ).split( ',' ).map( Number );
+		gfx.setFocus( { distance, range } );
+
+	}
+
+	// dataset
+	const ds = P( 'ds', 'imsv/lesmis' );
+	const manifest = await fetchManifest( '/data/manifest.json' );
+	const entry = manifest.datasets.find( ( d ) => d.id === ds );
+	if ( ! entry ) throw new Error( `dataset ${ds} not in manifest` );
+	const client = new DataClient( { baseUrl: '/' } );
+	const graph = ( await client.load( entry ) ).graph;
+	app.setGraph( graph );
+
+	const indexOf = ( v ) => {
+
+		if ( v === null || v === undefined || v === '' ) return - 1;
+		if ( /^-?\d+$/.test( v ) ) return + v;
+		return graph.labels ? graph.labels.indexOf( v ) : - 1;
+
+	};
+
+	// ── controls ────────────────────────────────────────────────────────────────────────────
+	const ui = document.getElementById( 'ui' );
+	if ( P( 'ui', '1' ) === '0' ) ui.style.display = 'none';
+	const el = ( tag, props = {}, ...children ) => {
+
+		const e = Object.assign( document.createElement( tag ), props );
+		e.append( ...children );
+		return e;
+
+	};
+
+	const refreshers = [];
+	const refresh = () => refreshers.forEach( ( f ) => f() );
+
+	ui.append( el( 'h2', {}, 'Tier' ) );
+	{
+
+		const seg = el( 'div', { className: 'seg' } );
+		for ( const tier of [ 'auto', ...TIER_ORDER ] ) {
+
+			const b = el( 'button', { textContent: tier, onclick: () => gfx.setQuality( tier ) } );
+			refreshers.push( () => b.classList.toggle( 'on', gfx.setting === tier ) );
+			seg.append( b );
+
+		}
+
+		ui.append( seg );
+
+	}
+
+	ui.append( el( 'h2', {}, 'Effects (grey = tier default)' ) );
+	{
+
+		// [ key of gfx.set, label, value in the resolved config ]
+		const switches = [
+			[ 'post', 'post chain', ( c ) => c.bloom ], [ 'traa', 'TRAA', ( c ) => c.aa === 'traa' ],
+			[ 'ao', 'AO', ( c ) => c.ao ], [ 'dof', 'depth of field', ( c ) => c.dof ],
+			[ 'shadows', 'shadows', ( c ) => c.shadows ], [ 'sharpen', 'RCAS', ( c ) => c.sharpen ],
+			[ 'streak', 'streak', ( c ) => c.streak ], [ 'chromaticAberration', 'chrom. ab.', ( c ) => c.chromaticAberration > 0 ],
+			[ 'grain', 'grain', ( c ) => c.grain > 0 ], [ 'vignette', 'vignette', ( c ) => c.vignette ],
+			[ 'dynamicResolution', 'dyn. res.', ( c ) => c.dynamicResolution ], [ 'governor', 'governor', () => gfx.governor.enabled ],
+		];
+		const grid = el( 'div', { className: 'grid' } );
+		for ( const [ key, text, read ] of switches ) {
+
+			const box = el( 'input', { type: 'checkbox', onchange: () => gfx.set( key, box.checked ) } );
+			const label = el( 'label', {}, box, text );
+			// right click: back to the tier default
+			label.oncontextmenu = ( e ) => ( e.preventDefault(), gfx.set( key, null ) );
+			refreshers.push( () => {
+
+				box.checked = !! read( gfx.config );
+				const v = gfx.get( key );
+				label.classList.toggle( 'tier', v === undefined || v === null );
+
+			} );
+			grid.append( label );
+
+		}
+
+		ui.append( grid, el( 'button', { className: 'act', textContent: 'tier defaults', onclick: () => {
+
+			for ( const [ key ] of switches ) if ( key !== 'governor' && gfx.get( key ) !== undefined && gfx.get( key ) !== null ) gfx.set( key, null );
+			gfx.set( 'scale', null );
+			gfx.set( 'debug', null );
+
+		} } ) );
+
+	}
+
+	ui.append( el( 'h2', {}, 'Debug view' ) );
+	{
+
+		const seg = el( 'div', { className: 'seg' } );
+		for ( const view of [ 'none', ...DEBUG_VIEWS ] ) {
+
+			const b = el( 'button', { textContent: view, onclick: () => gfx.set( 'debug', view === 'none' ? null : view ) } );
+			refreshers.push( () => b.classList.toggle( 'on', ( gfx.config.debug || 'none' ) === view ) );
+			seg.append( b );
+
+		}
+
+		ui.append( seg );
+
+	}
+
+	ui.append( el( 'h2', {}, 'Values' ) );
+	{
+
+		const slider = ( text, min, max, step, read, write ) => {
+
+			const input = el( 'input', { type: 'range', min, max, step } );
+			const out = el( 'span' );
+			input.oninput = () => ( write( + input.value ), refresh() );
+			refreshers.push( () => {
+
+				const v = read();
+				if ( document.activeElement !== input ) input.value = v;
+				out.textContent = ( + v ).toFixed( 2 );
+
+			} );
+			ui.append( el( 'div', { className: 'sl' }, el( 'span', {}, text ), input, out ) );
+
+		};
+
+		slider( 'render scale', 0.25, 1.5, 0.05, () => gfx.renderScale, ( v ) => gfx.set( 'scale', v ) );
+		slider( 'bloom', 0, 2, 0.01, () => gfx.get( 'bloom' ), ( v ) => gfx.set( 'bloom', v ) );
+		slider( 'AO strength', 0, 1, 0.01, () => gfx.uniforms.aoStrength.value, ( v ) => gfx.set( 'aoStrength', v ) );
+		slider( 'AO radius', 0.5, 10, 0.1, () => gfx.get( 'aoRadius' ), ( v ) => gfx.set( 'aoRadius', v ) );
+		slider( 'DoF strength', 0, 1, 0.01, () => gfxUniforms.dofAmount.value, ( v ) => gfx.set( 'dofStrength', v ) );
+		slider( 'exposure', 0.25, 3, 0.01, () => gfx.uniforms.exposure.value, ( v ) => gfx.set( 'exposure', v ) );
+		slider( 'sharpness', 0, 2, 0.01, () => gfx.uniforms.sharpness.value, ( v ) => gfx.set( 'sharpness', v ) );
+
+	}
+
+	const stats = el( 'div', { id: 'stats' } );
+	ui.append( stats );
+	app.events.addEventListener( 'gfx', refresh );
+	refresh();
+	setInterval( () => {
+
+		refresh();
+		const s = gfx.stats, c = gfx.config;
+		stats.textContent = [
+			`${graph.name || ds}  N=${graph.N} E=${graph.E}`,
+			`tier ${c.tier}${c.explicit ? '' : ' (auto)'}  aa ${c.aa}${c.samples > 1 ? ' ×' + c.samples : ''}`,
+			`scene ${s.width}×${s.height}  scale ${s.renderScale.toFixed( 2 )} (cap ${s.capScale.toFixed( 2 )})`,
+			`passes ≈${s.passes}  targets ≈${s.targets}  builds ${s.builds}`,
+			`textures ${s.textures}  ${( s.textureBytes / 1e6 ).toFixed( 1 )} MB`,
+			`${s.fps.toFixed( 1 )} fps  ${s.frameMs.toFixed( 1 )} ms${s.gpuMs !== null ? '  gpu ' + s.gpuMs.toFixed( 1 ) + ' ms' : ''}`,
+			`focus ${gfxUniforms.dofFocus.value.toFixed( 0 )} ± ${gfxUniforms.dofRange.value.toFixed( 0 )}  blur ${gfxUniforms.dofMaxBlur.value.toFixed( 1 )} px`,
+			`clip ${app.camera.near.toFixed( 1 )} … ${app.camera.far.toFixed( 0 )}`,
+		].join( '\n' );
+
+	}, 500 );
+
+	// ── scripted checks ─────────────────────────────────────────────────────────────────────
+	const memory = () => {
+
+		const m = app.renderer.info.memory;
+		return { textures: m.textures, textureMB: + ( m.texturesSize / 1e6 ).toFixed( 3 ), renderTargets: m.renderTargets, programs: m.programs, geometries: m.geometries, uniformBuffers: m.uniformBuffers, totalMB: + ( m.total / 1e6 ).toFixed( 3 ) };
+
+	};
+
+	window.__pipeline = {
+		frames: ( n ) => frames( app, n ),
+		memory,
+		async leakCheck( cycles = 3, order = TIER_ORDER, framesPerTier = 3 ) {
+
+			const start = gfx.setting;
+			const rows = [ { cycle: 'start', tier: gfx.tier, ...memory() } ];
+			for ( let c = 0; c <= cycles; c ++ ) {
+
+				for ( const tier of order ) {
+
+					gfx.setQuality( tier );
+					await frames( app, framesPerTier );
+
+				}
+
+				// every cycle ends in the same tier, so the rows are comparable (row 0 = warm-up)
+				rows.push( { cycle: c, tier: gfx.tier, ...memory() } );
+
+			}
+
+			gfx.setQuality( start );
+			await frames( app, framesPerTier );
+			rows.push( { cycle: 'end', tier: gfx.tier, ...memory() } ); // compare with 'start'
+			return rows;
+
+		},
+		targets() {
+
+			const chain = gfx.chain, size = ( rt ) => ( rt ? `${rt.width}×${rt.height}` : null );
+			const db = app.renderer.getDrawingBufferSize( new THREE.Vector2() );
+			return {
+				drawingBuffer: `${db.x}×${db.y}`,
+				scene: size( chain.scenePass.renderTarget ),
+				sceneSamples: chain.scenePass.renderTarget.samples,
+				sceneAttachments: chain.scenePass.renderTarget.textures.map( ( t ) => t.name ),
+				ao: chain.aoPass ? size( chain.aoPass._aoRenderTarget ) : null,
+				traa: chain.traaNode ? size( chain.traaNode._resolveRenderTarget ) : null,
+				dof: chain.dofPass ? size( chain.dofPass.blurTex.renderTarget ) : null,
+				overlay: size( gfx.overlayPass.renderTarget ),
+			};
+
+		},
+		state() {
+
+			const cam = app.camera;
+			return {
+				config: gfx.config, gfxState: { ...gfxState }, stats: { ...gfx.stats }, pxScale: gfxUniforms.pxScale.value,
+				pixelRatio: app.renderer.getPixelRatio(),
+				camera: { near: cam.near, far: cam.far, view: cam.view && cam.view.enabled ? { ...cam.view } : null },
+				focus: { distance: gfxUniforms.dofFocus.value, range: gfxUniforms.dofRange.value, amount: gfxUniforms.dofAmount.value, maxBlur: gfxUniforms.dofMaxBlur.value },
+				sphere: { radius: gfx._sphere.radius, live: gfx._sphere.live, speed: gfx._sphere.speed, distance: cam.position.distanceTo( gfx._sphere.center ) },
+				governor: { enabled: gfx.governor.enabled, ...gfx.governor.state, log: gfx.governor.log },
+			};
+
+		},
+		async overlayDiff( n = 34, threshold = 8 ) {
+
+			const rt = gfx.overlayPass.renderTarget, w = rt.width, h = rt.height;
+			const reads = [];
+			await new Promise( ( resolve ) => {
+
+				const onFrame = () => {
+
+					// queued right after the frame was drawn: the copy holds this frame's overlay
+					reads.push( app.renderer.readRenderTargetPixelsAsync( rt, 0, 0, w, h ) );
+					if ( reads.length < n ) return;
+					app.events.removeEventListener( 'frame', onFrame );
+					resolve();
+
+				};
+
+				app.events.addEventListener( 'frame', onFrame );
+
+			} );
+			const images = await Promise.all( reads );
+			const count = images[ 0 ].length >> 2;
+			let covered = 0;
+			for ( let i = 0; i < count; i ++ ) if ( images[ 0 ][ 4 * i + 3 ] > 0 ) covered ++;
+			const ever = new Uint8Array( count ), changed = [];
+			for ( let f = 1; f < images.length; f ++ ) {
+
+				const a = images[ f - 1 ], b = images[ f ];
+				let c = 0;
+				for ( let i = 0; i < count; i ++ ) {
+
+					const k = 4 * i;
+					if ( Math.abs( a[ k ] - b[ k ] ) > threshold || Math.abs( a[ k + 1 ] - b[ k + 1 ] ) > threshold || Math.abs( a[ k + 2 ] - b[ k + 2 ] ) > threshold || Math.abs( a[ k + 3 ] - b[ k + 3 ] ) > threshold ) {
+
+						c ++;
+						ever[ i ] = 1;
+
+					}
+
+				}
+
+				changed.push( c );
+
+			}
+
+			let everChanged = 0;
+			for ( let i = 0; i < count; i ++ ) everChanged += ever[ i ];
+			return { width: w, height: h, frames: images.length, covered, changed, total: changed.reduce( ( x, y ) => x + y, 0 ), everChanged, labelDepthFrame: gfx.chain.labelDepthFrame, frame: app.frame };
+
+		},
+	};
+	Object.assign( window, { __gfx: gfx, __layout: layout, __rig: rig, __labels: labels, __interaction: interaction, __nodes: nodes, __edges: edges, __graph: graph } );
+
+	// ── scenario ────────────────────────────────────────────────────────────────────────────
+	const tEnd = performance.now() + + P( 'settle', 6000 );
+	while ( performance.now() < tEnd && layout.running ) await sleep( 100 );
+	await frames( app, 2 );
+	rig.fitToGraph( { animate: false } );
+	rig.keepFramed( 0 );
+	await frames( app, 2 );
+	{
+
+		const zoom = + P( 'zoom', 1 ), yaw = THREE.MathUtils.degToRad( + P( 'yaw', 0 ) ), pitch = THREE.MathUtils.degToRad( + P( 'pitch', 0 ) );
+		const c = rig.controls, cam = app.camera;
+		const t = indexOf( P( 'target', '' ) );
+		if ( t >= 0 && app.positions ) c.target.set( app.positions[ 4 * t ], app.positions[ 4 * t + 1 ], app.positions[ 4 * t + 2 ] );
+		const off = cam.position.clone().sub( c.target );
+		const sph = new THREE.Spherical().setFromVector3( off );
+		sph.radius /= zoom;
+		sph.theta += yaw;
+		sph.phi = THREE.MathUtils.clamp( sph.phi - pitch, 0.05, Math.PI - 0.05 );
+		cam.position.copy( c.target ).add( new THREE.Vector3().setFromSpherical( sph ) );
+		cam.lookAt( c.target );
+		c.update();
+
+	}
+
+	if ( + P( 'probe', 0 ) > 0 ) {
+
+		// deterministic clump of touching spheres: contact shadows for AO, a depth range for DoF
+		const sphere = app.boundingSphere();
+		const R = sphere.radius, n = + P( 'probe' );
+		let seed = 12345;
+		const rnd = () => ( ( seed = ( seed * 1664525 + 1013904223 ) >>> 0 ) / 4294967296 );
+		const group = new THREE.Group();
+		group.name = 'probe';
+		const geometry = new THREE.SphereGeometry( 1, 48, 32 );
+		for ( let i = 0; i < n; i ++ ) {
+
+			const material = new THREE.MeshStandardNodeMaterial( { roughness: 0.45, metalness: 0 } );
+			material.color.setHSL( rnd(), 0.55, 0.55 );
+			const mesh = new THREE.Mesh( geometry, material );
+			const dir = new THREE.Vector3( rnd() - 0.5, rnd() - 0.5, rnd() - 0.5 ).normalize();
+			mesh.position.copy( sphere.center ).addScaledVector( dir, R * 0.42 * Math.cbrt( rnd() ) );
+			mesh.scale.setScalar( R * ( 0.07 + 0.07 * rnd() ) );
+			group.add( mesh );
+
+		}
+
+		const key = new THREE.DirectionalLight( 0xffffff, 2.6 );
+		key.position.copy( gfxUniforms.keyDir.value ).multiplyScalar( R * 4 ).add( sphere.center );
+		key.target.position.copy( sphere.center );
+		group.add( key, key.target, new THREE.HemisphereLight( 0x8fa8d8, 0x1a1a22, 1.6 ) );
+		app.scene.add( group );
+		window.__probe = group;
+
+	}
+
+	if ( P( 'graph', '1' ) === '0' ) {
+
+		nodes.mesh && ( nodes.mesh.visible = false );
+		for ( const m of [ nodes, edges ] ) for ( const k in m ) if ( m[ k ] && m[ k ].isObject3D && m[ k ] !== app.scene ) m[ k ].visible = false;
+
+	}
+
+	const hover = indexOf( P( 'hover', '' ) );
+	if ( hover >= 0 ) interaction.setHover( hover );
+	const sel = indexOf( P( 'sel', '' ) );
+	if ( sel >= 0 ) interaction.select( sel );
+	if ( P( 'pause', '1' ) !== '0' ) layout.pause();
+	await frames( app, + P( 'frames', 6 ) );
+	window.__ready = true;
+
+} catch ( e ) {
+
+	console.error( e );
+	document.getElementById( 'err' ).textContent = String( e && e.stack || e );
+	window.__error = String( e && e.message || e );
+
+}
+</script>
+</body>
+</html>

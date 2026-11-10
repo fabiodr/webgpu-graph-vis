@@ -1,11 +1,15 @@
 // Application entry: wires the modules together.
 //
 //   ForceLayout (GPU compute, order 0) → EdgeRenderer (10) → NodeRenderer (11) → Background (12)
-//   → Labels (20) → Interaction (30) → CameraRig (31) → NodeCard (41) → PostFX (90)
+//   → TextLabels (20) → Interaction (30) → CameraRig (31) → NodeCard (41)
 //
+// Rendering (scene pass, quality tiers, post-processing, label overlay) belongs to app.gfx, the
+// render graph the App creates; the labels are drawn in its overlay pass after tone mapping.
 // Data is loaded, clustered (Louvain when needed) and prepared in a Web Worker (DataClient).
 // URL parameters: ?ds=<dataset id> (e.g. imsv/lesmis, generated/hsbm-5k), ?layout=sphere,
-// ?autorotate=0, ?quality=low|high.
+// ?autorotate=0, and the graphics switches read by the App (parseGfxParams in app/Quality.js):
+// ?quality=auto|low|medium|high|ultra, ?governor=0|1, ?ao=0|1, ?dof=0|1, ?shadows=0|1, ?traa=0|1,
+// ?scale=<number>, ?debug=ao|depth|velocity|coc|none.
 import './ui/ui.css';
 import { createApp } from './app/App.js';
 import { fetchManifest } from './data/load.js';
@@ -14,9 +18,8 @@ import { colorize } from './graph/prepare.js';
 import { ForceLayout } from './gpu/ForceLayout.js';
 import { NodeRenderer } from './render/NodeRenderer.js';
 import { EdgeRenderer } from './render/EdgeRenderer.js';
-import { Labels } from './render/Labels.js';
+import { TextLabels } from './render/TextLabels.js';
 import { Background } from './render/Background.js';
-import { PostFX } from './render/PostFX.js';
 import { CameraRig } from './interact/CameraRig.js';
 import { Interaction } from './interact/Interaction.js';
 import { Panel, DEFAULT_SETTINGS } from './ui/Panel.js';
@@ -58,7 +61,7 @@ async function main() {
 	if ( params.get( 'ds' ) ) settings.dataset = params.get( 'ds' );
 	else if ( location.hash.length > 1 ) settings.dataset = decodeURIComponent( location.hash.slice( 1 ) );
 	if ( params.get( 'layout' ) === 'sphere' ) settings.layoutMode = 'sphere';
-	if ( params.get( 'quality' ) ) settings.quality = params.get( 'quality' );
+	settings.quality = app.gfx.setting; // 'auto' unless ?quality= names a tier (parsed by the App)
 	const touched = new Set(); // settings the user changed explicitly (auto values do not override them)
 
 	const rig = new CameraRig();
@@ -69,8 +72,12 @@ async function main() {
 	const edges = app.use( new EdgeRenderer( { beta: settings.bundling, opacity: settings.edgeOpacity, width: settings.edgeWidth, blendMode: settings.edgeBlend } ) );
 	const nodes = app.use( new NodeRenderer( { size: settings.nodeSize } ) );
 	app.use( new Background() );
-	const labels = app.use( new Labels( { mode: settings.labels } ) );
-	const post = app.use( new PostFX( { bloom: settings.bloom, quality: settings.quality } ) );
+	// GPU text in the overlay pass of the render graph: full resolution, after tone mapping, soft
+	// occlusion from the scene depth
+	const labels = app.use( new TextLabels( { mode: settings.labels } ) );
+	const gfx = app.gfx;
+	gfx.attachLabels( labels );
+	gfx.set( 'bloom', settings.bloom );
 
 	// UI values are multipliers on ForceLayout's d3-style units (charge −30, automatic gravity)
 	function applyForces() {
@@ -122,8 +129,8 @@ async function main() {
 			case 'edgeWidth': edges.width = v; break;
 			case 'edgeBlend': edges.blendMode = v; break;
 			case 'nodeSize': nodes.size = v; break;
-			case 'bloom': post.bloomStrength = v; break;
-			case 'quality': post.quality = v; break;
+			case 'bloom': gfx.set( 'bloom', v ); break;
+			case 'quality': gfx.setQuality( v ); break;
 			case 'labels': labels.mode = v; break;
 			case 'palette':
 				if ( app.graph ) {
@@ -274,7 +281,7 @@ async function main() {
 
 	await loadDataset( settings.dataset );
 	if ( settings.layoutMode === 'sphere' ) panel.set( 'layoutMode', 'sphere' );
-	window.__ui = { app, settings, layout, rig, interaction, panel, card, nodes, edges, labels, post, data, set };
+	window.__ui = { app, settings, layout, rig, interaction, panel, card, nodes, edges, labels, gfx, data, set };
 	window.__ready = true;
 
 }

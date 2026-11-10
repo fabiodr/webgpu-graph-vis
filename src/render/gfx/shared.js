@@ -52,6 +52,14 @@ export const gfxState = {
 	shadowMapSize: 2048,
 	lit: true, // false: cheapest shading (no IBL / shadows), phones
 	renderScale: 1, // scene-pass resolution scale (dynamic resolution)
+	// ── work package "pipeline" (written by RenderGraph on every build, see src/app/Quality.js) ──
+	aa: 'traa', // 'traa' | 'smaa' | 'msaa' | 'fxaa' | 'none'
+	clearcoat: false, // node materials may afford the clearcoat lobe (ultra)
+	shadowRadius: 1, // PCF radius of the key light shadow
+	dof: false, // the depth-of-field pass is built (gfxUniforms.dofAmount > 0)
+	edgeLit: false, // strands: analytic key-light shading
+	edgeTubes: false, // strands: real tubes for the highlighted ego network
+	edgeDefocus: false, // strands: analytic defocus (widen + fade by cocPixels)
 };
 
 const _vp = /*@__PURE__*/ new Matrix4();

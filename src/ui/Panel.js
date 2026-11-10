@@ -70,7 +70,10 @@ export const SETTINGS_SCHEMA = [
 		{ type: 'palette', key: 'palette', label: 'Palette', options: [ 'paper', 'rainbow', 'aurora', 'ember' ] },
 		{ type: 'segmented', key: 'labels', label: 'Labels', options: [ { value: 'auto', label: 'Auto' }, { value: 'all', label: 'All' }, { value: 'off', label: 'Off' } ] },
 		{ type: 'segmented', key: 'edgeBlend', label: 'Edge blend', options: [ { value: 'normal', label: 'Normal' }, { value: 'additive', label: 'Additive' } ] },
-		{ type: 'segmented', key: 'quality', label: 'Quality', options: [ { value: 'auto', label: 'Auto' }, { value: 'high', label: 'High' }, { value: 'low', label: 'Low' } ] },
+	] },
+	{ id: 'graphics', title: 'Quality', items: [
+		// tiers of src/app/Quality.js; 'auto' picks one for the device and adapts it to the frame rate
+		{ type: 'segmented', key: 'quality', options: [ { value: 'auto', label: 'Auto' }, { value: 'low', label: 'Low' }, { value: 'medium', label: 'Medium' }, { value: 'high', label: 'High' }, { value: 'ultra', label: 'Ultra' } ] },
 	] },
 	{ id: 'forces', title: 'Forces', collapsed: true, items: [
 		{ type: 'slider', key: 'charge', label: 'Charge', min: 0, max: 4, step: 0.05 },

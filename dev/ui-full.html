@@ -14,8 +14,8 @@ html, body { margin: 0; height: 100%; background: #000; overflow: hidden; oversc
 <div id="app"></div>
 <script type="module">
 // Integration preview: the interaction / camera / UI module wired to the real ForceLayout,
-// NodeRenderer, EdgeRenderer, Labels, Background and PostFX (what main.js is expected to do).
-// Query: ?ds=imsv/lesmis &autorotate=0
+// NodeRenderer, EdgeRenderer, TextLabels, Background and the render graph (what main.js does).
+// Query: ?ds=imsv/lesmis &autorotate=0, plus the graphics switches of the App (?quality= …)
 import '../src/ui/ui.css';
 import { createApp } from '../src/app/App.js';
 import { loadPrepared, fetchManifest } from '../src/data/load.js';
@@ -23,9 +23,8 @@ import { colorize } from '../src/graph/prepare.js';
 import { ForceLayout } from '../src/gpu/ForceLayout.js';
 import { NodeRenderer } from '../src/render/NodeRenderer.js';
 import { EdgeRenderer } from '../src/render/EdgeRenderer.js';
-import { Labels } from '../src/render/Labels.js';
+import { TextLabels } from '../src/render/TextLabels.js';
 import { Background } from '../src/render/Background.js';
-import { PostFX } from '../src/render/PostFX.js';
 import { CameraRig } from '../src/interact/CameraRig.js';
 import { Interaction } from '../src/interact/Interaction.js';
 import { Panel, DEFAULT_SETTINGS } from '../src/ui/Panel.js';
@@ -37,6 +36,8 @@ try {
 	const app = await createApp( document.getElementById( 'app' ) );
 	window.__app = app;
 	const settings = { ...DEFAULT_SETTINGS, dataset: params.get( 'ds' ) || DEFAULT_SETTINGS.dataset };
+	const gfx = app.gfx;
+	settings.quality = gfx.setting;
 	const rig = new CameraRig();
 	if ( rig.reducedMotion || params.get( 'autorotate' ) === '0' ) settings.autoRotate = false;
 	rig.autoRotate = settings.autoRotate;
@@ -60,8 +61,9 @@ try {
 	const edges = app.use( new EdgeRenderer( { beta: settings.bundling, opacity: settings.edgeOpacity, width: settings.edgeWidth, blendMode: settings.edgeBlend } ) );
 	const nodes = app.use( new NodeRenderer( { size: settings.nodeSize } ) );
 	app.use( new Background() );
-	const labels = app.use( new Labels( { mode: settings.labels } ) );
-	const post = app.use( new PostFX( { bloom: settings.bloom, quality: settings.quality } ) );
+	const labels = app.use( new TextLabels( { mode: settings.labels } ) );
+	gfx.attachLabels( labels );
+	gfx.set( 'bloom', settings.bloom );
 
 	let panel = null;
 	const cycle = ( list, v ) => list[ ( list.indexOf( v ) + 1 ) % list.length ];
@@ -101,8 +103,8 @@ try {
 			case 'edgeWidth': edges.width = v; break;
 			case 'edgeBlend': edges.blendMode = v; break;
 			case 'nodeSize': nodes.size = v; break;
-			case 'bloom': post.bloomStrength = v; break;
-			case 'quality': post.quality = v; break;
+			case 'bloom': gfx.set( 'bloom', v ); break;
+			case 'quality': gfx.setQuality( v ); break;
 			case 'labels': labels.mode = v; break;
 			case 'palette':
 				if ( app.graph ) app.buffers.setColors( colorize( app.graph.leafRank, v ) );
@@ -179,7 +181,7 @@ try {
 	} );
 
 	await load( settings.dataset );
-	window.__ui = { app, settings, layout, rig, interaction, panel, card, nodes, edges, labels, post, set };
+	window.__ui = { app, settings, layout, rig, interaction, panel, card, nodes, edges, labels, gfx, set };
 	window.__ready = true;
 
 } catch ( e ) {
