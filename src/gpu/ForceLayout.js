@@ -808,8 +808,21 @@ export class ForceLayout {
 		if ( this._mode === 'sphere' && this._targetKind === 'sphere' ) {
 
 			if ( uniforms.sphereRadius.value !== this._sphereRadius ) this._writeSphereTargets();
-			// the selected node and its neighbours move inward: wake the sleeping spring
-			const sig = `${uniforms.selectedIndex.value}|${this.buffers.nodeStateTarget.value.version}`;
+			// the selected node and its neighbours move inward: wake the sleeping spring. A hover
+			// change (w) writes the same buffer but moves nothing, so the signature hashes only the
+			// selected (x) and neighbour (y) columns, once per upload.
+			const target = this.buffers.nodeStateTarget.value;
+			if ( target.version !== this._stateVersion ) {
+
+				this._stateVersion = target.version;
+				const a = target.array;
+				let h = 0;
+				for ( let i = 0, n = a.length; i < n; i += 4 ) h = ( Math.imul( h, 31 ) + ( ( a[ i ] * 255 ) | 0 ) * 257 + ( ( a[ i + 1 ] * 255 ) | 0 ) ) | 0;
+				this._stateHash = h;
+
+			}
+
+			const sig = `${uniforms.selectedIndex.value}|${this._stateHash}`;
 			if ( sig !== this._targetSig ) {
 
 				this._targetSig = sig;

@@ -39,7 +39,15 @@
 // │ clusterInfo       │ uvec4 │ C     │ (childStart, childCount, height, mass)              │
 // │ childList         │ uint  │ Σ     │ children (node idx for height 1, else cluster idx)  │
 // │ bhTree            │ uvec2 │ T     │ preorder (ref, skip); ref<N node, else N+cluster    │
-// │ edgeInfo          │ uvec4 │ E     │ (src, tgt, lcaLevel, 0)                             │
+// │ edgeInfo          │ uvec4 │ E + 1 │ (src, tgt, lcaLevel, pathStart). pathStart = offset │
+// │                   │       │       │   of the edge's first interior control point in the │
+// │                   │       │       │   path buffer of gpu/EdgeCurves.js, which writes it  │
+// │                   │       │       │   (setPaths); element E holds the total, so the      │
+// │                   │       │       │   count of edge e is info[e+1].w − info[e].w         │
+// │ edgeAttr          │ vec4  │ E     │ CPU-written per-edge channels (EdgeRenderer): x     │
+// │                   │       │       │   width factor (1), y highlight weight 0..1 (path / │
+// │                   │       │       │   tools), z normalized metric value 0..1, w random   │
+// │                   │       │       │   seed in [0,1) (constant per edge)                  │
 // └───────────────────┴───────┴───────┴────────────────────────────────────────────────────┘
 //
 // Shared uniforms live in `buffers.uniforms` (see below). Buffers are allocated with at least one
@@ -76,7 +84,8 @@ export class GraphBuffers {
 		this.clusterInfo = instancedArray( at( C ), 'uvec4' ).setName( 'clusterInfo' );
 		this.childList = instancedArray( at( g.childList.length ), 'uint' ).setName( 'childList' );
 		this.bhTree = instancedArray( at( T ), 'uvec2' ).setName( 'bhTree' );
-		this.edgeInfo = instancedArray( at( E ), 'uvec4' ).setName( 'edgeInfo' );
+		this.edgeInfo = instancedArray( E + 1, 'uvec4' ).setName( 'edgeInfo' );
+		this.edgeAttr = instancedArray( at( E ), 'vec4' ).setName( 'edgeAttr' );
 
 		// fill static data
 		this.nodePos.value.array.set( g.initPos );
@@ -128,6 +137,15 @@ export class GraphBuffers {
 			ei[ 4 * e ] = g.edges[ 2 * e ];
 			ei[ 4 * e + 1 ] = g.edges[ 2 * e + 1 ];
 			ei[ 4 * e + 2 ] = g.edgeLca[ e ];
+
+		}
+
+		// edge channels: width factor 1, no highlight, no metric, a hashed seed per edge
+		const ea = this.edgeAttr.value.array;
+		for ( let e = 0; e < E; e ++ ) {
+
+			ea[ 4 * e ] = 1;
+			ea[ 4 * e + 3 ] = ( Math.imul( e + 1, 0x9e3779b1 ) >>> 8 ) / 16777216;
 
 		}
 
